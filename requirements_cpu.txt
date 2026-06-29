@@ -1,0 +1,15 @@
+numpy
+torch 
+ogbench
+numpy<2
+einops
+elements>=3.19.1
+ninjax>=3.5.1
+jax[cpu]==0.4.33
+optax
+chex
+jaxtyping
+portal>=3.5.0
+scope>=0.4.4
+requests
+# python -m pip install --no-deps git+https://github.com/danijar/embodied.git
