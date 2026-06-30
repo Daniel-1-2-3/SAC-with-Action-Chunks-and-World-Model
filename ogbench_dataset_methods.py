@@ -2,44 +2,30 @@ import os
 import requests
 import numpy as np
 import ogbench
-
+import jax.numpy as jnp
+import elements
 
 class DatasetMethods:
     """
     Converts OGBench transition datasets into Dreamer-style flat replay batches.
 
-    OGBench format:
+    OGBench format, with flat arrays:
         observations[t]
         actions[t]
         rewards[t]
         next_observations[t]
         terminals[t]
+        masks[t] 
 
-    Dreamer Agent.train() expects a flat data dict:
-        data["state"]        -> [B, T, obs_dim]
-        data["action"]       -> [B, T, action_dim]
-        data["reward"]       -> [B, T]
-        data["is_first"]     -> [B, T]
-        data["is_last"]      -> [B, T]
-        data["is_terminal"]  -> [B, T]
-        data["stepid"]       -> [B, T, 20]
-        data["consec"]       -> [B, T]
-
-    Important alignment:
-
-        state[0]      = obs_0
-        state[t + 1]  = next_obs_t
-
-        action[t]     = action taken at state[t]
-        action[-1]    = zero padding because final next_obs has no known action
-
-        reward[0]     = 0
-        reward[t + 1] = reward_t
-
-    Dreamer internally shifts action into prevact using:
-        prevact = prepend(prevact_carry, data["action"])
-
-    So at state[t + 1], prevact becomes action[t], which is correct.
+    Dreamer Agent.train() expects the following flat data dict:
+        data["state"]       (B, T, obs_dim)
+        data["action"]      (B, T, action_dim)
+        data["reward"]      (B, T)
+        data["is_first"]    (B, T)
+        data["is_last"]     (B, T)
+        data["is_terminal"] (B, T)
+        data["stepid"]      (B, T, 20)
+        data["consec"]      (B, T)
     """
 
     @staticmethod
@@ -74,12 +60,7 @@ class DatasetMethods:
                     pct = downloaded / total * 100
                     mb = downloaded // 1024 // 1024
                     tot = total // 1024 // 1024
-                    print(
-                        f"\r  {pct:.1f}% ({mb}MB/{tot}MB)",
-                        end="",
-                        flush=True,
-                    )
-
+                    print(f"\r  {pct:.1f}% ({mb}MB/{tot}MB)", end="", flush=True)
         print()
 
     @staticmethod
@@ -88,7 +69,6 @@ class DatasetMethods:
         os.makedirs(cache_dir, exist_ok=True)
 
         dataset_name = DatasetMethods.get_dataset_file_name(env_name)
-
         train_path = os.path.join(cache_dir, f"{dataset_name}.npz")
         val_path = os.path.join(cache_dir, f"{dataset_name}-val.npz")
 
@@ -96,17 +76,11 @@ class DatasetMethods:
 
         if not os.path.exists(train_path):
             print(f"Downloading train dataset: {dataset_name}.npz")
-            DatasetMethods.download_file(
-                f"{base_dir}/{dataset_name}.npz",
-                train_path,
-            )
+            DatasetMethods.download_file(f"{base_dir}/{dataset_name}.npz", train_path)
 
         if not os.path.exists(val_path):
             print(f"Downloading val dataset: {dataset_name}-val.npz")
-            DatasetMethods.download_file(
-                f"{base_dir}/{dataset_name}-val.npz",
-                val_path,
-            )
+            DatasetMethods.download_file(f"{base_dir}/{dataset_name}-val.npz", val_path)
 
         print(f"Train path: {os.path.basename(train_path)}")
         print(f"Val path:   {os.path.basename(val_path)}")
@@ -126,25 +100,8 @@ class DatasetMethods:
         return env, train_dataset, val_dataset
 
     @staticmethod
-    def split_flat_dataset_into_transition_episodes(dataset: dict):
-        """
-        Splits flat OGBench arrays into raw transition episodes.
-
-        Each episode still has:
-            observations
-            actions
-            rewards
-            next_observations
-            terminals
-            masks, if available
-        """
-        required_keys = [
-            "observations",
-            "actions",
-            "rewards",
-            "next_observations",
-            "terminals",
-        ]
+    def flat_dataset_to_episodes(dataset: dict):
+        required_keys = ["observations", "actions", "rewards", "next_observations", "terminals"]
 
         for key in required_keys:
             if key not in dataset:
@@ -152,49 +109,43 @@ class DatasetMethods:
 
         terminals = np.asarray(dataset["terminals"]).astype(bool)
         episode_ends = np.where(terminals)[0]
-
         episodes = []
         start = 0
 
         for end in episode_ends:
-            ep = {
-                k: np.asarray(v[start:end + 1])
-                for k, v in dataset.items()
-            }
+            ep = {k: np.asarray(v[start:end + 1]) for k, v in dataset.items()}
             episodes.append(ep)
             start = end + 1
 
         if start < len(terminals):
-            ep = {
-                k: np.asarray(v[start:])
-                for k, v in dataset.items()
-            }
+            ep = {k: np.asarray(v[start:]) for k, v in dataset.items()}
             episodes.append(ep)
 
         return episodes
 
     @staticmethod
-    def transition_episode_to_dreamer_episode(
+    def ogbench_to_dreamer_episode(
         ep: dict,
         obs_key: str = "state",
         action_key: str = "action",
     ):
         """
-        Converts one raw OGBench transition episode into a Dreamer replay episode.
+        Converts one raw OGBench transition episode into a Dreamer replay episode. 
+        For N OGBench transitions, this creates N + 1 Dreamer time steps. This 
+        conversion is done as follows:
 
-        For N OGBench transitions, this creates N + 1 Dreamer time steps.
+            Dreamer state[0]        = OGBench observations[0]
+            Dreamer state[t + 1]    = OGBench next_observations[t]
+            
+            Dreamer action[t]       = OGBench actions[t]
+            Dreamer action[-1]      = zero padding (Dreamer dataset gets more 1 more
+                                      timestep and there is action to assign)
 
-        This alignment is important:
-
-            Dreamer state[0]      = OGBench observations[0]
-            Dreamer state[t + 1]  = OGBench next_observations[t]
-
-            Dreamer action[t]     = OGBench actions[t]
-            Dreamer action[-1]    = zero padding
-
-            Dreamer reward[0]     = 0
-            Dreamer reward[t + 1] = OGBench rewards[t]
+            Dreamer reward[0]       = 0 (Dreamer uses "reward for arriving at state[t + 1]"
+                                      so there isn't a reward at the state[0])
+            Dreamer reward[t + 1]   = OGBench rewards[t]
         """
+        
         obs = np.asarray(ep["observations"], dtype=np.float32)
         next_obs = np.asarray(ep["next_observations"], dtype=np.float32)
         actions = np.asarray(ep["actions"], dtype=np.float32)
@@ -208,62 +159,28 @@ class DatasetMethods:
         obs_dim = obs.shape[-1]
         action_dim = actions.shape[-1]
 
-        # N transitions become N + 1 Dreamer observations.
-        state_seq = np.concatenate(
-            [obs[:1], next_obs],
-            axis=0,
-        ).astype(np.float32)
+        # N transitions become N + 1 Dreamer observations
+        state_seq = np.concatenate([obs[:1], next_obs], axis=0).astype(np.float32)
+        
+        zero_action = np.zeros((1, action_dim), dtype=np.float32) # Process action
+        action_seq = np.concatenate([actions, zero_action], axis=0).astype(np.float32)
+        reward_seq = np.concatenate([np.zeros((1,), dtype=np.float32), rewards], axis=0).astype(np.float32) # Process reward
 
-        # data["action"][t] is the action taken at state[t].
-        # The final state has no known outgoing action, so pad with zero.
-        zero_action = np.zeros((1, action_dim), dtype=np.float32)
-        action_seq = np.concatenate(
-            [actions, zero_action],
-            axis=0,
-        ).astype(np.float32)
-
-        # reward[t] is the reward received when arriving at state[t].
-        # Initial state has no previous transition reward.
-        reward_seq = np.concatenate(
-            [
-                np.zeros((1,), dtype=np.float32),
-                rewards,
-            ],
-            axis=0,
-        ).astype(np.float32)
-
+        # Mark start and end of episodes
         is_first = np.zeros((num_transitions + 1,), dtype=bool)
         is_first[0] = True
+        is_last = np.concatenate([np.zeros((1,), dtype=bool), terminals], axis=0)
 
-        is_last = np.concatenate(
-            [
-                np.zeros((1,), dtype=bool),
-                terminals,
-            ],
-            axis=0,
-        )
-
-        is_terminal = is_last.copy()
-
-        # Optional extra target. Dreamer Agent.loss does not need this directly,
-        # but it can be useful for your own world-model-only loop.
+        # Boundaries where action is no longer consecutive is_terminal
         if "masks" in ep:
             masks = np.asarray(ep["masks"], dtype=np.float32)
-            discount = np.concatenate(
-                [
-                    np.ones((1,), dtype=np.float32),
-                    masks,
-                ],
-                axis=0,
-            )
+            is_terminal = np.concatenate([np.zeros((1,), dtype=bool), masks < 0.5], axis=0)
+            discount = np.concatenate([np.ones((1,), dtype=np.float32), masks], axis=0)
         else:
+            is_terminal = is_last.copy()
             discount = 1.0 - is_terminal.astype(np.float32)
 
-        # Dreamer expects stepid to exist in Agent._apply_replay_context().
-        # Shape should be [T, 20], dtype uint8.
-        stepid = np.zeros((num_transitions + 1, 20), dtype=np.uint8)
-
-        # consec is mainly useful for replay_context. We include it anyway.
+        stepid = np.zeros((num_transitions + 1, 20), dtype=np.uint8) # (T, 20), dtype uint8
         consec = np.arange(num_transitions + 1, dtype=np.int32)
 
         return {
@@ -285,26 +202,10 @@ class DatasetMethods:
         obs_key: str = "state",
         action_key: str = "action",
     ):
-        """
-        Full conversion:
-            flat OGBench dataset
-                -> transition episodes
-                -> Dreamer replay episodes
-                -> filter short episodes
-        """
-        transition_episodes = DatasetMethods.split_flat_dataset_into_transition_episodes(
-            dataset
-        )
-
+        transition_episodes = DatasetMethods.flat_dataset_to_episodes(dataset)
         dreamer_episodes = []
-
         for ep in transition_episodes:
-            dreamer_ep = DatasetMethods.transition_episode_to_dreamer_episode(
-                ep,
-                obs_key=obs_key,
-                action_key=action_key,
-            )
-
+            dreamer_ep = DatasetMethods.ogbench_to_dreamer_episode(ep, obs_key=obs_key, action_key=action_key)
             if len(dreamer_ep[obs_key]) >= min_length:
                 dreamer_episodes.append(dreamer_ep)
 
@@ -321,29 +222,14 @@ class DatasetMethods:
         force_reset_at_chunk_start: bool = True,
     ):
         """
-        Samples a flat Dreamer replay batch.
-
-        Returns:
-            {
-                "state": [B, T, obs_dim],
-                "action": [B, T, action_dim],
-                "reward": [B, T],
-                "is_first": [B, T],
-                "is_last": [B, T],
-                "is_terminal": [B, T],
-                "discount": [B, T],
-                "stepid": [B, T, 20],
-                "consec": [B, T],
-            }
+        Refer to class description for the shape of the 
+        dictionary returned for a dreamer batch. 
         """
+        
         if rng is None:
             rng = np.random.default_rng()
 
-        if len(episodes) == 0:
-            raise ValueError("No usable Dreamer episodes. Check min_length/seq_len.")
-
-        batch = {
-            obs_key: [],
+        batch = {obs_key: [],
             action_key: [],
             "reward": [],
             "is_first": [],
@@ -359,26 +245,14 @@ class DatasetMethods:
             ep_len = len(ep[obs_key])
 
             if ep_len < seq_len:
-                raise ValueError(
-                    f"Episode length {ep_len} is shorter than seq_len {seq_len}."
-                )
+                raise ValueError(f"Episode length {ep_len} is shorter than seq_len {seq_len}.")
 
             start = rng.integers(0, ep_len - seq_len + 1)
             end = start + seq_len
-
-            chunk = {
-                k: np.asarray(v[start:end]).copy()
-                for k, v in ep.items()
-            }
+            chunk = {k: np.asarray(v[start:end]).copy() for k, v in ep.items()}
 
             if force_reset_at_chunk_start:
-                # Since this sampled chunk starts with a fresh RSSM carry,
-                # the first step must reset the model state.
                 chunk["is_first"][0] = True
-
-                # The first reward/terminal target is not valid if the chunk
-                # starts in the middle of an episode, because the previous
-                # action/transition is outside the chunk.
                 chunk["reward"][0] = 0.0
                 chunk["is_terminal"][0] = False
                 chunk["is_last"][0] = False
@@ -405,26 +279,6 @@ class DatasetMethods:
         return out
 
     @staticmethod
-    def to_jax(batch: dict):
-        """
-        Converts NumPy batch to JAX arrays while preserving flat structure.
-        """
-        import jax.numpy as jnp
-
-        out = {}
-        for k, v in batch.items():
-            if v.dtype == np.bool_:
-                out[k] = jnp.asarray(v, dtype=bool)
-            elif v.dtype == np.uint8:
-                out[k] = jnp.asarray(v, dtype=jnp.uint8)
-            elif v.dtype == np.int32:
-                out[k] = jnp.asarray(v, dtype=jnp.int32)
-            else:
-                out[k] = jnp.asarray(v, dtype=jnp.float32)
-
-        return out
-
-    @staticmethod
     def sample_jax_dreamer_batch(
         episodes,
         batch_size: int,
@@ -447,21 +301,14 @@ class DatasetMethods:
         return DatasetMethods.to_jax(batch)
 
     @staticmethod
-    def make_spaces(
-        obs_dim: int,
-        action_dim: int,
-        obs_key: str = "state",
-        action_key: str = "action",
-    ):
+    def make_spaces(obs_dim: int, action_dim: int):
         """
-        Creates obs_space and act_space matching the flat batch.
-
-        This is useful if you initialize Dreamer's Agent or separate Encoder/RSSM.
+        Creates obs_space and act_space matching the flat batch, 
+        used for initializing Dreamer agent or the RSSM
         """
-        import elements
 
         obs_space = {
-            obs_key: elements.Space(np.float32, (obs_dim,)),
+            "state": elements.Space(np.float32, (obs_dim,)),
             "reward": elements.Space(np.float32, ()),
             "is_first": elements.Space(bool, (), 0, 2),
             "is_last": elements.Space(bool, (), 0, 2),
@@ -469,7 +316,7 @@ class DatasetMethods:
         }
 
         act_space = {
-            action_key: elements.Space(np.float32, (action_dim,)),
+            "action": elements.Space(np.float32, (action_dim,)),
         }
 
         return obs_space, act_space
@@ -490,3 +337,18 @@ class DatasetMethods:
             print(f"min length:  {lengths.min()}")
             print(f"mean length: {lengths.mean():.1f}")
             print(f"max length:  {lengths.max()}")
+    
+    @staticmethod
+    def to_jax(batch: dict): # Converts numpy batch to jax arrays
+        out = {}
+        for k, v in batch.items():
+            if v.dtype == np.bool_:
+                out[k] = jnp.asarray(v, dtype=bool)
+            elif v.dtype == np.uint8:
+                out[k] = jnp.asarray(v, dtype=jnp.uint8)
+            elif v.dtype == np.int32:
+                out[k] = jnp.asarray(v, dtype=jnp.int32)
+            else:
+                out[k] = jnp.asarray(v, dtype=jnp.float32)
+
+        return out
