@@ -3,6 +3,7 @@ import argparse
 import elements
 import numpy as np
 import ruamel.yaml as yaml
+import wandb
 from ogbench_dataset_methods import DatasetMethods
 from agent import WorldModelAgent
 
@@ -40,6 +41,10 @@ def train(
     ckpt_every: int = 5_000,
     presets: list = None,
     seed: int = 0,
+    wandb_project: str = 'world-model',
+    wandb_entity: str = None,
+    wandb_run_name: str = None,
+    wandb_mode: str = 'online',
 ):
     folder = pathlib.Path(__file__).parent
     logdir = folder / 'world_model_train_out'
@@ -48,6 +53,23 @@ def train(
     config = load_config(folder, presets)
     batch_size = config.batch_size if batch_size is None else batch_size
     seq_len = config.batch_length if seq_len is None else seq_len
+
+    wandb.init(
+        project=wandb_project,
+        entity=wandb_entity,
+        name=wandb_run_name,
+        mode=wandb_mode,
+        config={
+            'env_name': env_name,
+            'obs_key': obs_key,
+            'action_key': action_key,
+            'seq_len': seq_len,
+            'batch_size': batch_size,
+            'train_steps': train_steps,
+            'presets': presets,
+            'seed': seed,
+        },
+    )
 
     print(f'Loading OGBench dataset: {env_name}')
     env, train_dataset, val_dataset = DatasetMethods.load_ogbench(env_name)
@@ -72,10 +94,14 @@ def train(
     rng = np.random.default_rng(seed)
     eval_rng = np.random.default_rng(seed + 1)
 
-    def fmt(metrics, prefix='loss/'):
-        items = {k[len(prefix):]: float(v) for k, v in metrics.items()
-                if k.startswith(prefix)}
-        return '  '.join(f'{k}={v:.4f}' for k, v in sorted(items.items()))
+    def numeric_metrics(metrics, prefix=''):
+        out = {}
+        for k, v in metrics.items():
+            try:
+                out[f'{prefix}{k}'] = float(v)
+            except (TypeError, ValueError):
+                continue  # skip non-numeric entries, e.g. the optimizer's param summary string
+        return out
 
     print(f'Starting world model training for {train_steps} steps.')
     for step in range(1, train_steps + 1):
@@ -86,7 +112,7 @@ def train(
         train_carry, outs, metrics = agent.train(train_carry, batch)
 
         if step % log_every == 0:
-            print(f'step {step:>7}  {fmt(metrics)}')
+            wandb.log(numeric_metrics(metrics), step=step)
 
         if step % eval_every == 0:
             val_batch = DatasetMethods.sample_jax_dreamer_batch(
@@ -94,19 +120,21 @@ def train(
             val_batch.pop('discount')
             val_batch['seed'] = agent._seeds(step, agent.train_mirrored)
             eval_carry, eval_metrics = agent.report(eval_carry, val_batch)
-            print(f'  [eval] step {step:>7}  {fmt(eval_metrics)}')
+            wandb.log(numeric_metrics(eval_metrics, prefix='eval/'), step=step)
 
         if step % ckpt_every == 0:
             ckpt_path = logdir / f'checkpoint_{step}.npz'
             state = agent.save()
             np.savez(ckpt_path, **{k: np.asarray(v) for k, v in state.items()})
+            wandb.log({'checkpoint_step': step}, step=step)
             print(f'  saved checkpoint: {ckpt_path}')
 
     print('done')
+    wandb.finish()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--env_name', type=str, default='cube-single-singletask-v0')
+    parser.add_argument('--env_name', type=str, default='cube-single-play-singletask-v0')
     parser.add_argument('--obs_key', type=str, default='state')
     parser.add_argument('--action_key', type=str, default='action')
     parser.add_argument('--seq_len', type=int, default=None)
@@ -117,7 +145,12 @@ if __name__ == '__main__':
     parser.add_argument('--ckpt_every', type=int, default=5_000)
     parser.add_argument('--presets', type=str, nargs='*', default=None)
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--wandb_project', type=str, default='world-model')
+    parser.add_argument('--wandb_entity', type=str, default=None)
+    parser.add_argument('--wandb_run_name', type=str, default=None)
+    parser.add_argument('--wandb_mode', type=str, default='online',
+                         choices=['online', 'offline', 'disabled'])
     args = parser.parse_args()
     train(**vars(args))
-    
+
     # python train_world_model.py --env_name cube-single-play-singletask-v0 --presets debug
