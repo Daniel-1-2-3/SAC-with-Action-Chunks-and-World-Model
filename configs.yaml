@@ -14,6 +14,7 @@ defaults:
     prealloc: True
     jit: True
     debug: False
+    profiler: False
     expect_devices: 0
     enable_policy: True
     coordinator_address: ''
@@ -63,7 +64,7 @@ size_large:
 debug:
   batch_size: 8
   batch_length: 10
-  jax: {platform: cpu, debug: True, prealloc: False}
+  jax: {platform: cpu, debug: True, prealloc: False, profiler: False}
   .*\.layers: 1
   .*\.units: 8
   .*\.stoch: 2

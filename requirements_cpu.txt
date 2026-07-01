@@ -1,15 +1,20 @@
-numpy
-torch 
+torch
 ogbench
-numpy<2
-einops
-elements>=3.19.1
-ninjax>=3.5.1
 jax[cpu]==0.4.33
+numpy<2
 optax
 chex
+einops
 jaxtyping
+ninjax>=3.5.1
+elements>=3.17.0
+google-resumable-media>=2.7.2
+granular>=0.20.3
 portal>=3.5.0
 scope>=0.4.4
+av
+colored_traceback
+ipdb
 requests
-# python -m pip install --no-deps git+https://github.com/danijar/embodied.git
+tqdm
+# git clone https://github.com/danijar/embodied.git

@@ -301,14 +301,14 @@ class DatasetMethods:
         return DatasetMethods.to_jax(batch)
 
     @staticmethod
-    def make_spaces(obs_dim: int, action_dim: int):
+    def make_spaces(obs_dim: int, action_dim: int, obs_key: str = "state", action_key: str = "action"):
         """
         Creates obs_space and act_space matching the flat batch, 
         used for initializing Dreamer agent or the RSSM
         """
 
         obs_space = {
-            "state": elements.Space(np.float32, (obs_dim,)),
+            obs_key: elements.Space(np.float32, (obs_dim,)),
             "reward": elements.Space(np.float32, ()),
             "is_first": elements.Space(bool, (), 0, 2),
             "is_last": elements.Space(bool, (), 0, 2),
@@ -316,7 +316,7 @@ class DatasetMethods:
         }
 
         act_space = {
-            "action": elements.Space(np.float32, (action_dim,)),
+            action_key: elements.Space(np.float32, (action_dim,)),
         }
 
         return obs_space, act_space
