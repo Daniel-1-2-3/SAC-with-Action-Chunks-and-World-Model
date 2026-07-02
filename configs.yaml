@@ -23,7 +23,7 @@ defaults:
 
     loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1}
 
-    opt: {lr: 4e-5, agc: 0.3, eps: 1e-20, beta1: 0.9, beta2: 0.999,
+    opt: {lr: 2e-4, agc: 0.5, eps: 1e-20, beta1: 0.9, beta2: 0.999,
           momentum: True, wd: 0.0, schedule: const, warmup: 1000, anneal: 0}
 
     horizon: 333
@@ -31,26 +31,26 @@ defaults:
 
     dyn:
       typ: rssm
-      rssm: {deter: 1024, hidden: 256, stoch: 32, classes: 32, act: silu,
+      rssm: {deter: 512, hidden: 128, stoch: 32, classes: 32, act: silu,
              norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in,
              imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False,
              blocks: 8, free_nats: 1.0}
 
     enc:
       typ: simple
-      simple: {layers: 3, units: 512, act: silu, norm: rms,
+      simple: {layers: 3, units: 256, act: silu, norm: rms,
                winit: trunc_normal_in, symlog: True}
 
     dec:
       typ: simple
-      simple: {layers: 3, units: 512, act: silu, norm: rms, outscale: 1.0,
+      simple: {layers: 3, units: 256, act: silu, norm: rms, outscale: 1.0,
                winit: trunc_normal_in, symlog: True}
 
-    rewhead: {layers: 1, units: 512, act: silu, norm: rms,
+    rewhead: {layers: 1, units: 256, act: silu, norm: rms,
               output: symexp_twohot, outscale: 0.0, winit: trunc_normal_in,
               bins: 255}
 
-    conhead: {layers: 1, units: 512, act: silu, norm: rms, output: binary,
+    conhead: {layers: 1, units: 256, act: silu, norm: rms, output: binary,
               outscale: 1.0, winit: trunc_normal_in}
 
 size_small:
@@ -60,6 +60,9 @@ size_small:
 size_large:
   .*\.rssm: {deter: 2048, hidden: 512, classes: 32}
   .*\.units: 512
+
+cpu:
+  jax: {platform: cpu, prealloc: False}
 
 debug:
   batch_size: 8
