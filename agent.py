@@ -122,12 +122,16 @@ class WorldModelAgent(embodied.embodied.jax.Agent): # From Dreamer, policy code 
             dec_carry, repfeat, reset, training)
 
         inp = self.feat2tensor(repfeat)
-        losses['rew'] = self.rew(inp, 2).loss(obs['reward'])
+        rew_dist = self.rew(inp, 2)
+        losses['rew'] = rew_dist.loss(obs['reward'])
+        metrics['pred/rew'] = rew_dist.pred()
 
         con = f32(~obs['is_terminal'])
         if self.config.contdisc:
             con *= 1 - 1 / self.config.horizon
-        losses['con'] = self.con(inp, 2).loss(con)
+        con_dist = self.con(inp, 2)
+        losses['con'] = con_dist.loss(con)
+        metrics['pred/con'] = con_dist.pred()
 
         for key, recon in recons.items():
             space, value = self.obs_space[key], obs[key]

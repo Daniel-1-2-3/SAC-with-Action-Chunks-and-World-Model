@@ -83,7 +83,7 @@ class DatasetMethods:
             DatasetMethods.download_file(f"{base_dir}/{dataset_name}-val.npz", val_path)
 
         print(f"Train path: {os.path.basename(train_path)}")
-        print(f"Val path:   {os.path.basename(val_path)}")
+        print(f"Val path: {os.path.basename(val_path)}")
 
         return train_path, val_path
 
