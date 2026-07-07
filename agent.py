@@ -106,6 +106,37 @@ class WorldModelAgent(embodied.embodied.jax.Agent): # From Dreamer, policy code 
 
         carry = (*new_carry, {k: data[k][:, -1] for k in self.act_space})
         return carry, metrics
+    
+    def init_imagine(self, batch_size):
+        return self.dyn.initial(batch_size)
+
+    def encode_posterior(self, batch_size, data):
+        enc_carry, dyn_carry, dec_carry, prevact_carry = self.init_train(batch_size)
+        obs = {k: data[k] for k in self.obs_space}
+        prevact = self._shift_actions(prevact_carry, data)
+        reset = obs['is_first']
+
+        enc_carry, enc_entries, tokens = self.enc(enc_carry, obs, reset, training=False)
+        dyn_carry, dyn_entries, feat = self.dyn.observe(
+            dyn_carry, tokens, prevact, reset, training=False)
+
+        # Public contract: always float32 out, regardless of internal compute dtype.
+        dyn_entries = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), dyn_entries)
+        return dyn_entries
+
+    def imagine_step(self, dyn_carry, action):
+        dyn_carry, action = nn.cast((dyn_carry, action))
+        next_carry, (feat, _) = self.dyn.imagine(
+            dyn_carry, action, 1, training=False, single=True)
+        inp = self.feat2tensor(feat)
+        reward = self.rew(inp, 1).pred()
+        cont = self.con(inp, 1).pred()
+
+        next_carry = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), next_carry)
+        inp = inp.astype(jnp.float32)
+        reward = reward.astype(jnp.float32)
+        cont = cont.astype(jnp.float32)
+        return next_carry, inp, reward, cont
 
     def loss(self, carry, obs, prevact, training):
         enc_carry, dyn_carry, dec_carry = carry

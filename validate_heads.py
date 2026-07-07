@@ -1,3 +1,7 @@
+# Validates rewards and continue heads of world model
+# JAX op tests for using imagination rollouts
+import jax
+print('devices at script start:', jax.devices())
 import pathlib
 import argparse
 import numpy as np
@@ -5,6 +9,54 @@ import elements
 import ruamel.yaml as yaml
 from ogbench_dataset_methods import DatasetMethods
 from agent import WorldModelAgent
+
+def jax_tests(agent, val_episodes, batch_size, seq_len, obs_key, action_key, rng):
+    import jax
+    import jax.numpy as jnp
+    import ninjax as nj
+    from embodied.embodied.jax import transform
+
+    mesh = agent.train_mesh
+    tp = agent.train_params_sharding
+    tm = agent.train_mirrored
+    ts = agent.train_sharded
+    ar = agent.partition_rules[1]
+
+    _encode_posterior = transform.apply(
+        nj.pure(agent.model.encode_posterior), mesh,
+        (tp, tm, ts), (ts,), ar,
+        static_argnums=(2,), single_output=True,
+    )
+
+    batch = DatasetMethods.sample_jax_dreamer_batch(
+        val_episodes, batch_size, seq_len, obs_key, action_key, rng=rng)
+    seed_arr = agent._seeds(1, agent.train_mirrored)
+    pool = _encode_posterior(agent.params, seed_arr, batch_size, batch)
+    print(jax.tree_util.tree_map(lambda x: x.shape, pool))
+
+    _imagine_step = transform.apply(
+        nj.pure(agent.model.imagine_step), mesh,
+        (tp, tm, ts, ts), (ts, ts, ts, ts), ar,
+    )
+
+    # convert to plain numpy, then flatten/slice in numpy 
+    # avoid any bare jax-array indexing outside a jit-wrapped call
+    # flatten (batch, time, ...) -> (batch*time, ...) and take a slice to use as test starting states
+    flat_carry = {k: np.asarray(v).astype(np.float32).reshape((-1,) + v.shape[2:]) for k, v in pool.items()}
+    test_n = 8
+    carry_slice = {k: v[:test_n] for k, v in flat_carry.items()}
+    
+    # build a random action to step forward with (action dim=5)
+    rand_action = {action_key: np.random.uniform(-1, 1, size=(test_n, 5)).astype(np.float32)}
+
+    seed_arr2 = agent._seeds(2, agent.train_mirrored)
+    next_carry, feat_flat, reward, cont = _imagine_step(
+        agent.params, seed_arr2, carry_slice, rand_action)
+
+    print('next_carry:', jax.tree_util.tree_map(lambda x: x.shape, next_carry))
+    print('feat_flat:', feat_flat.shape)
+    print('reward:', np.asarray(reward))
+    print('cont:', np.asarray(cont))
 
 def load_config(folder, presets=None):
     configs_txt = elements.Path(folder / 'configs.yaml').read()
@@ -71,6 +123,8 @@ def validate_heads(env_name, obs_key, action_key, presets, seed, ckpt, n_batches
 
     rng = np.random.default_rng(seed)
     carry = agent.init_report(batch_size)
+    
+    jax_tests(agent, val_episodes, batch_size, seq_len, obs_key, action_key, rng)
 
     all_true_rew, all_pred_rew = [], []
     all_true_con, all_pred_con = [], []
@@ -150,3 +204,5 @@ if __name__ == '__main__':
     parser.add_argument('--n_batches', type=int, default=20)
     args = parser.parse_args()
     validate_heads(**vars(args))
+    
+    # python validate_heads.py --env_name cube-single-play-singletask-v0 --ckpt checkpoints_cube_single_play_v0/checkpoint_20000.npz

@@ -1,6 +1,6 @@
 Total timesteps checked: 20480
-'At target' (reward=0) timesteps: 513 (2.50%)
-'Not at target:' (reward=-1) timesteps: 19967 (97.50%)
+'At target' (reward=0) timesteps: 546 (2.67%)
+'Not at target:' (reward=-1) timesteps: 19934 (97.33%)
 
 The following logged metrics looks at transitions where the reward
 is -1.0 (not at target) and 0.0 (at target). If the mean predicted reward for 0.0
@@ -8,15 +8,15 @@ at target situations (which is rare) is near 0.0, it means that the model is
 actually predicting 0.0 when it is supposed to, and not blindly outputing -1.0
 
 reward = -1.0, not at target:
-Predicted reward mean: -0.99640 (true: -1.0)
-Predicted reward std: 0.04839
+Predicted reward mean: -0.99478 (true: -1.0)
+Predicted reward std: 0.05657
 
 reward = 0.0, at target:
-Count: 513
-Predicted reward mean: -0.04498 (true: 0.0)
-Predicted reward std: 0.12271
-MAE (model): 0.04498
+Count: 546
+Predicted reward mean: -0.06990 (true: 0.0)
+Predicted reward std: 0.16874
+MAE (model): 0.06990
 MAE (always predict -1.0): 1.00000 (majority-class baseline)
 
-Terminal timesteps found: 193
-Predicted continue-prob at true terminals (should be low): 0.04663
+Terminal timesteps found: 226
+Predicted continue-prob at true terminals (should be low): 0.09292
