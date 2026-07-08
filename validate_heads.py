@@ -48,6 +48,9 @@ def jax_tests(agent, val_episodes, batch_size, seq_len, obs_key, action_key, rng
     
     # build a random action to step forward with (action dim=5)
     rand_action = {action_key: np.random.uniform(-1, 1, size=(test_n, 5)).astype(np.float32)}
+    
+    carry_slice = jax.device_put(carry_slice, ts)
+    rand_action = jax.device_put(rand_action, ts)
 
     seed_arr2 = agent._seeds(2, agent.train_mirrored)
     next_carry, feat_flat, reward, cont = _imagine_step(

@@ -1,7 +1,8 @@
 torch
 ogbench
-jax[cpu]==0.4.33
+jax[cuda12]==0.4.33
 numpy<2
+nvidia-cuda-nvcc-cu12<=12.2
 optax
 chex
 einops
@@ -18,6 +19,7 @@ ipdb
 requests
 tqdm
 wandb
+hydra
 
 # git clone https://github.com/danijar/embodied.git
 # wandb login
