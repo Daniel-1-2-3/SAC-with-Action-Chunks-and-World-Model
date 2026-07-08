@@ -385,3 +385,5 @@ if __name__ == '__main__':
                          choices=['online', 'offline', 'disabled'])
     args = parser.parse_args()
     train(**vars(args))
+    
+    # python drqv2_world_model.py --env_name cube-single-play-singletask-v0 --wm_ckpt checkpoints_cube_single_play_v0/checkpoint_20000.npz
