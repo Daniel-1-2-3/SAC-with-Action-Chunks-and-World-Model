@@ -1,6 +1,6 @@
 torch
 ogbench
-jax[cpu]
+jax[cpu]==0.4.33
 numpy<2
 optax
 chex

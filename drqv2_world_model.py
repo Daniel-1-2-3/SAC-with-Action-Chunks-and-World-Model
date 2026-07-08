@@ -56,11 +56,10 @@ def numeric_metrics(metrics, prefix=''):
 
 def jax_to_torch(x, device):
     x = jnp.asarray(x).astype(jnp.float32)
-    return torch.as_tensor(np.asarray(x).copy(), device=device).float()
+    return torch.as_tensor(jax.device_get(x).copy(), device=device).float()
 
 def flatten_leading_two_dims_np(tree):
-    # dict of [B, T, ...] JAX arrays -> dict of [B*T, ...] numpy arrays
-    return {k: np.asarray(v).reshape((-1,) + v.shape[2:]) for k, v in tree.items()}
+    return {k: jax.device_get(v).reshape((-1,) + v.shape[2:]) for k, v in tree.items()}
 
 def subsample_tree_np(tree, n, rng):
     total = next(iter(tree.values())).shape[0]
@@ -84,8 +83,8 @@ class WorldModelBridge:
 
         self._encode_posterior = transform.apply(
             nj.pure(self.model.encode_posterior), self.mesh,
-            (tp, tm, self.ts), # params, seed, data (batch_size is static below)
-            (self.ts,), # single output: the seed pool
+            (tp, tm, self.ts),
+            (self.ts,),
             ar,
             static_argnums=(2,),
             single_output=True,
@@ -93,8 +92,8 @@ class WorldModelBridge:
         
         self._imagine_step = transform.apply(
             nj.pure(self.model.imagine_step), self.mesh,
-            (tp, tm, self.ts, self.ts), # params, seed, dyn_carry, action
-            (self.ts, self.ts, self.ts, self.ts), # next_carry, feat_flat, reward, cont
+            (tp, tm, self.ts, self.ts),
+            (self.ts, self.ts, self.ts, self.ts),
             ar,
         )
         
@@ -112,7 +111,7 @@ class WorldModelBridge:
     def place_seed(self, seed_carry_np):
         return jax.device_put(seed_carry_np, self.ts)
 
-    def get_feat(self, dyn_carry): # Latent state to flat tensor
+    def get_feat(self, dyn_carry):
         return self.model.feat2tensor(dyn_carry)
 
     def img_step(self, dyn_carry, action_np):
@@ -120,6 +119,7 @@ class WorldModelBridge:
         action = jax.device_put(action, self.ts)
         return self._imagine_step(
             self.agent.params, self._next_seed(), dyn_carry, action)
+
 class WorldModelDrQV2Agent:
     def __init__(self, repr_dim, action_shape, device, lr, feature_dim,
                  hidden_dim, critic_target_tau, stddev_schedule, stddev_clip,
@@ -206,8 +206,6 @@ class WorldModelDrQV2Agent:
         }
 
 def imagine_rollout(bridge, actor, seed_carry, horizon, stddev, device):
-    """Roll `horizon` steps of imagination forward from seed latents using
-    the current actor. Every step becomes an independent 1-step transition."""
     carry = seed_carry
     feat_t = jax_to_torch(bridge.get_feat(carry), device)
 
@@ -304,7 +302,7 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
         train_episodes, seed_batch_size, seq_len_seed, obs_key, action_key, rng=rng)
     probe_pool = bridge.seed_pool(probe_batch, seed_batch_size)
     probe_carry = bridge.place_seed(subsample_tree_np(probe_pool, 8, rng))
-    feat_dim = int(np.asarray(bridge.get_feat(probe_carry)).shape[-1])
+    feat_dim = int(bridge.get_feat(probe_carry).shape[-1])
     print(f'Detected latent feature dim: {feat_dim}')
 
     policy = WorldModelDrQV2Agent(
