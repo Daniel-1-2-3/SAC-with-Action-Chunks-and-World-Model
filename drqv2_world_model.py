@@ -1,25 +1,9 @@
-"""
-Per training step:
-  1. sample a real sequence batch from OGBench
-  2. encode_posterior() -> pool of real posterior latents (one per timestep)
-  3. subsample a training-size batch of seed latents from that pool
-  4. imagine_rollout(): roll `horizon` steps forward using the current actor
-     and imagine_step() (prior-only dynamics, no real observations)
-  5. every imagined step becomes a 1-step (obs, action, reward, discount,
-     next_obs) transition, fed into the unmodified DrQ-v2 critic/actor update
-
-NOTE: this uses flat 1-step transitions, not n-step returns / lambda-returns.
-That's a real mismatch with your n-step DrQ-v2 baseline (ReplayBuffer's
-_sample() sums n real rewards before bootstrapping) -- worth fixing before
-treating this as an apples-to-apples comparison. Flag if you want that next.
-"""
+import jax
+print(jax.devices())
 
 import argparse
 import pathlib
-
 import numpy as np
-import jax
-print(jax.devices())
 import jax.numpy as jnp
 import ninjax as nj
 import torch
@@ -34,11 +18,6 @@ from ogbench_dataset_methods import DatasetMethods
 from agent import WorldModelAgent
 from embodied.embodied.jax import transform
 
-
-# ---------------------------------------------------------------------------
-# Config loading (duplicated from validate_heads.py for a self-contained script)
-# ---------------------------------------------------------------------------
-
 def load_config(folder, presets=None):
     configs_txt = elements.Path(folder / 'configs.yaml').read()
     configs = yaml.YAML(typ='safe').load(configs_txt)
@@ -46,7 +25,6 @@ def load_config(folder, presets=None):
     for name in (presets or []):
         config = config.update(configs[name])
     return config
-
 
 def build_agent_config(config, batch_size, seq_len, logdir):
     return elements.Config(
@@ -62,12 +40,10 @@ def build_agent_config(config, batch_size, seq_len, logdir):
         replicas=1,
     )
 
-
 def unwrap(v):
     if isinstance(v, np.ndarray) and v.dtype == object and v.shape == ():
         return v.item()
     return v
-
 
 def numeric_metrics(metrics, prefix=''):
     out = {}
@@ -75,50 +51,25 @@ def numeric_metrics(metrics, prefix=''):
         try:
             out[f'{prefix}{k}'] = float(v)
         except (TypeError, ValueError):
-            continue  # skip non-numeric entries
+            continue
     return out
 
-
-# ---------------------------------------------------------------------------
-# JAX <-> PyTorch bridging (data only, no gradients cross the boundary --
-# DrQ-v2's actor loss only ever backprops through the critic, never through
-# the world model, so this doesn't need to be differentiable)
-# ---------------------------------------------------------------------------
-
 def jax_to_torch(x, device):
-    # feat2tensor (called via get_feat) runs in the model's bf16 compute
-    # dtype and isn't wrapped with the float32 cast imagine_step/
-    # encode_posterior have -- cast explicitly here so torch never sees
-    # ml_dtypes.bfloat16, which torch.as_tensor can't convert.
     x = jnp.asarray(x).astype(jnp.float32)
     return torch.as_tensor(np.asarray(x).copy(), device=device).float()
 
-
 def flatten_leading_two_dims_np(tree):
-    """dict of [B, T, ...] JAX arrays -> dict of [B*T, ...] numpy arrays.
-    Done in numpy, not jnp -- raw jax-array reshape/indexing outside a
-    jit-wrapped call hits 'Disallowed host-to-device transfer' under this
-    project's JAX config, same failure we hit slicing carry_slice earlier."""
+    # dict of [B, T, ...] JAX arrays -> dict of [B*T, ...] numpy arrays
     return {k: np.asarray(v).reshape((-1,) + v.shape[2:]) for k, v in tree.items()}
-
 
 def subsample_tree_np(tree, n, rng):
     total = next(iter(tree.values())).shape[0]
     idx = rng.choice(total, size=min(n, total), replace=False)
     return {k: v[idx] for k, v in tree.items()}
 
-
-# ---------------------------------------------------------------------------
-# World model bridge -- thin wrapper around the new WorldModelAgent methods
-# ---------------------------------------------------------------------------
-
 class WorldModelBridge:
-    """Wraps encode_posterior/imagine_step with transform.apply, using the
-    same mesh/sharding/partition-rule objects that Agent.__init__ already
-    used to build the working _report/_train/_policy entry points. This is
-    required, not optional -- calling these nj.Module-backed methods without
-    it hits 'Disallowed host-to-device transfer' errors under this configured
-    JAX setup, regardless of the seed-construction fix from earlier."""
+    """ Sorts out JAX and ninjax complexities so other classes do not have
+    to directly touch these parts """
 
     def __init__(self, wm_agent, action_key):
         self.agent = wm_agent
@@ -133,18 +84,20 @@ class WorldModelBridge:
 
         self._encode_posterior = transform.apply(
             nj.pure(self.model.encode_posterior), self.mesh,
-            (tp, tm, self.ts),   # params, seed, data (batch_size is static below)
-            (self.ts,),          # single output: the seed pool
+            (tp, tm, self.ts), # params, seed, data (batch_size is static below)
+            (self.ts,), # single output: the seed pool
             ar,
             static_argnums=(2,),
             single_output=True,
         )
+        
         self._imagine_step = transform.apply(
             nj.pure(self.model.imagine_step), self.mesh,
-            (tp, tm, self.ts, self.ts),       # params, seed, dyn_carry, action
-            (self.ts, self.ts, self.ts, self.ts),  # next_carry, feat_flat, reward, cont
+            (tp, tm, self.ts, self.ts), # params, seed, dyn_carry, action
+            (self.ts, self.ts, self.ts, self.ts), # next_carry, feat_flat, reward, cont
             ar,
         )
+        
         self._seed_counter = 0
 
     def _next_seed(self):
@@ -152,25 +105,14 @@ class WorldModelBridge:
         return self.agent._seeds(self._seed_counter, self.agent.train_mirrored)
 
     def seed_pool(self, batch, batch_size):
-        """Returns a flat pool of real posterior latents as plain numpy,
-        shape (B*T, ...). Kept in numpy so it can be freely sliced/subsampled
-        without hitting jit placement errors -- convert back to on-device
-        arrays via place_seed() right before feeding into img_step."""
         pool = self._encode_posterior(
             self.agent.params, self._next_seed(), batch_size, batch)
         return flatten_leading_two_dims_np(pool)
 
     def place_seed(self, seed_carry_np):
-        """Explicitly place a numpy carry dict on-device with the sharding
-        img_step expects. Required -- handing raw numpy/jnp arrays built
-        outside a jit call directly to a jit-wrapped function fails under
-        this project's JAX config."""
         return jax.device_put(seed_carry_np, self.ts)
 
-    def get_feat(self, dyn_carry):
-        # Plain jnp math (concat/reshape), no nj.Module state involved --
-        # safe to call directly as long as dyn_carry is already on-device
-        # (i.e. came from place_seed() or a prior img_step() call).
+    def get_feat(self, dyn_carry): # Latent state to flat tensor
         return self.model.feat2tensor(dyn_carry)
 
     def img_step(self, dyn_carry, action_np):
@@ -178,18 +120,7 @@ class WorldModelBridge:
         action = jax.device_put(action, self.ts)
         return self._imagine_step(
             self.agent.params, self._next_seed(), dyn_carry, action)
-
-
-# ---------------------------------------------------------------------------
-# DrQ-v2 actor-critic, minus the pixel encoder/augmentation
-# ---------------------------------------------------------------------------
-
 class WorldModelDrQV2Agent:
-    """Same Actor/Critic architecture and critic/actor losses as your
-    DrQV2Agent, operating on world-model latent features instead of pixel
-    encodings. No CNN encoder, no image augmentation -- neither means
-    anything once the 'observation' is already an RSSM latent vector."""
-
     def __init__(self, repr_dim, action_shape, device, lr, feature_dim,
                  hidden_dim, critic_target_tau, stddev_schedule, stddev_clip,
                  gamma, use_tb=False):
@@ -274,11 +205,6 @@ class WorldModelDrQV2Agent:
             'critic_target': self.critic_target.state_dict(),
         }
 
-
-# ---------------------------------------------------------------------------
-# Imagination rollout
-# ---------------------------------------------------------------------------
-
 def imagine_rollout(bridge, actor, seed_carry, horizon, stddev, device):
     """Roll `horizon` steps of imagination forward from seed latents using
     the current actor. Every step becomes an independent 1-step transition."""
@@ -307,11 +233,6 @@ def imagine_rollout(bridge, actor, seed_carry, horizon, stddev, device):
 
     return (torch.cat(feats), torch.cat(actions), torch.cat(rewards),
             torch.cat(conts), torch.cat(next_feats))
-
-
-# ---------------------------------------------------------------------------
-# Main training loop
-# ---------------------------------------------------------------------------
 
 def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
           imagination_batch, seq_len_seed, num_train_steps, log_every,
@@ -379,8 +300,6 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
     rng = np.random.default_rng(seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Determine latent feature dim empirically rather than guessing rssm
-    # config keys (deter / stoch / classes).
     probe_batch = DatasetMethods.sample_jax_dreamer_batch(
         train_episodes, seed_batch_size, seq_len_seed, obs_key, action_key, rng=rng)
     probe_pool = bridge.seed_pool(probe_batch, seed_batch_size)
@@ -436,7 +355,6 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
     torch.save(policy.state_dict_all(), out_dir / 'policy_final.pt')
     print(f"Done. Final policy saved to {out_dir / 'policy_final.pt'}")
     wandb.finish()
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
