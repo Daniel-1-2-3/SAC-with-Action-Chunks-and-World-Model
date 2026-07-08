@@ -1,3 +1,6 @@
+import os
+os.environ['MUJOCO_GL'] = 'egl'
+
 import jax
 print(jax.devices())
 
@@ -273,6 +276,16 @@ def eval_in_env(env, bridge, policy, action_dim, num_episodes, device, obs_key, 
     returns, successes = [], []
     frames = []
 
+    def safe_render():
+        nonlocal record_video
+        if not record_video:
+            return
+        try:
+            frames.append(env.render())
+        except Exception as e:
+            print(f'Video recording failed, disabling for this eval: {e}')
+            record_video = False
+
     for ep in range(num_episodes):
         obs, info = env.reset()
         enc_carry, dyn_carry = bridge.init_encode(1)
@@ -282,8 +295,8 @@ def eval_in_env(env, bridge, policy, action_dim, num_episodes, device, obs_key, 
         ep_return = 0.0
         ep_success = False
 
-        if record_video and ep == 0:
-            frames.append(env.render())
+        if ep == 0:
+            safe_render()
 
         while not done:
             state = extract_state(obs, obs_key)
@@ -297,8 +310,8 @@ def eval_in_env(env, bridge, policy, action_dim, num_episodes, device, obs_key, 
             ep_return += float(reward)
             ep_success = ep_success or bool(info.get('success', reward == 0))
 
-            if record_video and ep == 0:
-                frames.append(env.render())
+            if ep == 0:
+                safe_render()
 
             prevact = action.reshape(1, -1).astype(np.float32)
             is_first = np.array([False])
