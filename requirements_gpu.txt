@@ -19,7 +19,6 @@ ipdb
 requests
 tqdm
 wandb
-hydra
 
 # git clone https://github.com/danijar/embodied.git
 # wandb login

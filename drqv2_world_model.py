@@ -1,12 +1,4 @@
 """
-train_policy_with_world_model.py
-
-Trains a DrQ-v2-style actor-critic entirely via latent imagination through a
-pretrained/frozen world model (RSSM), seeded from the OGBench offline dataset.
-
-REQUIRES: agent_py_additions.py's three methods (init_imagine, encode_posterior,
-imagine_step) added to WorldModelAgent in agent.py.
-
 Per training step:
   1. sample a real sequence batch from OGBench
   2. encode_posterior() -> pool of real posterior latents (one per timestep)
