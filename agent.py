@@ -137,6 +137,18 @@ class WorldModelAgent(embodied.embodied.jax.Agent): # From Dreamer, policy code 
         reward = reward.astype(jnp.float32)
         cont = cont.astype(jnp.float32)
         return next_carry, inp, reward, cont
+    
+    def init_encode(self, batch_size):
+        return self.enc.initial(batch_size), self.dyn.initial(batch_size)
+
+    def encode_step(self, enc_carry, dyn_carry, obs, prevact, is_first):
+        enc_carry, enc_entries, tokens = self.enc(enc_carry, obs, is_first, training=False, single=True)
+        dyn_carry, entry, feat = self.dyn.observe(dyn_carry, tokens, prevact, is_first, training=False, single=True)
+        inp = self.feat2tensor(dyn_carry)
+        enc_carry = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), enc_carry)
+        dyn_carry = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), dyn_carry)
+        inp = inp.astype(jnp.float32)
+        return enc_carry, dyn_carry, inp
 
     def loss(self, carry, obs, prevact, training):
         enc_carry, dyn_carry, dec_carry = carry
