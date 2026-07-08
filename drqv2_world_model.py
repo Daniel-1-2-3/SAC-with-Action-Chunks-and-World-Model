@@ -175,11 +175,12 @@ class WorldModelDrQV2Agent:
         self.critic.train(training)
 
     def act(self, feat, step, eval_mode):
-        feat = torch.as_tensor(feat, device=self.device).unsqueeze(0).float()
-        stddev = utils.schedule(self.stddev_schedule, step)
-        dist = self.actor(feat, stddev)
-        action = dist.mean if eval_mode else dist.sample(clip=None)
-        return action.cpu().numpy()[0]
+        with torch.no_grad():
+            feat = torch.as_tensor(feat, device=self.device).unsqueeze(0).float()
+            stddev = utils.schedule(self.stddev_schedule, step)
+            dist = self.actor(feat, stddev)
+            action = dist.mean if eval_mode else dist.sample(clip=None)
+            return action.cpu().numpy()[0]
 
     def update_critic(self, obs, action, reward, discount, next_obs, step):
         metrics = dict()
@@ -277,7 +278,7 @@ def eval_in_env(env, bridge, policy, action_dim, num_episodes, device, obs_key):
             state = extract_state(obs, obs_key)
             enc_carry, dyn_carry, feat_j = bridge.encode_step(
                 enc_carry, dyn_carry, state, prevact, is_first)
-            feat_np = np.asarray(jax.device_get(feat_j))[0]
+            feat_np = np.asarray(jax.device_get(feat_j))[0].copy()
             action = policy.act(feat_np, step=0, eval_mode=True)
 
             next_obs, reward, terminated, truncated, info = env.step(action)
@@ -460,4 +461,4 @@ if __name__ == '__main__':
     args = parser.parse_args()
     train(**vars(args))
 
-    # python drqv2_world_model.py --env_name cube-single-play-singletask-v0 --wm_ckpt checkpoints_cube_single_play_v0/checkpoint_20000.npz
+    # python drqv2_world_model.py --env_name cube-single-play-singletask-v0 --wm_ckpt checkpoints_cube_single_play_v0/checkpoint_20000.npz --horizon 10
