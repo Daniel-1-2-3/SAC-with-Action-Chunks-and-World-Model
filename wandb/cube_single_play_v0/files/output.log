@@ -1,0 +1,85 @@
+Loading OGBench dataset: cube-single-play-singletask-v0
+Train path: cube-single-play-v0.npz
+Val path:   cube-single-play-v0-val.npz
+C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\gymnasium\envs\registration.py:728: UserWarning: [33mWARN: The environment is being initialised with render_mode='rgb_array' that is not in the possible render_modes ([]).[0m
+  logger.warn(
+C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\gymnasium\spaces\box.py:236: UserWarning: [33mWARN: Box low's precision lowered by casting to float32, current low.dtype=float64[0m
+  gym.logger.warn(
+C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\gymnasium\spaces\box.py:306: UserWarning: [33mWARN: Box high's precision lowered by casting to float32, current high.dtype=float64[0m
+  gym.logger.warn(
+Dataset keys: ['observations', 'actions', 'terminals', 'next_observations', 'rewards', 'masks']
+obs_dim=28, action_dim=5
+total_transitions=1000000
+usable Dreamer episodes: 1000
+min length:  1001
+mean length: 1001.0
+max length:  1001
+[36mObservations[0m
+  state            Space[0m[37m([0m[34mfloat32[0m[37m,[0m [0m[35mshape[0m[37m=[0m[0m[37m([0m[34m28[0m[37m,[0m[0m[37m)[0m[0m[37m,[0m [0m[35mlow[0m[37m=[0m[34m-inf[0m[37m,[0m [0m[35mhigh[0m[37m=[0m[34minf[0m[37m)[0m[0m
+  reward           Space[0m[37m([0m[34mfloat32[0m[37m,[0m [0m[35mshape[0m[37m=[0m[0m[37m([0m[0m[37m)[0m[0m[37m,[0m [0m[35mlow[0m[37m=[0m[34m-inf[0m[37m,[0m [0m[35mhigh[0m[37m=[0m[34minf[0m[37m)[0m[0m
+  is_first         Space[0m[37m([0m[34mbool[0m[37m,[0m [0m[35mshape[0m[37m=[0m[0m[37m([0m[0m[37m)[0m[0m[37m,[0m [0m[35mlow[0m[37m=[0m[34m0[0m[37m,[0m [0m[35mhigh[0m[37m=[0m[34m2[0m[37m)[0m[0m
+  is_last          Space[0m[37m([0m[34mbool[0m[37m,[0m [0m[35mshape[0m[37m=[0m[0m[37m([0m[0m[37m)[0m[0m[37m,[0m [0m[35mlow[0m[37m=[0m[34m0[0m[37m,[0m [0m[35mhigh[0m[37m=[0m[34m2[0m[37m)[0m[0m
+  is_terminal      Space[0m[37m([0m[34mbool[0m[37m,[0m [0m[35mshape[0m[37m=[0m[0m[37m([0m[0m[37m)[0m[0m[37m,[0m [0m[35mlow[0m[37m=[0m[34m0[0m[37m,[0m [0m[35mhigh[0m[37m=[0m[34m2[0m[37m)[0m[0m
+[36mActions[0m
+  action           Space[0m[37m([0m[34mfloat32[0m[37m,[0m [0m[35mshape[0m[37m=[0m[0m[37m([0m[34m5[0m[37m,[0m[0m[37m)[0m[0m[37m,[0m [0m[35mlow[0m[37m=[0m[34m-inf[0m[37m,[0m [0m[35mhigh[0m[37m=[0m[34minf[0m[37m)[0m[0m
+[36mExtras[0m
+  consec           Space[0m[37m([0m[34mint32[0m[37m,[0m [0m[35mshape[0m[37m=[0m[0m[37m([0m[0m[37m)[0m[0m[37m,[0m [0m[35mlow[0m[37m=[0m[34m-2147483648[0m[37m,[0m [0m[35mhigh[0m[37m=[0m[34m2147483647[0m[37m)[0m[0m
+  stepid           Space[0m[37m([0m[34muint8[0m[37m,[0m [0m[35mshape[0m[37m=[0m[0m[37m([0m[34m20[0m[37m,[0m[0m[37m)[0m[0m[37m,[0m [0m[35mlow[0m[37m=[0m[34m0[0m[37m,[0m [0m[35mhigh[0m[37m=[0m[34m255[0m[37m)[0m[0m
+JAX devices [0m[37m([0m[34m1[0m[37m)[0m[0m[37m:[0m [0m[36m[TFRT_CPU_0][0m
+Policy devices: TFRT_CPU_0
+Train devices:  TFRT_CPU_0
+[33mInitializing parameters...[0m
+Optimizer opt has 2,499,484 params:
+       973,440 dyn
+       533,020 dec
+       459,263 rew
+       393,985 con
+       139,776 enc
+[33mDone initializing![0m
+[33mCompiling 1 checkpoint groups...[0m
+Largest checkpoint group: 0 GB
+[33mCompiling train and report...[0m
+Train cost analysis:
+  FLOPS:            1.1e+10
+  Memory (temp):    1.7e+08
+  Memory (inputs):  3.0e+07
+  Memory (outputs): 3.6e+07
+  Memory (code):    9.7e+05
+
+Report cost analysis:
+  FLOPS:            3.7e+09
+  Memory (temp):    2.4e+07
+  Memory (inputs):  1.0e+07
+  Memory (outputs): 5.0e+04
+  Memory (code):    2.9e+05
+
+[33mDone compiling![0m
+Starting world model training for 100000 steps.
+  saved checkpoint: C:\Daniel\High School\Research\SAC_Action_Chunks_World_Model\world_model_train_out\checkpoint_5000.npz
+  saved checkpoint: C:\Daniel\High School\Research\SAC_Action_Chunks_World_Model\world_model_train_out\checkpoint_10000.npz
+  saved checkpoint: C:\Daniel\High School\Research\SAC_Action_Chunks_World_Model\world_model_train_out\checkpoint_15000.npz
+  saved checkpoint: C:\Daniel\High School\Research\SAC_Action_Chunks_World_Model\world_model_train_out\checkpoint_20000.npz
+Traceback (most recent call last):
+  File "C:\Daniel\High School\Research\SAC_Action_Chunks_World_Model\train_world_model.py", line 154, in <module>
+    train(**vars(args))
+  File "C:\Daniel\High School\Research\SAC_Action_Chunks_World_Model\train_world_model.py", line 112, in train
+    train_carry, outs, metrics = agent.train(train_carry, batch)
+                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\contextlib.py", line 80, in inner
+    with self._recreate_cm():
+  File "C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\contextlib.py", line 141, in __exit__
+    def __exit__(self, typ, value, traceback):
+
+KeyboardInterrupt
+Traceback (most recent call last):
+  File [96m"C:\Daniel\High School\Research\SAC_Action_Chunks_World_Model\train_world_model.py"[39;49;00m, line [94m154[39;49;00m, in <module>[90m[39;49;00m
+[90m    [39;49;00mtrain(**[96mvars[39;49;00m(args))[90m[39;49;00m
+  File [96m"C:\Daniel\High School\Research\SAC_Action_Chunks_World_Model\train_world_model.py"[39;49;00m, line [94m112[39;49;00m, in train[90m[39;49;00m
+[90m    [39;49;00mtrain_carry, outs, metrics = agent.train(train_carry, batch)[90m[39;49;00m
+[90m                                 [39;49;00m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[90m[39;49;00m
+  File [96m"C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\contextlib.py"[39;49;00m, line [94m80[39;49;00m, in inner[90m[39;49;00m
+[90m    [39;49;00m[94mwith[39;49;00m [96mself[39;49;00m._recreate_cm():[90m[39;49;00m
+  File [96m"C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\contextlib.py"[39;49;00m, line [94m141[39;49;00m, in __exit__[90m[39;49;00m
+[90m    [39;49;00m[94mdef[39;49;00m[90m [39;49;00m[92m__exit__[39;49;00m([96mself[39;49;00m, typ, value, traceback):[90m[39;49;00m
+
+KeyboardInterrupt

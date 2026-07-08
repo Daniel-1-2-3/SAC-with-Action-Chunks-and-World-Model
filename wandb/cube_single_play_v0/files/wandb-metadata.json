@@ -1,0 +1,36 @@
+{
+  "os":  "Windows-11-10.0.26200-SP0",
+  "python":  "CPython 3.12.5",
+  "startedAt":  "2026-07-02T06:11:53.981164Z",
+  "args":  [
+    "--env_name",
+    "cube-single-play-singletask-v0",
+    "--presets",
+    "cpu",
+    "--train_steps",
+    "100_000"
+  ],
+  "program":  "C:\\Daniel\\High School\\Research\\SAC_Action_Chunks_World_Model\\train_world_model.py",
+  "codePath":  "train_world_model.py",
+  "codePathLocal":  "train_world_model.py",
+  "git":  {
+    "remote":  "https://github.com/Daniel-1-2-3/SAC-with-Action-Chunks-and-World-Model",
+    "commit":  "c290207fbfda598322a219fe6db8c4b7754ffb74"
+  },
+  "email":  "danielzhu501@gmail.com",
+  "root":  "C:\\Daniel\\High School\\Research\\SAC_Action_Chunks_World_Model",
+  "host":  "Daniel",
+  "executable":  "C:\\Users\\danie_gfshjqx\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
+  "cpu_count":  4,
+  "cpu_count_logical":  8,
+  "disk":  {
+    "/":  {
+      "total":  "254179012608",
+      "used":  "246605127680"
+    }
+  },
+  "memory":  {
+    "total":  "8155979776"
+  },
+  "writerId":  "3u9l24wpe336bo1t9kch2m4rbems01e5"
+}

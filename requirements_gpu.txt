@@ -1,6 +1,7 @@
 torch
 ogbench
 jax[cuda12]
+nvidia-cusparse-cu12
 numpy<2
 optax
 chex

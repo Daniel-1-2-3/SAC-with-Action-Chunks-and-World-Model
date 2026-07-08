@@ -1,0 +1,70 @@
+_wandb:
+    value:
+        cli_version: 0.23.1
+        e:
+            3u9l24wpe336bo1t9kch2m4rbems01e5:
+                args:
+                    - --env_name
+                    - cube-single-play-singletask-v0
+                    - --presets
+                    - cpu
+                    - --train_steps
+                    - "100_000"
+                codePath: train_world_model.py
+                codePathLocal: train_world_model.py
+                cpu_count: 4
+                cpu_count_logical: 8
+                disk:
+                    /:
+                        total: "254179012608"
+                        used: "246605127680"
+                email: danielzhu501@gmail.com
+                executable: C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\python.exe
+                git:
+                    commit: c290207fbfda598322a219fe6db8c4b7754ffb74
+                    remote: https://github.com/Daniel-1-2-3/SAC-with-Action-Chunks-and-World-Model
+                host: Daniel
+                memory:
+                    total: "8155979776"
+                os: Windows-11-10.0.26200-SP0
+                program: C:\Daniel\High School\Research\SAC_Action_Chunks_World_Model\train_world_model.py
+                python: CPython 3.12.5
+                root: C:\Daniel\High School\Research\SAC_Action_Chunks_World_Model
+                startedAt: "2026-07-02T06:11:53.981164Z"
+                writerId: 3u9l24wpe336bo1t9kch2m4rbems01e5
+        m: []
+        python_version: 3.12.5
+        t:
+            "1":
+                - 12
+                - 105
+            "2":
+                - 12
+                - 105
+            "3":
+                - 16
+                - 61
+            "4": 3.12.5
+            "5": 0.23.1
+            "8":
+                - 2
+                - 3
+            "12": 0.23.1
+            "13": windows-amd64
+action_key:
+    value: action
+batch_size:
+    value: 16
+env_name:
+    value: cube-single-play-singletask-v0
+obs_key:
+    value: state
+presets:
+    value:
+        - cpu
+seed:
+    value: 0
+seq_len:
+    value: 64
+train_steps:
+    value: 100000

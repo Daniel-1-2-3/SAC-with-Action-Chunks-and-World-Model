@@ -1,0 +1,126 @@
+Loading OGBench dataset: cube-single-play-singletask-v0
+Train path: cube-single-play-v0.npz
+Val path: cube-single-play-v0-val.npz
+C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\gymnasium\envs\registration.py:728: UserWarning: [33mWARN: The environment is being initialised with render_mode='rgb_array' that is not in the possible render_modes ([]).[0m
+  logger.warn(
+C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\gymnasium\spaces\box.py:236: UserWarning: [33mWARN: Box low's precision lowered by casting to float32, current low.dtype=float64[0m
+  gym.logger.warn(
+C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\gymnasium\spaces\box.py:306: UserWarning: [33mWARN: Box high's precision lowered by casting to float32, current high.dtype=float64[0m
+  gym.logger.warn(
+[36mObservations[0m
+  state            Space[0m[37m([0m[34mfloat32[0m[37m,[0m [0m[35mshape[0m[37m=[0m[0m[37m([0m[34m28[0m[37m,[0m[0m[37m)[0m[0m[37m,[0m [0m[35mlow[0m[37m=[0m[34m-inf[0m[37m,[0m [0m[35mhigh[0m[37m=[0m[34minf[0m[37m)[0m[0m
+  reward           Space[0m[37m([0m[34mfloat32[0m[37m,[0m [0m[35mshape[0m[37m=[0m[0m[37m([0m[0m[37m)[0m[0m[37m,[0m [0m[35mlow[0m[37m=[0m[34m-inf[0m[37m,[0m [0m[35mhigh[0m[37m=[0m[34minf[0m[37m)[0m[0m
+  is_first         Space[0m[37m([0m[34mbool[0m[37m,[0m [0m[35mshape[0m[37m=[0m[0m[37m([0m[0m[37m)[0m[0m[37m,[0m [0m[35mlow[0m[37m=[0m[34m0[0m[37m,[0m [0m[35mhigh[0m[37m=[0m[34m2[0m[37m)[0m[0m
+  is_last          Space[0m[37m([0m[34mbool[0m[37m,[0m [0m[35mshape[0m[37m=[0m[0m[37m([0m[0m[37m)[0m[0m[37m,[0m [0m[35mlow[0m[37m=[0m[34m0[0m[37m,[0m [0m[35mhigh[0m[37m=[0m[34m2[0m[37m)[0m[0m
+  is_terminal      Space[0m[37m([0m[34mbool[0m[37m,[0m [0m[35mshape[0m[37m=[0m[0m[37m([0m[0m[37m)[0m[0m[37m,[0m [0m[35mlow[0m[37m=[0m[34m0[0m[37m,[0m [0m[35mhigh[0m[37m=[0m[34m2[0m[37m)[0m[0m
+[36mActions[0m
+  action           Space[0m[37m([0m[34mfloat32[0m[37m,[0m [0m[35mshape[0m[37m=[0m[0m[37m([0m[34m5[0m[37m,[0m[0m[37m)[0m[0m[37m,[0m [0m[35mlow[0m[37m=[0m[34m-inf[0m[37m,[0m [0m[35mhigh[0m[37m=[0m[34minf[0m[37m)[0m[0m
+[36mExtras[0m
+  consec           Space[0m[37m([0m[34mint32[0m[37m,[0m [0m[35mshape[0m[37m=[0m[0m[37m([0m[0m[37m)[0m[0m[37m,[0m [0m[35mlow[0m[37m=[0m[34m-2147483648[0m[37m,[0m [0m[35mhigh[0m[37m=[0m[34m2147483647[0m[37m)[0m[0m
+  stepid           Space[0m[37m([0m[34muint8[0m[37m,[0m [0m[35mshape[0m[37m=[0m[0m[37m([0m[34m20[0m[37m,[0m[0m[37m)[0m[0m[37m,[0m [0m[35mlow[0m[37m=[0m[34m0[0m[37m,[0m [0m[35mhigh[0m[37m=[0m[34m255[0m[37m)[0m[0m
+JAX devices [0m[37m([0m[34m1[0m[37m)[0m[0m[37m:[0m [0m[36m[TFRT_CPU_0][0m
+Policy devices: TFRT_CPU_0
+Train devices:  TFRT_CPU_0
+[33mInitializing parameters...[0m
+Optimizer opt has 2,499,484 params:
+       973,440 dyn
+       533,020 dec
+       459,263 rew
+       393,985 con
+       139,776 enc
+[33mDone initializing![0m
+[33mCompiling 1 checkpoint groups...[0m
+Largest checkpoint group: 0 GB
+[33mCompiling train and report...[0m
+Train cost analysis:
+  FLOPS:            1.1e+10
+  Memory (temp):    1.7e+08
+  Memory (inputs):  3.0e+07
+  Memory (outputs): 3.6e+07
+  Memory (code):    9.8e+05
+
+Report cost analysis:
+  FLOPS:            3.7e+09
+  Memory (temp):    2.6e+07
+  Memory (inputs):  1.0e+07
+  Memory (outputs): 5.5e+04
+  Memory (code):    3.0e+05
+
+[33mDone compiling![0m
+Loading world model checkpoint: checkpoints_cube_single_play_v0/checkpoint_20000.npz
+Detected latent feature dim: 1536
+step      0 | critic_loss 2.1056 | actor_loss 0.1003 | mean_imag_reward -0.9993
+Traceback (most recent call last):
+  File "C:\Daniel\High School\Research\SAC_Action_Chunks_World_Model\drqv2_world_model.py", line 387, in <module>
+    train(**vars(args))
+  File "C:\Daniel\High School\Research\SAC_Action_Chunks_World_Model\drqv2_world_model.py", line 332, in train
+    feats, actions, rewards, conts, next_feats = imagine_rollout(
+                                                 ^^^^^^^^^^^^^^^^
+  File "C:\Daniel\High School\Research\SAC_Action_Chunks_World_Model\drqv2_world_model.py", line 217, in imagine_rollout
+    dist = actor(feat_t, stddev)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\nn\modules\module.py", line 1776, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\nn\modules\module.py", line 1787, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Daniel\High School\Research\SAC_Action_Chunks_World_Model\drqv2\drqv2.py", line 84, in forward
+    h = self.trunk(obs)
+        ^^^^^^^^^^^^^^^
+  File "C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\nn\modules\module.py", line 1776, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\nn\modules\module.py", line 1787, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\nn\modules\container.py", line 253, in forward
+    input = module(input)
+            ^^^^^^^^^^^^^
+  File "C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\nn\modules\module.py", line 1776, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\nn\modules\module.py", line 1787, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\nn\modules\linear.py", line 134, in forward
+    return F.linear(input, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+Traceback (most recent call last):
+  File [96m"C:\Daniel\High School\Research\SAC_Action_Chunks_World_Model\drqv2_world_model.py"[39;49;00m, line [94m387[39;49;00m, in <module>[90m[39;49;00m
+[90m    [39;49;00mtrain(**[96mvars[39;49;00m(args))[90m[39;49;00m
+  File [96m"C:\Daniel\High School\Research\SAC_Action_Chunks_World_Model\drqv2_world_model.py"[39;49;00m, line [94m332[39;49;00m, in train[90m[39;49;00m
+[90m    [39;49;00mfeats, actions, rewards, conts, next_feats = imagine_rollout([90m[39;49;00m
+[90m                                                 [39;49;00m^^^^^^^^^^^^^^^^[90m[39;49;00m
+  File [96m"C:\Daniel\High School\Research\SAC_Action_Chunks_World_Model\drqv2_world_model.py"[39;49;00m, line [94m217[39;49;00m, in imagine_rollout[90m[39;49;00m
+[90m    [39;49;00mdist = actor(feat_t, stddev)[90m[39;49;00m
+[90m           [39;49;00m^^^^^^^^^^^^^^^^^^^^^[90m[39;49;00m
+  File [96m"C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\nn\modules\module.py"[39;49;00m, line [94m1776[39;49;00m, in _wrapped_call_impl[90m[39;49;00m
+[90m    [39;49;00m[94mreturn[39;49;00m [96mself[39;49;00m._call_impl(*args, **kwargs)[90m[39;49;00m
+[90m           [39;49;00m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[90m[39;49;00m
+  File [96m"C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\nn\modules\module.py"[39;49;00m, line [94m1787[39;49;00m, in _call_impl[90m[39;49;00m
+[90m    [39;49;00m[94mreturn[39;49;00m forward_call(*args, **kwargs)[90m[39;49;00m
+[90m           [39;49;00m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[90m[39;49;00m
+  File [96m"C:\Daniel\High School\Research\SAC_Action_Chunks_World_Model\drqv2\drqv2.py"[39;49;00m, line [94m84[39;49;00m, in forward[90m[39;49;00m
+[90m    [39;49;00mh = [96mself[39;49;00m.trunk(obs)[90m[39;49;00m
+[90m        [39;49;00m^^^^^^^^^^^^^^^[90m[39;49;00m
+  File [96m"C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\nn\modules\module.py"[39;49;00m, line [94m1776[39;49;00m, in _wrapped_call_impl[90m[39;49;00m
+[90m    [39;49;00m[94mreturn[39;49;00m [96mself[39;49;00m._call_impl(*args, **kwargs)[90m[39;49;00m
+[90m           [39;49;00m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[90m[39;49;00m
+  File [96m"C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\nn\modules\module.py"[39;49;00m, line [94m1787[39;49;00m, in _call_impl[90m[39;49;00m
+[90m    [39;49;00m[94mreturn[39;49;00m forward_call(*args, **kwargs)[90m[39;49;00m
+[90m           [39;49;00m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[90m[39;49;00m
+  File [96m"C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\nn\modules\container.py"[39;49;00m, line [94m253[39;49;00m, in forward[90m[39;49;00m
+[90m    [39;49;00m[96minput[39;49;00m = module([96minput[39;49;00m)[90m[39;49;00m
+[90m            [39;49;00m^^^^^^^^^^^^^[90m[39;49;00m
+  File [96m"C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\nn\modules\module.py"[39;49;00m, line [94m1776[39;49;00m, in _wrapped_call_impl[90m[39;49;00m
+[90m    [39;49;00m[94mreturn[39;49;00m [96mself[39;49;00m._call_impl(*args, **kwargs)[90m[39;49;00m
+[90m           [39;49;00m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[90m[39;49;00m
+  File [96m"C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\nn\modules\module.py"[39;49;00m, line [94m1787[39;49;00m, in _call_impl[90m[39;49;00m
+[90m    [39;49;00m[94mreturn[39;49;00m forward_call(*args, **kwargs)[90m[39;49;00m
+[90m           [39;49;00m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[90m[39;49;00m
+  File [96m"C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\nn\modules\linear.py"[39;49;00m, line [94m134[39;49;00m, in forward[90m[39;49;00m
+[90m    [39;49;00m[94mreturn[39;49;00m F.linear([96minput[39;49;00m, [96mself[39;49;00m.weight, [96mself[39;49;00m.bias)[90m[39;49;00m
+[90m           [39;49;00m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[90m[39;49;00m
+[91mKeyboardInterrupt[39;49;00m[90m[39;49;00m

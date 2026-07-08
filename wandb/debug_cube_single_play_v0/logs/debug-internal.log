@@ -1,0 +1,18 @@
+{"time":"2026-07-02T02:08:29.6422622-04:00","level":"INFO","msg":"stream: starting","core version":"0.23.1"}
+{"time":"2026-07-02T02:08:31.5143547-04:00","level":"ERROR","msg":"HTTP error","status":401,"method":"POST","url":"https://api.wandb.ai/graphql"}
+{"time":"2026-07-02T02:08:31.5257035-04:00","level":"ERROR","msg":"featurechecker: failed to load features, all will be disabled","error":"returned error 401: {\"data\":null}"}
+{"time":"2026-07-02T02:08:31.5568297-04:00","level":"INFO","msg":"stream: created new stream","id":"vf6d08ht"}
+{"time":"2026-07-02T02:08:31.5611963-04:00","level":"INFO","msg":"handler: started","stream_id":"vf6d08ht"}
+{"time":"2026-07-02T02:08:31.5720679-04:00","level":"INFO","msg":"stream: started","id":"vf6d08ht"}
+{"time":"2026-07-02T02:08:31.5756274-04:00","level":"INFO","msg":"sender: started","stream_id":"vf6d08ht"}
+{"time":"2026-07-02T02:08:31.5756274-04:00","level":"INFO","msg":"writer: started","stream_id":"vf6d08ht"}
+{"time":"2026-07-02T02:08:31.6645731-04:00","level":"WARN","msg":"runupserter: server does not expand metric globs but the x_server_side_expand_glob_metrics setting is set; ignoring"}
+{"time":"2026-07-02T02:08:31.7146684-04:00","level":"ERROR","msg":"HTTP error","status":401,"method":"POST","url":"https://api.wandb.ai/graphql"}
+{"time":"2026-07-02T02:08:31.7146684-04:00","level":"ERROR","msg":"runupserter: failed to init run","error":"returned error 401: {\"data\":null}"}
+{"time":"2026-07-02T02:08:32.1308983-04:00","level":"INFO","msg":"stream: closing","id":"vf6d08ht"}
+{"time":"2026-07-02T02:08:32.1319855-04:00","level":"ERROR","msg":"sender: uploadConfigFile: runupserter: run not yet initialized"}
+{"time":"2026-07-02T02:08:32.1824282-04:00","level":"ERROR","msg":"runfiles: runupserter: run not yet initialized"}
+{"time":"2026-07-02T02:08:32.1831876-04:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2026-07-02T02:08:32.1831876-04:00","level":"INFO","msg":"handler: closed","stream_id":"vf6d08ht"}
+{"time":"2026-07-02T02:08:32.1837617-04:00","level":"INFO","msg":"sender: closed","stream_id":"vf6d08ht"}
+{"time":"2026-07-02T02:08:32.1837617-04:00","level":"INFO","msg":"stream: closed","id":"vf6d08ht"}

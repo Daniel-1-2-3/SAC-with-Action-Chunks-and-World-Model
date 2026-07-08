@@ -1,0 +1,36 @@
+2026-07-02 02:11:53,997 INFO    MainThread:14392 [wandb_setup.py:_flush():80] Current SDK version is 0.23.1
+2026-07-02 02:11:53,998 INFO    MainThread:14392 [wandb_setup.py:_flush():80] Configure stats pid to 14392
+2026-07-02 02:11:53,998 INFO    MainThread:14392 [wandb_setup.py:_flush():80] Loading settings from C:\Users\danie_gfshjqx\.config\wandb\settings
+2026-07-02 02:11:53,998 INFO    MainThread:14392 [wandb_setup.py:_flush():80] Loading settings from C:\Daniel\High School\Research\SAC_Action_Chunks_World_Model\wandb\settings
+2026-07-02 02:11:53,998 INFO    MainThread:14392 [wandb_setup.py:_flush():80] Loading settings from environment variables
+2026-07-02 02:11:53,999 INFO    MainThread:14392 [wandb_init.py:setup_run_log_directory():714] Logging user logs to C:\Daniel\High School\Research\SAC_Action_Chunks_World_Model\wandb\run-20260702_021153-jibxtl4d\logs\debug.log
+2026-07-02 02:11:54,001 INFO    MainThread:14392 [wandb_init.py:setup_run_log_directory():715] Logging internal logs to C:\Daniel\High School\Research\SAC_Action_Chunks_World_Model\wandb\run-20260702_021153-jibxtl4d\logs\debug-internal.log
+2026-07-02 02:11:54,001 INFO    MainThread:14392 [wandb_init.py:init():841] calling init triggers
+2026-07-02 02:11:54,002 INFO    MainThread:14392 [wandb_init.py:init():846] wandb.init called with sweep_config: {}
+config: {'env_name': 'cube-single-play-singletask-v0', 'obs_key': 'state', 'action_key': 'action', 'seq_len': 64, 'batch_size': 16, 'train_steps': 100000, 'presets': ['cpu'], 'seed': 0, '_wandb': {}}
+2026-07-02 02:11:54,002 INFO    MainThread:14392 [wandb_init.py:init():889] starting backend
+2026-07-02 02:11:58,039 INFO    MainThread:14392 [wandb_init.py:init():892] sending inform_init request
+2026-07-02 02:11:58,197 INFO    MainThread:14392 [wandb_init.py:init():900] backend started and connected
+2026-07-02 02:11:58,337 INFO    MainThread:14392 [wandb_init.py:init():970] updated telemetry
+2026-07-02 02:11:58,522 INFO    MainThread:14392 [wandb_init.py:init():994] communicating run to backend with 90.0 second timeout
+2026-07-02 02:11:59,138 INFO    MainThread:14392 [wandb_init.py:init():1041] starting run threads in backend
+2026-07-02 02:12:03,842 INFO    MainThread:14392 [wandb_run.py:_console_start():2521] atexit reg
+2026-07-02 02:12:03,844 INFO    MainThread:14392 [wandb_run.py:_redirect():2369] redirect: wrap_raw
+2026-07-02 02:12:03,844 INFO    MainThread:14392 [wandb_run.py:_redirect():2438] Wrapping output streams.
+2026-07-02 02:12:03,846 INFO    MainThread:14392 [wandb_run.py:_redirect():2461] Redirects installed.
+2026-07-02 02:12:03,871 INFO    MainThread:14392 [wandb_init.py:init():1081] run started, returning control to user process
+2026-07-02 15:04:10,375 INFO    wandb-AsyncioManager-main:14392 [service_client.py:_forward_responses():80] Reached EOF.
+2026-07-02 15:04:10,393 INFO    wandb-AsyncioManager-main:14392 [mailbox.py:close():137] Closing mailbox, abandoning 1 handles.
+2026-07-02 15:04:19,118 ERROR   wandb-AsyncioManager-main:14392 [asyncio_manager.py:fn_wrap_exceptions():183] Uncaught exception in run_soon callback.
+Traceback (most recent call last):
+  File "C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\wandb\sdk\lib\asyncio_manager.py", line 181, in fn_wrap_exceptions
+    await fn()
+  File "C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\wandb\sdk\lib\service\service_client.py", line 38, in publish
+    await self._send_server_request(request)
+  File "C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\site-packages\wandb\sdk\lib\service\service_client.py", line 64, in _send_server_request
+    await self._writer.drain()
+  File "C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\asyncio\streams.py", line 392, in drain
+    await self._protocol._drain_helper()
+  File "C:\Users\danie_gfshjqx\AppData\Local\Programs\Python\Python312\Lib\asyncio\streams.py", line 166, in _drain_helper
+    raise ConnectionResetError('Connection lost')
+ConnectionResetError: Connection lost
