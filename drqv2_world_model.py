@@ -182,7 +182,7 @@ class WorldModelDrQV2Agent:
             action = dist.mean if eval_mode else dist.sample(clip=None)
             return action.cpu().numpy()[0]
 
-    def update_critic(self, obs, action, reward, discount, next_obs, step):
+    def update_critic(self, obs, action, reward, discount, next_obs, step, weight):
         metrics = dict()
         with torch.no_grad():
             stddev = utils.schedule(self.stddev_schedule, step)
@@ -193,7 +193,9 @@ class WorldModelDrQV2Agent:
             target_Q = reward + discount * target_V
 
         Q1, Q2 = self.critic(obs, action)
-        critic_loss = F.mse_loss(Q1, target_Q) + F.mse_loss(Q2, target_Q)
+        wsum = weight.sum().clamp_min(1e-6)
+        critic_loss = ((weight * (Q1 - target_Q) ** 2).sum() / wsum
+                        + (weight * (Q2 - target_Q) ** 2).sum() / wsum)
 
         self.critic_opt.zero_grad(set_to_none=True)
         critic_loss.backward()
@@ -206,7 +208,7 @@ class WorldModelDrQV2Agent:
             metrics['critic_q2'] = Q2.mean().item()
         return metrics
 
-    def update_actor(self, obs, step):
+    def update_actor(self, obs, step, weight):
         metrics = dict()
         stddev = utils.schedule(self.stddev_schedule, step)
         dist = self.actor(obs, stddev)
@@ -214,7 +216,8 @@ class WorldModelDrQV2Agent:
         log_prob = dist.log_prob(action).sum(-1, keepdim=True)
         Q1, Q2 = self.critic(obs, action)
         Q = torch.min(Q1, Q2)
-        actor_loss = -Q.mean()
+        wsum = weight.sum().clamp_min(1e-6)
+        actor_loss = -(weight * Q).sum() / wsum
 
         self.actor_opt.zero_grad(set_to_none=True)
         actor_loss.backward()
@@ -233,12 +236,14 @@ class WorldModelDrQV2Agent:
             'critic_target': self.critic_target.state_dict(),
         }
 
-def imagine_rollout(bridge, actor, seed_carry, horizon, stddev, device):
+def imagine_rollout(bridge, actor, seed_carry, horizon, stddev, device, gamma):
     carry = seed_carry
     feat_t = jax_to_torch(bridge.get_feat(carry), device)
 
-    feats, actions, rewards, conts, next_feats = [], [], [], [], []
+    feats, actions, rewards, conts, next_feats, weights = [], [], [], [], [], []
     cont_by_step = []
+
+    weight = torch.ones(feat_t.shape[0], 1, device=device)
 
     for _ in range(horizon):
         dist = actor(feat_t, stddev)
@@ -255,17 +260,20 @@ def imagine_rollout(bridge, actor, seed_carry, horizon, stddev, device):
         rewards.append(reward_t)
         conts.append(cont_t)
         next_feats.append(next_feat_t)
+        weights.append(weight)
         cont_by_step.append(cont_t.mean().item())
 
+        weight = weight * (gamma * cont_t)
         carry, feat_t = next_carry, next_feat_t
 
     return (torch.cat(feats), torch.cat(actions), torch.cat(rewards),
-            torch.cat(conts), torch.cat(next_feats), cont_by_step)
+            torch.cat(conts), torch.cat(next_feats), torch.cat(weights), cont_by_step)
 
-def eval_in_env(env, bridge, policy, action_dim, num_episodes, device, obs_key):
+def eval_in_env(env, bridge, policy, action_dim, num_episodes, device, obs_key, record_video=False):
     returns, successes = [], []
+    frames = []
 
-    for _ in range(num_episodes):
+    for ep in range(num_episodes):
         obs, info = env.reset()
         enc_carry, dyn_carry = bridge.init_encode(1)
         prevact = np.zeros((1, action_dim), dtype=np.float32)
@@ -273,6 +281,9 @@ def eval_in_env(env, bridge, policy, action_dim, num_episodes, device, obs_key):
         done = False
         ep_return = 0.0
         ep_success = False
+
+        if record_video and ep == 0:
+            frames.append(env.render())
 
         while not done:
             state = extract_state(obs, obs_key)
@@ -286,6 +297,9 @@ def eval_in_env(env, bridge, policy, action_dim, num_episodes, device, obs_key):
             ep_return += float(reward)
             ep_success = ep_success or bool(info.get('success', reward == 0))
 
+            if record_video and ep == 0:
+                frames.append(env.render())
+
             prevact = action.reshape(1, -1).astype(np.float32)
             is_first = np.array([False])
             obs = next_obs
@@ -293,7 +307,11 @@ def eval_in_env(env, bridge, policy, action_dim, num_episodes, device, obs_key):
         returns.append(ep_return)
         successes.append(float(ep_success))
 
-    return float(np.mean(returns)), float(np.mean(successes))
+    video = None
+    if record_video and frames:
+        video = np.stack(frames).astype(np.uint8).transpose(0, 3, 1, 2)
+
+    return float(np.mean(returns)), float(np.mean(successes)), video
 
 def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
           imagination_batch, seq_len_seed, num_train_steps, log_every,
@@ -391,18 +409,19 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
         seed_carry = bridge.place_seed(seed_pool)
 
         stddev = utils.schedule(policy.stddev_schedule, step)
-        feats, actions, rewards, conts, next_feats, cont_by_step = imagine_rollout(
-            bridge, policy.actor, seed_carry, horizon, stddev, device)
+        feats, actions, rewards, conts, next_feats, weights, cont_by_step = imagine_rollout(
+            bridge, policy.actor, seed_carry, horizon, stddev, device, policy.gamma)
 
         discounts = policy.gamma * conts
 
-        metrics = policy.update_critic(feats, actions, rewards, discounts, next_feats, step)
-        metrics.update(policy.update_actor(feats.detach(), step))
+        metrics = policy.update_critic(feats, actions, rewards, discounts, next_feats, step, weights)
+        metrics.update(policy.update_actor(feats.detach(), step, weights.detach()))
         utils.soft_update_params(policy.critic, policy.critic_target, policy.critic_target_tau)
         metrics['mean_imag_reward'] = rewards.mean().item()
         metrics['mean_imag_cont'] = conts.mean().item()
         metrics['cont_horizon_first'] = cont_by_step[0]
         metrics['cont_horizon_last'] = cont_by_step[-1]
+        metrics['mean_horizon_weight'] = weights.mean().item()
 
         if step % log_every == 0:
             print(f"step {step:6d} | critic_loss {metrics['critic_loss']:.4f} "
@@ -411,12 +430,16 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
             wandb.log(numeric_metrics(metrics), step=step)
 
         if step % eval_every == 0 and step > 0:
-            mean_return, success_rate = eval_in_env(
-                env, bridge, policy, action_dim, eval_episodes, device, obs_key)
+            mean_return, success_rate, video = eval_in_env(
+                env, bridge, policy, action_dim, eval_episodes, device, obs_key,
+                record_video=True)
             print(f"step {step:6d} | eval_return {mean_return:.4f} "
                   f"| eval_success_rate {success_rate:.4f}")
-            wandb.log({'eval/mean_return': mean_return,
-                       'eval/success_rate': success_rate}, step=step)
+            log_dict = {'eval/mean_return': mean_return,
+                        'eval/success_rate': success_rate}
+            if video is not None:
+                log_dict['eval/video'] = wandb.Video(video, fps=20, format='mp4')
+            wandb.log(log_dict, step=step)
 
         if step % save_every == 0 and step > 0:
             ckpt_path = out_dir / f'policy_step{step}.pt'
