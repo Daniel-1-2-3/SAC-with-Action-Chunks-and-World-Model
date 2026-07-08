@@ -19,7 +19,7 @@ colored_traceback
 ipdb
 requests
 tqdm
-wandb
+wandb[media]
 
 # git clone https://github.com/danijar/embodied.git
 # wandb login
