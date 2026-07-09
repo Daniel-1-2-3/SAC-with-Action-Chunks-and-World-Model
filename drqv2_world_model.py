@@ -157,7 +157,7 @@ class WorldModelSACAgent:
         self.critic_target_tau = critic_target_tau
         self.gamma = gamma
         self.use_tb = use_tb
-        self.target_entropy = -float(action_shape[0])
+        self.target_entropy = -0.5 * float(action_shape[0])
 
         self.actor = SACActor(repr_dim, action_shape, feature_dim, hidden_dim).to(device)
         self.critic = Critic(repr_dim, action_shape, feature_dim, hidden_dim).to(device)
@@ -499,8 +499,8 @@ if __name__ == '__main__':
     parser.add_argument('--eval_every', type=int, default=2000)
     parser.add_argument('--eval_episodes', type=int, default=10)
     parser.add_argument('--out_dir', type=str, default='policy_train_out')
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--alpha_lr', type=float, default=1e-4)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--alpha_lr', type=float, default=1e-5)
     parser.add_argument('--feature_dim', type=int, default=50)
     parser.add_argument('--hidden_dim', type=int, default=1024)
     parser.add_argument('--critic_target_tau', type=float, default=0.01)
