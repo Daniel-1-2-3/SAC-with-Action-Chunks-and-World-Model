@@ -124,6 +124,21 @@ class TruncatedNormal(pyd.Normal):
         return self._clamp(x)
 
 
+def sample_action(mu, log_std):
+    """Reparameterized, tanh-squashed sampling for a proper SAC actor
+    (mu, log_std both come from the network, unlike TruncatedNormal above
+    whose scale comes from an external schedule). Returns the squashed
+    action and its log-probability, with the standard tanh Jacobian
+    correction applied (see SAC paper, Appendix C)."""
+    std = log_std.exp()
+    noise = torch.randn_like(mu)
+    u = mu + noise * std
+    action = torch.tanh(u)
+    log_prob = (-0.5 * noise.pow(2) - log_std - 0.5 * np.log(2 * np.pi)).sum(-1, keepdim=True)
+    log_prob -= torch.log(1 - action.pow(2) + 1e-6).sum(-1, keepdim=True)
+    return action, log_prob
+
+
 def schedule(schdl, step):
     try:
         return float(schdl)

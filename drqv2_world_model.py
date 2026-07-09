@@ -16,7 +16,7 @@ import ruamel.yaml as yaml
 import wandb
 
 import drqv2.utils as utils
-from drqv2.drqv2 import Actor, Critic
+from drqv2.drqv2 import Critic, SACActor
 from ogbench_dataset_methods import DatasetMethods
 from agent import WorldModelAgent
 from embodied.embodied.jax import transform
@@ -150,27 +150,32 @@ class WorldModelBridge:
         return self._encode_step(
             self.agent.params, self._next_seed(), enc_carry, dyn_carry, obs, prevact, is_first)
 
-class WorldModelDrQV2Agent:
-    def __init__(self, repr_dim, action_shape, device, lr, feature_dim,
-                 hidden_dim, critic_target_tau, stddev_schedule, stddev_clip,
-                 gamma, use_tb=False):
+class WorldModelSACAgent:
+    def __init__(self, repr_dim, action_shape, device, lr, alpha_lr, feature_dim,
+                 hidden_dim, critic_target_tau, gamma, init_alpha=0.1, use_tb=False):
         self.device = device
         self.critic_target_tau = critic_target_tau
-        self.stddev_schedule = stddev_schedule
-        self.stddev_clip = stddev_clip
         self.gamma = gamma
         self.use_tb = use_tb
+        self.target_entropy = -float(action_shape[0])
 
-        self.actor = Actor(repr_dim, action_shape, feature_dim, hidden_dim).to(device)
+        self.actor = SACActor(repr_dim, action_shape, feature_dim, hidden_dim).to(device)
         self.critic = Critic(repr_dim, action_shape, feature_dim, hidden_dim).to(device)
         self.critic_target = Critic(repr_dim, action_shape, feature_dim, hidden_dim).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
+        self.log_alpha = torch.tensor(np.log(init_alpha), device=device, requires_grad=True)
+
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=lr)
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr)
+        self.alpha_opt = torch.optim.Adam([self.log_alpha], lr=alpha_lr)
 
         self.train()
         self.critic_target.train()
+
+    @property
+    def alpha(self):
+        return self.log_alpha.exp()
 
     def train(self, training=True):
         self.training = training
@@ -180,19 +185,20 @@ class WorldModelDrQV2Agent:
     def act(self, feat, step, eval_mode):
         with torch.no_grad():
             feat = torch.as_tensor(feat, device=self.device).unsqueeze(0).float()
-            stddev = utils.schedule(self.stddev_schedule, step)
-            dist = self.actor(feat, stddev)
-            action = dist.mean if eval_mode else dist.sample(clip=None)
+            mu, log_std = self.actor(feat)
+            if eval_mode:
+                action = torch.tanh(mu)
+            else:
+                action, _ = utils.sample_action(mu, log_std)
             return action.cpu().numpy()[0]
 
     def update_critic(self, obs, action, reward, discount, next_obs, step, weight):
         metrics = dict()
         with torch.no_grad():
-            stddev = utils.schedule(self.stddev_schedule, step)
-            dist = self.actor(next_obs, stddev)
-            next_action = dist.sample(clip=self.stddev_clip)
+            next_mu, next_log_std = self.actor(next_obs)
+            next_action, next_log_prob = utils.sample_action(next_mu, next_log_std)
             target_Q1, target_Q2 = self.critic_target(next_obs, next_action)
-            target_V = torch.min(target_Q1, target_Q2)
+            target_V = torch.min(target_Q1, target_Q2) - self.alpha.detach() * next_log_prob
             target_Q = reward + discount * target_V
 
         Q1, Q2 = self.critic(obs, action)
@@ -213,29 +219,33 @@ class WorldModelDrQV2Agent:
 
     def update_actor(self, obs, step, weight):
         metrics = dict()
-        stddev = utils.schedule(self.stddev_schedule, step)
-        dist = self.actor(obs, stddev)
-        action = dist.sample(clip=self.stddev_clip)
-        log_prob = dist.log_prob(action).sum(-1, keepdim=True)
+        mu, log_std = self.actor(obs)
+        action, log_prob = utils.sample_action(mu, log_std)
         Q1, Q2 = self.critic(obs, action)
         Q = torch.min(Q1, Q2)
         wsum = weight.sum().clamp_min(1e-6)
-        actor_loss = -(weight * Q).sum() / wsum
+        actor_loss = (weight * (self.alpha.detach() * log_prob - Q)).sum() / wsum
 
         self.actor_opt.zero_grad(set_to_none=True)
         actor_loss.backward()
         self.actor_opt.step()
 
+        alpha_loss = -(self.log_alpha * (log_prob.detach() + self.target_entropy)).mean()
+        self.alpha_opt.zero_grad(set_to_none=True)
+        alpha_loss.backward()
+        self.alpha_opt.step()
+
         with torch.no_grad():
             h = self.actor.trunk(obs)
-            mu_raw = self.actor.policy(h)
+            mu_raw, _ = self.actor.policy(h).chunk(2, dim=-1)
 
         metrics['actor_loss'] = actor_loss.item()
+        metrics['alpha'] = self.alpha.item()
+        metrics['alpha_loss'] = alpha_loss.item()
         metrics['actor_pretanh_mean_abs'] = mu_raw.abs().mean().item()
         metrics['actor_pretanh_max_abs'] = mu_raw.abs().max().item()
         if self.use_tb:
             metrics['actor_logprob'] = log_prob.mean().item()
-            metrics['actor_ent'] = dist.entropy().sum(dim=-1).mean().item()
         return metrics
 
     def state_dict_all(self):
@@ -243,9 +253,10 @@ class WorldModelDrQV2Agent:
             'actor': self.actor.state_dict(),
             'critic': self.critic.state_dict(),
             'critic_target': self.critic_target.state_dict(),
+            'log_alpha': self.log_alpha.detach().cpu(),
         }
 
-def imagine_rollout(bridge, actor, seed_carry, horizon, stddev, device, gamma):
+def imagine_rollout(bridge, actor, seed_carry, horizon, device, gamma):
     carry = seed_carry
     feat_t = jax_to_torch(bridge.get_feat(carry), device)
 
@@ -255,8 +266,8 @@ def imagine_rollout(bridge, actor, seed_carry, horizon, stddev, device, gamma):
     weight = torch.ones(feat_t.shape[0], 1, device=device)
 
     for _ in range(horizon):
-        dist = actor(feat_t, stddev)
-        action_t = dist.sample(clip=None)
+        mu, log_std = actor(feat_t)
+        action_t, _ = utils.sample_action(mu, log_std)
         action_np = action_t.detach().cpu().numpy()
 
         next_carry, next_feat_flat, reward_j, cont_j = bridge.img_step(carry, action_np)
@@ -334,8 +345,8 @@ def eval_in_env(env, bridge, policy, action_dim, num_episodes, device, obs_key, 
 
 def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
           imagination_batch, seq_len_seed, num_train_steps, log_every,
-          save_every, eval_every, eval_episodes, out_dir, lr, feature_dim,
-          hidden_dim, critic_target_tau, stddev_schedule, stddev_clip, gamma,
+          save_every, eval_every, eval_episodes, out_dir, lr, alpha_lr,
+          feature_dim, hidden_dim, critic_target_tau, gamma, init_alpha,
           wandb_project, wandb_entity, wandb_run_name, wandb_mode):
 
     folder = pathlib.Path(__file__).parent
@@ -364,12 +375,12 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
             'eval_every': eval_every,
             'eval_episodes': eval_episodes,
             'lr': lr,
+            'alpha_lr': alpha_lr,
             'feature_dim': feature_dim,
             'hidden_dim': hidden_dim,
             'critic_target_tau': critic_target_tau,
-            'stddev_schedule': stddev_schedule,
-            'stddev_clip': stddev_clip,
             'gamma': gamma,
+            'init_alpha': init_alpha,
             'presets': presets,
         },
     )
@@ -406,17 +417,17 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
     feat_dim = int(bridge.get_feat(probe_carry).shape[-1])
     print(f'Detected latent feature dim: {feat_dim}')
 
-    policy = WorldModelDrQV2Agent(
+    policy = WorldModelSACAgent(
         repr_dim=feat_dim,
         action_shape=(action_dim,),
         device=device,
         lr=lr,
+        alpha_lr=alpha_lr,
         feature_dim=feature_dim,
         hidden_dim=hidden_dim,
         critic_target_tau=critic_target_tau,
-        stddev_schedule=stddev_schedule,
-        stddev_clip=stddev_clip,
         gamma=gamma,
+        init_alpha=init_alpha,
     )
 
     for step in range(num_train_steps):
@@ -427,9 +438,8 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
         seed_pool = subsample_tree_np(seed_pool, imagination_batch, rng)
         seed_carry = bridge.place_seed(seed_pool)
 
-        stddev = utils.schedule(policy.stddev_schedule, step)
         feats, actions, rewards, conts, next_feats, weights, cont_by_step = imagine_rollout(
-            bridge, policy.actor, seed_carry, horizon, stddev, device, policy.gamma)
+            bridge, policy.actor, seed_carry, horizon, device, policy.gamma)
 
         discounts = policy.gamma * conts
 
@@ -445,6 +455,7 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
         if step % log_every == 0:
             print(f"step {step:6d} | critic_loss {metrics['critic_loss']:.4f} "
                   f"| actor_loss {metrics['actor_loss']:.4f} "
+                  f"| alpha {metrics['alpha']:.4f} "
                   f"| mean_imag_reward {metrics['mean_imag_reward']:.4f}")
             wandb.log(numeric_metrics(metrics), step=step)
 
@@ -489,12 +500,12 @@ if __name__ == '__main__':
     parser.add_argument('--eval_episodes', type=int, default=10)
     parser.add_argument('--out_dir', type=str, default='policy_train_out')
     parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--alpha_lr', type=float, default=1e-4)
     parser.add_argument('--feature_dim', type=int, default=50)
     parser.add_argument('--hidden_dim', type=int, default=1024)
     parser.add_argument('--critic_target_tau', type=float, default=0.01)
-    parser.add_argument('--stddev_schedule', type=str, default='linear(1.0,0.1,100000)')
-    parser.add_argument('--stddev_clip', type=float, default=0.3)
     parser.add_argument('--gamma', type=float, default=0.99)
+    parser.add_argument('--init_alpha', type=float, default=0.1)
     parser.add_argument('--wandb_project', type=str, default='world-model-policy')
     parser.add_argument('--wandb_entity', type=str, default=None)
     parser.add_argument('--wandb_run_name', type=str, default=None)
@@ -503,4 +514,4 @@ if __name__ == '__main__':
     args = parser.parse_args()
     train(**vars(args))
 
-    # python drqv2_world_model.py --env_name cube-single-play-singletask-v0 --wm_ckpt checkpoints_cube_single_play_v0/checkpoint_20000.npz --horizon 10 --num_train_steps 1000000
+    # python drqv2_world_model.py --env_name cube-single-play-singletask-v0 --wm_ckpt checkpoints_cube_single_play_v0/checkpoint_20000.npz --horizon 15 --num_train_steps 1000000

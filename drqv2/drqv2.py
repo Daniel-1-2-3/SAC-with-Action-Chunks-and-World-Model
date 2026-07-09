@@ -91,6 +91,38 @@ class Actor(nn.Module):
         return dist
 
 
+LOG_STD_MIN = -20.0
+LOG_STD_MAX = 2.0
+
+
+class SACActor(nn.Module):
+    """Proper SAC actor: outputs a learned mean AND learned log_std (unlike
+    Actor above, whose std comes from an external schedule). Used with
+    utils.sample_action for reparameterized, tanh-squashed sampling with
+    the standard SAC log-probability correction."""
+
+    def __init__(self, repr_dim, action_shape, feature_dim, hidden_dim):
+        super().__init__()
+
+        self.trunk = nn.Sequential(nn.Linear(repr_dim, feature_dim),
+                                   nn.LayerNorm(feature_dim), nn.Tanh())
+
+        self.policy = nn.Sequential(nn.Linear(feature_dim, hidden_dim),
+                                    nn.ReLU(inplace=True),
+                                    nn.Linear(hidden_dim, hidden_dim),
+                                    nn.ReLU(inplace=True),
+                                    nn.Linear(hidden_dim, 2 * action_shape[0]))
+
+        self.apply(utils.weight_init)
+
+    def forward(self, obs):
+        h = self.trunk(obs)
+        mu, log_std = self.policy(h).chunk(2, dim=-1)
+        log_std = torch.tanh(log_std)
+        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)
+        return mu, log_std
+
+
 class Critic(nn.Module):
     def __init__(self, repr_dim, action_shape, feature_dim, hidden_dim):
         super().__init__()
