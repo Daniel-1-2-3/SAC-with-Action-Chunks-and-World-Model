@@ -226,7 +226,13 @@ class WorldModelDrQV2Agent:
         actor_loss.backward()
         self.actor_opt.step()
 
+        with torch.no_grad():
+            h = self.actor.trunk(obs)
+            mu_raw = self.actor.policy(h)
+
         metrics['actor_loss'] = actor_loss.item()
+        metrics['actor_pretanh_mean_abs'] = mu_raw.abs().mean().item()
+        metrics['actor_pretanh_max_abs'] = mu_raw.abs().max().item()
         if self.use_tb:
             metrics['actor_logprob'] = log_prob.mean().item()
             metrics['actor_ent'] = dist.entropy().sum(dim=-1).mean().item()
