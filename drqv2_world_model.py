@@ -152,14 +152,15 @@ class WorldModelBridge:
 
 class WorldModelSACAgent:
     def __init__(self, repr_dim, action_shape, device, lr, alpha_lr, feature_dim,
-                 hidden_dim, critic_target_tau, gamma, init_alpha=0.1, use_tb=False):
+                 hidden_dim, critic_target_tau, gamma, init_alpha=0.1, clip_mean=2.0,
+                 use_tb=False):
         self.device = device
         self.critic_target_tau = critic_target_tau
         self.gamma = gamma
         self.use_tb = use_tb
-        self.target_entropy = -float(action_shape[0])
+        self.target_entropy = -0.5 * float(action_shape[0])
 
-        self.actor = SACActor(repr_dim, action_shape, feature_dim, hidden_dim).to(device)
+        self.actor = SACActor(repr_dim, action_shape, feature_dim, hidden_dim, clip_mean).to(device)
         self.critic = Critic(repr_dim, action_shape, feature_dim, hidden_dim).to(device)
         self.critic_target = Critic(repr_dim, action_shape, feature_dim, hidden_dim).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
@@ -351,7 +352,7 @@ def eval_in_env(env, bridge, policy, action_dim, num_episodes, device, obs_key, 
 def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
           imagination_batch, seq_len_seed, num_train_steps, log_every,
           save_every, eval_every, eval_episodes, out_dir, lr, alpha_lr,
-          feature_dim, hidden_dim, critic_target_tau, gamma, init_alpha,
+          feature_dim, hidden_dim, critic_target_tau, gamma, init_alpha, clip_mean,
           wandb_project, wandb_entity, wandb_run_name, wandb_mode):
 
     folder = pathlib.Path(__file__).parent
@@ -386,6 +387,7 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
             'critic_target_tau': critic_target_tau,
             'gamma': gamma,
             'init_alpha': init_alpha,
+            'clip_mean': clip_mean,
             'presets': presets,
         },
     )
@@ -433,6 +435,7 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
         critic_target_tau=critic_target_tau,
         gamma=gamma,
         init_alpha=init_alpha,
+        clip_mean=clip_mean,
     )
 
     for step in range(num_train_steps):
@@ -512,8 +515,9 @@ if __name__ == '__main__':
     parser.add_argument('--eval_every', type=int, default=2000)
     parser.add_argument('--eval_episodes', type=int, default=10)
     parser.add_argument('--out_dir', type=str, default='policy_train_out')
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--alpha_lr', type=float, default=1e-4)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--alpha_lr', type=float, default=1e-5)
+    parser.add_argument('--clip_mean', type=float, default=2.0)
     parser.add_argument('--feature_dim', type=int, default=50)
     parser.add_argument('--hidden_dim', type=int, default=1024)
     parser.add_argument('--critic_target_tau', type=float, default=0.01)
@@ -522,7 +526,7 @@ if __name__ == '__main__':
     parser.add_argument('--wandb_project', type=str, default='world-model-policy')
     parser.add_argument('--wandb_entity', type=str, default=None)
     parser.add_argument('--wandb_run_name', type=str, default=None)
-    parser.add_argument('--zwandb_mode', type=str, default='online',
+    parser.add_argument('--wandb_mode', type=str, default='online',
                          choices=['online', 'offline', 'disabled'])
     args = parser.parse_args()
     train(**vars(args))

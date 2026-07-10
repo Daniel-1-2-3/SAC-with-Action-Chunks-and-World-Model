@@ -99,9 +99,14 @@ class SACActor(nn.Module):
     """Proper SAC actor: outputs a learned mean AND learned log_std (unlike
     Actor above, whose std comes from an external schedule). Used with
     utils.sample_action for reparameterized, tanh-squashed sampling with
-    the standard SAC log-probability correction."""
+    the standard SAC log-probability correction.
 
-    def __init__(self, repr_dim, action_shape, feature_dim, hidden_dim):
+    mu is hard-clamped to [-clip_mean, clip_mean] via Hardtanh before the
+    tanh squash, matching Stable-Baselines3's SACPolicy default (clip_mean=2.0)
+    -- this structurally prevents mu from growing into tanh's saturated
+    region at all, rather than just discouraging it."""
+
+    def __init__(self, repr_dim, action_shape, feature_dim, hidden_dim, clip_mean=2.0):
         super().__init__()
 
         self.trunk = nn.Sequential(nn.Linear(repr_dim, feature_dim),
@@ -113,11 +118,14 @@ class SACActor(nn.Module):
                                     nn.ReLU(inplace=True),
                                     nn.Linear(hidden_dim, 2 * action_shape[0]))
 
+        self.mu_clip = nn.Hardtanh(min_val=-clip_mean, max_val=clip_mean)
+
         self.apply(utils.weight_init)
 
     def forward(self, obs):
         h = self.trunk(obs)
         mu, log_std = self.policy(h).chunk(2, dim=-1)
+        mu = self.mu_clip(mu)
         log_std = torch.tanh(log_std)
         log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)
         return mu, log_std
