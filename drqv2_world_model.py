@@ -346,8 +346,7 @@ def eval_in_env(env, bridge, policy, action_dim, num_episodes, device, obs_key, 
     if record_video and frames:
         video = np.stack(frames).astype(np.uint8).transpose(0, 3, 1, 2)
 
-    mean_imagined_reward = float(np.mean(imag_rewards_ep0)) if imag_rewards_ep0 else None
-    return float(np.mean(returns)), float(np.mean(successes)), video, mean_imagined_reward
+    return float(np.mean(returns)), float(np.mean(successes)), video, imag_rewards_ep0
 
 def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
           imagination_batch, seq_len_seed, num_train_steps, log_every,
@@ -466,7 +465,7 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
             wandb.log(numeric_metrics(metrics), step=step)
 
         if step % eval_every == 0 and step > 0:
-            mean_return, success_rate, video, mean_imagined_reward = eval_in_env(
+            mean_return, success_rate, video, imag_rewards_ep0 = eval_in_env(
                 env, bridge, policy, action_dim, eval_episodes, device, obs_key,
                 record_video=True)
             print(f"step {step:6d} | eval_return {mean_return:.4f} "
@@ -475,8 +474,14 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
                         'eval/success_rate': success_rate}
             if video is not None:
                 log_dict['eval/video'] = wandb.Video(video, fps=20, format='mp4')
-            if mean_imagined_reward is not None:
-                log_dict['eval/mean_imagined_reward'] = mean_imagined_reward
+            if imag_rewards_ep0:
+                xs = list(range(len(imag_rewards_ep0)))
+                log_dict['eval/imagined_reward_per_step'] = wandb.plot.line_series(
+                    xs=xs,
+                    ys=[imag_rewards_ep0],
+                    keys=['world_model_imagined_reward'],
+                    title='Eval ep0: world-model-predicted reward per step',
+                    xname='env step within episode')
             wandb.log(log_dict, step=step)
 
         if step % save_every == 0 and step > 0:
@@ -517,7 +522,7 @@ if __name__ == '__main__':
     parser.add_argument('--wandb_project', type=str, default='world-model-policy')
     parser.add_argument('--wandb_entity', type=str, default=None)
     parser.add_argument('--wandb_run_name', type=str, default=None)
-    parser.add_argument('--wandb_mode', type=str, default='online',
+    parser.add_argument('--zwandb_mode', type=str, default='online',
                          choices=['online', 'offline', 'disabled'])
     args = parser.parse_args()
     train(**vars(args))
