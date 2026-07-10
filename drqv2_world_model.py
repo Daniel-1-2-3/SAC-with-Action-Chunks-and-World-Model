@@ -244,8 +244,6 @@ class WorldModelSACAgent:
         metrics['alpha_loss'] = alpha_loss.item()
         metrics['actor_pretanh_mean_abs'] = mu_raw.abs().mean().item()
         metrics['actor_pretanh_max_abs'] = mu_raw.abs().max().item()
-        metrics['action_min'] = action.min().item()
-        metrics['action_max'] = action.max().item()
         if self.use_tb:
             metrics['actor_logprob'] = log_prob.mean().item()
         return metrics
@@ -294,7 +292,6 @@ def imagine_rollout(bridge, actor, seed_carry, horizon, device, gamma):
 def eval_in_env(env, bridge, policy, action_dim, num_episodes, device, obs_key, record_video=False):
     returns, successes = [], []
     frames = []
-    real_rewards_ep0 = []
     imag_rewards_ep0 = []
 
     def safe_render():
@@ -336,7 +333,6 @@ def eval_in_env(env, bridge, policy, action_dim, num_episodes, device, obs_key, 
             ep_success = ep_success or bool(info.get('success', reward == 0))
 
             if ep == 0:
-                real_rewards_ep0.append(float(reward))
                 safe_render()
 
             prevact = action.reshape(1, -1).astype(np.float32)
@@ -350,7 +346,8 @@ def eval_in_env(env, bridge, policy, action_dim, num_episodes, device, obs_key, 
     if record_video and frames:
         video = np.stack(frames).astype(np.uint8).transpose(0, 3, 1, 2)
 
-    return float(np.mean(returns)), float(np.mean(successes)), video, real_rewards_ep0, imag_rewards_ep0
+    mean_imagined_reward = float(np.mean(imag_rewards_ep0)) if imag_rewards_ep0 else None
+    return float(np.mean(returns)), float(np.mean(successes)), video, mean_imagined_reward
 
 def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
           imagination_batch, seq_len_seed, num_train_steps, log_every,
@@ -469,7 +466,7 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
             wandb.log(numeric_metrics(metrics), step=step)
 
         if step % eval_every == 0 and step > 0:
-            mean_return, success_rate, video, real_rewards_ep0, imag_rewards_ep0 = eval_in_env(
+            mean_return, success_rate, video, mean_imagined_reward = eval_in_env(
                 env, bridge, policy, action_dim, eval_episodes, device, obs_key,
                 record_video=True)
             print(f"step {step:6d} | eval_return {mean_return:.4f} "
@@ -478,14 +475,8 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
                         'eval/success_rate': success_rate}
             if video is not None:
                 log_dict['eval/video'] = wandb.Video(video, fps=20, format='mp4')
-            if real_rewards_ep0:
-                xs = list(range(len(real_rewards_ep0)))
-                log_dict['eval/reward_comparison'] = wandb.plot.line_series(
-                    xs=xs,
-                    ys=[real_rewards_ep0, imag_rewards_ep0],
-                    keys=['real_reward', 'world_model_imagined_reward'],
-                    title='Eval ep0: real vs world-model-predicted reward',
-                    xname='env step within episode')
+            if mean_imagined_reward is not None:
+                log_dict['eval/mean_imagined_reward'] = mean_imagined_reward
             wandb.log(log_dict, step=step)
 
         if step % save_every == 0 and step > 0:
