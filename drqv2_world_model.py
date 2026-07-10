@@ -257,11 +257,12 @@ class WorldModelSACAgent:
             'log_alpha': self.log_alpha.detach().cpu(),
         }
 
-def imagine_rollout(bridge, actor, seed_carry, horizon, device, gamma):
+def imagine_rollout(bridge, actor, seed_carry, horizon, device, gamma, round_reward=False):
     carry = seed_carry
     feat_t = jax_to_torch(bridge.get_feat(carry), device)
 
-    feats, actions, rewards, conts, next_feats, weights = [], [], [], [], [], []
+    feats, actions, rewards, raw_rewards, rounded_rewards, conts, next_feats, weights = \
+        [], [], [], [], [], [], [], []
     cont_by_step = []
 
     weight = torch.ones(feat_t.shape[0], 1, device=device)
@@ -273,12 +274,16 @@ def imagine_rollout(bridge, actor, seed_carry, horizon, device, gamma):
 
         next_carry, next_feat_flat, reward_j, cont_j = bridge.img_step(carry, action_np)
         next_feat_t = jax_to_torch(next_feat_flat, device)
-        reward_t = jax_to_torch(reward_j, device).reshape(-1, 1)
+        raw_reward_t = jax_to_torch(reward_j, device).reshape(-1, 1)
+        rounded_reward_t = torch.round(raw_reward_t.clamp(-1.0, 0.0))
+        reward_t = rounded_reward_t if round_reward else raw_reward_t
         cont_t = jax_to_torch(cont_j, device).reshape(-1, 1)
 
         feats.append(feat_t)
         actions.append(action_t)
         rewards.append(reward_t)
+        raw_rewards.append(raw_reward_t)
+        rounded_rewards.append(rounded_reward_t)
         conts.append(cont_t)
         next_feats.append(next_feat_t)
         weights.append(weight)
@@ -288,7 +293,8 @@ def imagine_rollout(bridge, actor, seed_carry, horizon, device, gamma):
         carry, feat_t = next_carry, next_feat_t
 
     return (torch.cat(feats), torch.cat(actions), torch.cat(rewards),
-            torch.cat(conts), torch.cat(next_feats), torch.cat(weights), cont_by_step)
+            torch.cat(conts), torch.cat(next_feats), torch.cat(weights), cont_by_step,
+            torch.cat(raw_rewards), torch.cat(rounded_rewards))
 
 def eval_in_env(env, bridge, policy, action_dim, num_episodes, device, obs_key, record_video=False):
     returns, successes = [], []
@@ -353,6 +359,7 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
           imagination_batch, seq_len_seed, num_train_steps, log_every,
           save_every, eval_every, eval_episodes, out_dir, lr, alpha_lr,
           feature_dim, hidden_dim, critic_target_tau, gamma, init_alpha, clip_mean,
+          round_reward,
           wandb_project, wandb_entity, wandb_run_name, wandb_mode):
 
     folder = pathlib.Path(__file__).parent
@@ -388,6 +395,7 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
             'gamma': gamma,
             'init_alpha': init_alpha,
             'clip_mean': clip_mean,
+            'round_reward': round_reward,
             'presets': presets,
         },
     )
@@ -446,8 +454,8 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
         seed_pool = subsample_tree_np(seed_pool, imagination_batch, rng)
         seed_carry = bridge.place_seed(seed_pool)
 
-        feats, actions, rewards, conts, next_feats, weights, cont_by_step = imagine_rollout(
-            bridge, policy.actor, seed_carry, horizon, device, policy.gamma)
+        feats, actions, rewards, conts, next_feats, weights, cont_by_step, raw_rewards, rounded_rewards = imagine_rollout(
+            bridge, policy.actor, seed_carry, horizon, device, policy.gamma, round_reward)
 
         discounts = policy.gamma * conts
 
@@ -455,6 +463,8 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
         metrics.update(policy.update_actor(feats.detach(), step, weights.detach()))
         utils.soft_update_params(policy.critic, policy.critic_target, policy.critic_target_tau)
         metrics['mean_imag_reward'] = rewards.mean().item()
+        metrics['mean_imag_reward_raw'] = raw_rewards.mean().item()
+        metrics['mean_imag_reward_rounded'] = rounded_rewards.mean().item()
         metrics['mean_imag_cont'] = conts.mean().item()
         metrics['cont_horizon_first'] = cont_by_step[0]
         metrics['cont_horizon_last'] = cont_by_step[-1]
@@ -518,6 +528,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--alpha_lr', type=float, default=1e-5)
     parser.add_argument('--clip_mean', type=float, default=2.0)
+    parser.add_argument('--round_reward', action='store_true')
     parser.add_argument('--feature_dim', type=int, default=50)
     parser.add_argument('--hidden_dim', type=int, default=1024)
     parser.add_argument('--critic_target_tau', type=float, default=0.01)
