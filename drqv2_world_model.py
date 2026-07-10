@@ -157,7 +157,7 @@ class WorldModelSACAgent:
         self.critic_target_tau = critic_target_tau
         self.gamma = gamma
         self.use_tb = use_tb
-        self.target_entropy = -0.5 * float(action_shape[0])
+        self.target_entropy = -float(action_shape[0])
 
         self.actor = SACActor(repr_dim, action_shape, feature_dim, hidden_dim).to(device)
         self.critic = Critic(repr_dim, action_shape, feature_dim, hidden_dim).to(device)
@@ -244,6 +244,8 @@ class WorldModelSACAgent:
         metrics['alpha_loss'] = alpha_loss.item()
         metrics['actor_pretanh_mean_abs'] = mu_raw.abs().mean().item()
         metrics['actor_pretanh_max_abs'] = mu_raw.abs().max().item()
+        metrics['action_min'] = action.min().item()
+        metrics['action_max'] = action.max().item()
         if self.use_tb:
             metrics['actor_logprob'] = log_prob.mean().item()
         return metrics
@@ -292,6 +294,8 @@ def imagine_rollout(bridge, actor, seed_carry, horizon, device, gamma):
 def eval_in_env(env, bridge, policy, action_dim, num_episodes, device, obs_key, record_video=False):
     returns, successes = [], []
     frames = []
+    real_rewards_ep0 = []
+    imag_rewards_ep0 = []
 
     def safe_render():
         nonlocal record_video
@@ -322,12 +326,17 @@ def eval_in_env(env, bridge, policy, action_dim, num_episodes, device, obs_key, 
             feat_np = np.asarray(jax.device_get(feat_j))[0].copy()
             action = policy.act(feat_np, step=0, eval_mode=True)
 
+            if ep == 0:
+                _, _, imag_reward_j, _ = bridge.img_step(dyn_carry, action.reshape(1, -1))
+                imag_rewards_ep0.append(float(jax.device_get(imag_reward_j)[0]))
+
             next_obs, reward, terminated, truncated, info = env.step(action)
             done = bool(terminated or truncated)
             ep_return += float(reward)
             ep_success = ep_success or bool(info.get('success', reward == 0))
 
             if ep == 0:
+                real_rewards_ep0.append(float(reward))
                 safe_render()
 
             prevact = action.reshape(1, -1).astype(np.float32)
@@ -341,7 +350,7 @@ def eval_in_env(env, bridge, policy, action_dim, num_episodes, device, obs_key, 
     if record_video and frames:
         video = np.stack(frames).astype(np.uint8).transpose(0, 3, 1, 2)
 
-    return float(np.mean(returns)), float(np.mean(successes)), video
+    return float(np.mean(returns)), float(np.mean(successes)), video, real_rewards_ep0, imag_rewards_ep0
 
 def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
           imagination_batch, seq_len_seed, num_train_steps, log_every,
@@ -460,7 +469,7 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
             wandb.log(numeric_metrics(metrics), step=step)
 
         if step % eval_every == 0 and step > 0:
-            mean_return, success_rate, video = eval_in_env(
+            mean_return, success_rate, video, real_rewards_ep0, imag_rewards_ep0 = eval_in_env(
                 env, bridge, policy, action_dim, eval_episodes, device, obs_key,
                 record_video=True)
             print(f"step {step:6d} | eval_return {mean_return:.4f} "
@@ -469,6 +478,14 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
                         'eval/success_rate': success_rate}
             if video is not None:
                 log_dict['eval/video'] = wandb.Video(video, fps=20, format='mp4')
+            if real_rewards_ep0:
+                xs = list(range(len(real_rewards_ep0)))
+                log_dict['eval/reward_comparison'] = wandb.plot.line_series(
+                    xs=xs,
+                    ys=[real_rewards_ep0, imag_rewards_ep0],
+                    keys=['real_reward', 'world_model_imagined_reward'],
+                    title='Eval ep0: real vs world-model-predicted reward',
+                    xname='env step within episode')
             wandb.log(log_dict, step=step)
 
         if step % save_every == 0 and step > 0:
@@ -499,8 +516,8 @@ if __name__ == '__main__':
     parser.add_argument('--eval_every', type=int, default=2000)
     parser.add_argument('--eval_episodes', type=int, default=10)
     parser.add_argument('--out_dir', type=str, default='policy_train_out')
-    parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--alpha_lr', type=float, default=1e-5)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--alpha_lr', type=float, default=1e-4)
     parser.add_argument('--feature_dim', type=int, default=50)
     parser.add_argument('--hidden_dim', type=int, default=1024)
     parser.add_argument('--critic_target_tau', type=float, default=0.01)
