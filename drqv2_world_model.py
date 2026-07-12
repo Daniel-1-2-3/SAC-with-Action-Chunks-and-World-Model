@@ -15,8 +15,8 @@ import elements
 import ruamel.yaml as yaml
 import wandb
 
-import drqv2.utils as utils
-from drqv2.drqv2 import Critic, SACActor
+import sac.utils as utils
+from sac.sac import Critic, SACActor
 from ogbench_dataset_methods import DatasetMethods
 from agent import WorldModelAgent
 from embodied.embodied.jax import transform
@@ -158,7 +158,7 @@ class WorldModelSACAgent:
         self.critic_target_tau = critic_target_tau
         self.gamma = gamma
         self.use_tb = use_tb
-        self.target_entropy = -0.5 * float(action_shape[0])
+        self.target_entropy = -float(action_shape[0])
 
         self.actor = SACActor(repr_dim, action_shape, feature_dim, hidden_dim, clip_mean).to(device)
         self.critic = Critic(repr_dim, action_shape, feature_dim, hidden_dim).to(device)
@@ -526,14 +526,14 @@ if __name__ == '__main__':
     parser.add_argument('--eval_episodes', type=int, default=10)
     parser.add_argument('--out_dir', type=str, default='policy_train_out')
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--alpha_lr', type=float, default=1e-5)
+    parser.add_argument('--alpha_lr', type=float, default=1e-3)
     parser.add_argument('--clip_mean', type=float, default=2.0)
     parser.add_argument('--round_reward', action='store_true')
     parser.add_argument('--feature_dim', type=int, default=50)
     parser.add_argument('--hidden_dim', type=int, default=1024)
     parser.add_argument('--critic_target_tau', type=float, default=0.01)
     parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--init_alpha', type=float, default=0.1)
+    parser.add_argument('--init_alpha', type=float, default=1.0)
     parser.add_argument('--wandb_project', type=str, default='world-model-policy')
     parser.add_argument('--wandb_entity', type=str, default=None)
     parser.add_argument('--wandb_run_name', type=str, default=None)
@@ -542,4 +542,4 @@ if __name__ == '__main__':
     args = parser.parse_args()
     train(**vars(args))
 
-    # python drqv2_world_model.py --env_name cube-single-play-singletask-v0 --wm_ckpt checkpoints_cube_single_play_v0/checkpoint_20000.npz --horizon 15 --num_train_steps 1000000
+    # python drqv2_world_model.py --env_name cube-single-play-singletask-v0 --wm_ckpt checkpoints_cube_single_play_v0/checkpoint_20000.npz --horizon 15 --num_train_steps 500000

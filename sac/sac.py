@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import drqv2.utils as utils
+import sac.utils as utils
 
 class RandomShiftsAug(nn.Module):
     def __init__(self, pad):

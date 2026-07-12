@@ -1,5 +1,5 @@
 ogbench
-jax[cuda12]
+jax[cuda12]<0.7.0
 numpy<2
 optax
 chex
