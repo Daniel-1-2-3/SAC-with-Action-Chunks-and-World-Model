@@ -90,10 +90,8 @@ class Actor(nn.Module):
         dist = utils.TruncatedNormal(mu, std)
         return dist
 
-
-LOG_STD_MIN = -20.0
+LOG_STD_MIN = -5.0
 LOG_STD_MAX = 2.0
-
 
 class SACActor(nn.Module):
     """Proper SAC actor: outputs a learned mean AND learned log_std (unlike
