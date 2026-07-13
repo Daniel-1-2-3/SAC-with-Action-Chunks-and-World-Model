@@ -153,12 +153,21 @@ class WorldModelBridge:
 class WorldModelSACAgent:
     def __init__(self, repr_dim, action_shape, device, lr, alpha_lr, feature_dim,
                  hidden_dim, critic_target_tau, gamma, init_alpha=0.1, clip_mean=2.0,
+                 target_entropy_start_scale=-0.5, target_entropy_end_scale=-1.0,
+                 target_entropy_anneal_steps=50_000,
                  use_tb=False):
         self.device = device
         self.critic_target_tau = critic_target_tau
         self.gamma = gamma
         self.use_tb = use_tb
-        self.target_entropy = -float(action_shape[0])
+        self.action_dim = float(action_shape[0])
+        # target_entropy is annealed from start_scale*action_dim down to
+        # end_scale*action_dim over target_entropy_anneal_steps, then held fixed.
+        # start_scale should be *less negative* (looser) than end_scale so early
+        # training demands more entropy and late training allows sharper policies.
+        self.target_entropy_start_scale = target_entropy_start_scale
+        self.target_entropy_end_scale = target_entropy_end_scale
+        self.target_entropy_anneal_steps = max(1, target_entropy_anneal_steps)
 
         self.actor = SACActor(repr_dim, action_shape, feature_dim, hidden_dim, clip_mean).to(device)
         self.critic = Critic(repr_dim, action_shape, feature_dim, hidden_dim).to(device)
@@ -177,6 +186,12 @@ class WorldModelSACAgent:
     @property
     def alpha(self):
         return self.log_alpha.exp()
+
+    def current_target_entropy(self, step):
+        frac = min(1.0, step / self.target_entropy_anneal_steps)
+        scale = (self.target_entropy_start_scale
+                 + (self.target_entropy_end_scale - self.target_entropy_start_scale) * frac)
+        return scale * self.action_dim
 
     def train(self, training=True):
         self.training = training
@@ -218,7 +233,7 @@ class WorldModelSACAgent:
             metrics['critic_q2'] = Q2.mean().item()
         return metrics
 
-    def update_actor(self, obs, step, weight):
+    def update_actor(self, obs, step, weight, step_idx=None):
         metrics = dict()
         mu, log_std = self.actor(obs)
         action, log_prob = utils.sample_action(mu, log_std)
@@ -231,7 +246,9 @@ class WorldModelSACAgent:
         actor_loss.backward()
         self.actor_opt.step()
 
-        alpha_loss = -(self.log_alpha * (log_prob.detach() + self.target_entropy)).mean()
+        target_entropy = self.current_target_entropy(step)
+        # --- ACTUAL alpha update: unchanged, still an unweighted mean ---
+        alpha_loss = -(self.log_alpha * (log_prob.detach() + target_entropy)).mean()
         self.alpha_opt.zero_grad(set_to_none=True)
         alpha_loss.backward()
         self.alpha_opt.step()
@@ -240,9 +257,41 @@ class WorldModelSACAgent:
             h = self.actor.trunk(obs)
             mu_raw, _ = self.actor.policy(h).chunk(2, dim=-1)
 
+            # --- DEBUG ONLY below: does not affect training, just exposes the
+            # gap between "what population alpha_loss actually averages over"
+            # (every horizon step, equal weight) vs "what population is actually
+            # steering the actor" (weighted by discount, dominated by whichever
+            # steps still have meaningful weight). If these diverge a lot, alpha
+            # is being tuned against a different distribution than the one that
+            # determines the policy's real behavior. ---
+            error_term = log_prob.detach() + target_entropy  # what alpha_loss is built from
+            unweighted_error_mean = error_term.mean()
+            weighted_error_mean = (weight * error_term).sum() / wsum
+            alpha_loss_if_weighted = -(self.log_alpha.detach() * weighted_error_mean)
+
+            metrics['debug_alpha_error_unweighted'] = unweighted_error_mean.item()
+            metrics['debug_alpha_error_weighted'] = weighted_error_mean.item()
+            metrics['debug_alpha_error_gap'] = (weighted_error_mean - unweighted_error_mean).item()
+            metrics['debug_alpha_loss_if_weighted'] = alpha_loss_if_weighted.item()
+
+            metrics['debug_logprob_unweighted_mean'] = log_prob.mean().item()
+            metrics['debug_logprob_weighted_mean'] = ((weight * log_prob).sum() / wsum).item()
+
+            if step_idx is not None:
+                flat_idx = step_idx.squeeze(-1)
+                first_mask = flat_idx == 0
+                last_mask = flat_idx == flat_idx.max()
+                if first_mask.any():
+                    metrics['debug_log_std_seed_step0'] = log_std[first_mask].mean().item()
+                    metrics['debug_weight_seed_step0'] = weight[first_mask].mean().item()
+                if last_mask.any():
+                    metrics['debug_log_std_last_step'] = log_std[last_mask].mean().item()
+                    metrics['debug_weight_last_step'] = weight[last_mask].mean().item()
+
         metrics['actor_loss'] = actor_loss.item()
         metrics['alpha'] = self.alpha.item()
         metrics['alpha_loss'] = alpha_loss.item()
+        metrics['target_entropy'] = target_entropy
         metrics['actor_pretanh_mean_abs'] = mu_raw.abs().mean().item()
         metrics['actor_pretanh_max_abs'] = mu_raw.abs().max().item()
         metrics['log_std_mean'] = log_std.mean().item()
@@ -263,12 +312,12 @@ def imagine_rollout(bridge, actor, seed_carry, horizon, device, gamma):
     carry = seed_carry
     feat_t = jax_to_torch(bridge.get_feat(carry), device)
 
-    feats, actions, rewards, conts, next_feats, weights = [], [], [], [], [], []
+    feats, actions, rewards, conts, next_feats, weights, step_idxs = [], [], [], [], [], [], []
     cont_by_step = []
 
     weight = torch.ones(feat_t.shape[0], 1, device=device)
 
-    for _ in range(horizon):
+    for t in range(horizon):
         mu, log_std = actor(feat_t)
         action_t, _ = utils.sample_action(mu, log_std)
         action_np = action_t.detach().cpu().numpy()
@@ -284,13 +333,15 @@ def imagine_rollout(bridge, actor, seed_carry, horizon, device, gamma):
         conts.append(cont_t)
         next_feats.append(next_feat_t)
         weights.append(weight)
+        step_idxs.append(torch.full((feat_t.shape[0], 1), t, dtype=torch.long, device=device))
         cont_by_step.append(cont_t.mean().item())
 
         weight = weight * (gamma * cont_t)
         carry, feat_t = next_carry, next_feat_t
 
     return (torch.cat(feats), torch.cat(actions), torch.cat(rewards),
-            torch.cat(conts), torch.cat(next_feats), torch.cat(weights), cont_by_step)
+            torch.cat(conts), torch.cat(next_feats), torch.cat(weights), cont_by_step,
+            torch.cat(step_idxs))
 
 def eval_in_env(env, bridge, policy, action_dim, num_episodes, device, obs_key, record_video=False):
     returns, successes = [], []
@@ -355,6 +406,7 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
           imagination_batch, seq_len_seed, num_train_steps, log_every,
           save_every, eval_every, eval_episodes, out_dir, lr, alpha_lr,
           feature_dim, hidden_dim, critic_target_tau, gamma, init_alpha, clip_mean,
+          target_entropy_start_scale, target_entropy_end_scale, target_entropy_anneal_steps,
           wandb_project, wandb_entity, wandb_run_name, wandb_mode):
 
     folder = pathlib.Path(__file__).parent
@@ -390,6 +442,9 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
             'gamma': gamma,
             'init_alpha': init_alpha,
             'clip_mean': clip_mean,
+            'target_entropy_start_scale': target_entropy_start_scale,
+            'target_entropy_end_scale': target_entropy_end_scale,
+            'target_entropy_anneal_steps': target_entropy_anneal_steps,
             'presets': presets,
         },
     )
@@ -438,6 +493,9 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
         gamma=gamma,
         init_alpha=init_alpha,
         clip_mean=clip_mean,
+        target_entropy_start_scale=target_entropy_start_scale,
+        target_entropy_end_scale=target_entropy_end_scale,
+        target_entropy_anneal_steps=target_entropy_anneal_steps,
     )
 
     for step in range(num_train_steps):
@@ -448,13 +506,13 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
         seed_pool = subsample_tree_np(seed_pool, imagination_batch, rng)
         seed_carry = bridge.place_seed(seed_pool)
 
-        feats, actions, rewards, conts, next_feats, weights, cont_by_step = imagine_rollout(
+        feats, actions, rewards, conts, next_feats, weights, cont_by_step, step_idx = imagine_rollout(
             bridge, policy.actor, seed_carry, horizon, device, policy.gamma)
 
         discounts = policy.gamma * conts
 
         metrics = policy.update_critic(feats, actions, rewards, discounts, next_feats, step, weights)
-        metrics.update(policy.update_actor(feats.detach(), step, weights.detach()))
+        metrics.update(policy.update_actor(feats.detach(), step, weights.detach(), step_idx))
         utils.soft_update_params(policy.critic, policy.critic_target, policy.critic_target_tau)
         metrics['mean_imag_reward'] = rewards.mean().item()
         metrics['mean_imag_cont'] = conts.mean().item()
@@ -467,7 +525,16 @@ def train(env_name, obs_key, action_key, presets, seed, wm_ckpt, horizon,
                   f"| actor_loss {metrics['actor_loss']:.4f} "
                   f"| alpha {metrics['alpha']:.4f} "
                   f"| log_std {metrics['log_std_mean']:.3f} "
+                  f"| target_H {metrics['target_entropy']:.3f} "
                   f"| mean_imag_reward {metrics['mean_imag_reward']:.4f}")
+            print(f"         [debug] alpha_loss actual(unweighted) {metrics['alpha_loss']:.4f} "
+                  f"vs if-weighted {metrics['debug_alpha_loss_if_weighted']:.4f} "
+                  f"| error_term unweighted {metrics['debug_alpha_error_unweighted']:.3f} "
+                  f"vs weighted {metrics['debug_alpha_error_weighted']:.3f} "
+                  f"| log_std seed(step0) {metrics.get('debug_log_std_seed_step0', float('nan')):.3f} "
+                  f"vs last_step {metrics.get('debug_log_std_last_step', float('nan')):.3f} "
+                  f"| weight seed(step0) {metrics.get('debug_weight_seed_step0', float('nan')):.4f} "
+                  f"vs last_step {metrics.get('debug_weight_last_step', float('nan')):.6f}")
             wandb.log(numeric_metrics(metrics), step=step)
 
         if step % eval_every == 0 and step > 0:
@@ -526,6 +593,14 @@ if __name__ == '__main__':
     parser.add_argument('--critic_target_tau', type=float, default=0.01)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--init_alpha', type=float, default=1.0)
+    parser.add_argument('--target_entropy_start_scale', type=float, default=-0.5,
+                         help='target_entropy = scale * action_dim; less negative = looser/more entropy required')
+    parser.add_argument('--target_entropy_end_scale', type=float, default=-1.0,
+                         help='final scale once annealing completes (standard SAC default is -1.0)')
+    parser.add_argument('--target_entropy_anneal_steps', type=int, default=100_000,
+                         help='steps to linearly anneal from start_scale to end_scale; set explicitly, '
+                              'does NOT scale with num_train_steps -- a short test run should still get '
+                              'a real exploratory window unless you deliberately shorten this')
     parser.add_argument('--wandb_project', type=str, default='world-model-policy')
     parser.add_argument('--wandb_entity', type=str, default=None)
     parser.add_argument('--wandb_run_name', type=str, default=None)
