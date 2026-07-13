@@ -173,23 +173,48 @@ class SACAgent:
         }
 
 
-def eval_in_env(env, agent, num_episodes):
+def eval_in_env(env, agent, num_episodes, record_video=False):
     returns, successes = [], []
-    for _ in range(num_episodes):
+    frames = []
+
+    def safe_render():
+        nonlocal record_video
+        if not record_video:
+            return
+        try:
+            frames.append(env.render())
+        except Exception as e:
+            print(f'Video recording failed, disabling for this eval: {e}')
+            record_video = False
+
+    for ep in range(num_episodes):
         obs, info = env.reset()
         done = False
         ep_return = 0.0
         ep_success = False
+
+        if ep == 0:
+            safe_render()
+
         while not done:
             action = agent.act(obs, eval_mode=True)
             next_obs, reward, terminated, truncated, info = env.step(action)
             done = bool(terminated or truncated)
             ep_return += float(reward)
             ep_success = ep_success or bool(info.get('success', reward == 0))
+
+            if ep == 0:
+                safe_render()
+
             obs = next_obs
         returns.append(ep_return)
         successes.append(float(ep_success))
-    return float(np.mean(returns)), float(np.mean(successes))
+
+    video = None
+    if record_video and frames:
+        video = np.stack(frames).astype(np.uint8).transpose(0, 3, 1, 2)
+
+    return float(np.mean(returns)), float(np.mean(successes)), video
 
 
 def train(env_name, seed, num_train_steps, batch_size, log_every, eval_every, eval_episodes,
@@ -231,7 +256,7 @@ def train(env_name, seed, num_train_steps, batch_size, log_every, eval_every, ev
     )
 
     print(f'Loading OGBench env + dataset: {env_name}')
-    env, train_dataset, val_dataset = ogbench.make_env_and_datasets(env_name)
+    env, train_dataset, val_dataset = ogbench.make_env_and_datasets(env_name, render_mode='rgb_array')
     obs_dim = train_dataset['observations'].shape[-1]
     action_dim = train_dataset['actions'].shape[-1]
     print(f'obs_dim={obs_dim}  action_dim={action_dim}  '
@@ -278,10 +303,13 @@ def train(env_name, seed, num_train_steps, batch_size, log_every, eval_every, ev
             wandb.log(numeric_metrics(metrics), step=step)
 
         if step % eval_every == 0 and step > 0:
-            mean_return, success_rate = eval_in_env(env, agent, eval_episodes)
+            mean_return, success_rate, video = eval_in_env(env, agent, eval_episodes, record_video=True)
             print(f"step {step:6d} | eval_return {mean_return:.4f} "
                   f"| eval_success_rate {success_rate:.4f}")
-            wandb.log({'eval/mean_return': mean_return, 'eval/success_rate': success_rate}, step=step)
+            log_dict = {'eval/mean_return': mean_return, 'eval/success_rate': success_rate}
+            if video is not None:
+                log_dict['eval/video'] = wandb.Video(video, fps=20, format='mp4')
+            wandb.log(log_dict, step=step)
 
         if step % save_every == 0 and step > 0:
             ckpt_path = out_dir / f'policy_step{step}.pt'
