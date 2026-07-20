@@ -13,7 +13,7 @@ import ogbench
 
 from dreamer.wm_agent import WorldModelAgent # JAX dreamer agent
 from dreamer.wm_bridge import WorldModelBridge # handles JAX and numpy conversions
-from drqv2_wm_agent import DrQV2WorldModelAgent # drqv2 + world model
+from sac_wm_agent import SACWorldModelAgent # SAC + world model (file kept as drqv2_wm_agent.py for continuity)
 from evaluation import eval_in_env
 from imagination import imagine_rollout
 from interop import numeric_metrics, subsample_tree_np, unwrap # JAX to torch/dict helpers
@@ -59,8 +59,22 @@ def build_real_env(env_name, load_offline_dataset):
     env, _, _ = ogbench.make_env_and_datasets(env_name, env_only=True)
     return env, None, None
 
+def _param_norm(params):
+    """ L2 norm across every leaf of a JAX param pytree -- used to
+        watch the world model's weight scale over the whole run """
+    leaves = jax.tree_util.tree_leaves(params)
+    total = sum(float(jax.numpy.sum(jax.numpy.square(x))) for x in leaves)
+    return total ** 0.5
+
+def _prefixed(d, default_prefix):
+    """ Prefix every key with default_prefix, EXCEPT keys that already
+        carry their own namespace (e.g. 'diagnosis/critic_grad_norm')
+        -- those pass through unprefixed so they land in their own
+        wandb tab instead of sac/diagnosis/... """
+    return {k if '/' in k else f'{default_prefix}/{k}': v for k, v in d.items()}
+
 def train(config):
-    general_config, dreamer_config, drqv2_config = config.joint.general, config.joint.dreamer, config.joint.drqv2
+    general_config, dreamer_config, sac_config = config.joint.general, config.joint.dreamer, config.joint.sac
 
     out_dir = pathlib.Path(general_config.out_dir) # Checkpoints and outs dir
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -102,13 +116,12 @@ def train(config):
         replay.seed_from_offline(offline_episodes, rng=rng) # Put offline episodes into buffer for warm start
         print(f'Seeded replay buffer with {len(replay.dreamer_episodes)} offline episodes')
 
-    # Create drqv2 policy
-    policy = DrQV2WorldModelAgent( # repr_dim same as world-model feature dim
+    # Create SAC policy
+    policy = SACWorldModelAgent( # repr_dim same as world-model feature dim
         repr_dim=feat_dim, action_shape=(action_dim,), device=device,
-        lr=drqv2_config.lr, feature_dim=drqv2_config.feature_dim, hidden_dim=drqv2_config.hidden_dim,
-        critic_target_tau=drqv2_config.critic_target_tau,
-        num_expl_steps=drqv2_config.num_expl_steps,
-        stddev_schedule=drqv2_config.stddev_schedule, stddev_clip=drqv2_config.stddev_clip,
+        lr=sac_config.lr, feature_dim=sac_config.feature_dim, hidden_dim=sac_config.hidden_dim,
+        critic_target_tau=sac_config.critic_target_tau,
+        init_ent_coef=sac_config.init_ent_coef,
     )
 
     # Reset
@@ -117,7 +130,7 @@ def train(config):
     prevact = np.zeros((1, action_dim), dtype=np.float32) # No actions taken yet
     is_first = np.array([True])
     global_step = 0
-    print('Starting world-model + DrQV2 training loop')
+    print('Starting world-model + SAC training loop')
 
     while global_step < general_config.num_train_steps:
         # Encode the obs 
@@ -127,9 +140,9 @@ def train(config):
         if global_step < general_config.num_seed_steps:
             action = env.action_space.sample()
         else:
-            # Using encoded obs as input, calculate action to take with drqv2 policy
+            # Using encoded obs as input, calculate action to take with SAC policy
             feat_np = np.asarray(jax.device_get(feat_jax))[0].copy()
-            action = policy.act(feat_np, global_step, eval_mode=False)
+            action = policy.act(feat_np, eval_mode=False)
 
         # Take step and store the observations in replay
         env_action = ENV_ACTION_LOW + (action + 1.0) * 0.5 * (ENV_ACTION_HIGH - ENV_ACTION_LOW)
@@ -161,28 +174,63 @@ def train(config):
             wm_carry, outs, wm_mets = wm_agent.train(wm_carry, batch)
             metrics.update({f'wm/{k}': v for k, v in wm_mets.items()})
 
-        # Update drqv2 policy
-        if ready and global_step % drqv2_config.train_every == 0:
+            # diagnosis/: gated behind log_every since the WM trains every
+            # step but a param-norm tree traversal isn't free -- no point
+            # paying that cost on steps that never reach wandb anyway.
+            if global_step % general_config.log_every == 0:
+                metrics['diagnosis/wm_param_norm'] = _param_norm(wm_agent.params)
+                metrics['diagnosis/replay_transitions'] = len(replay)
+                metrics['diagnosis/replay_episodes'] = len(replay.dreamer_episodes)
+
+        # Update SAC policy
+        if ready and global_step % sac_config.train_every == 0:
             # Get a pool of seed states
             seed_batch_np = replay.sample_batch(batch_size, seq_len, rng=rng)
             seed_batch = OGBenchMethods.to_jax(seed_batch_np)
             seed_pool = bridge.seed_pool(seed_batch, batch_size)
-            seed_pool = subsample_tree_np(seed_pool, drqv2_config.imagination_batch, rng)
+            seed_pool = subsample_tree_np(seed_pool, sac_config.imagination_batch, rng)
             seed_carry = bridge.place_seed(seed_pool)
 
             # Using seed states imagine horizon steps forward
             feats, actions, rewards, conts, next_feats, weights = imagine_rollout(
-                bridge, policy, seed_carry, drqv2_config.horizon, 
-                device, drqv2_config.gamma, global_step
+                bridge, policy, seed_carry, sac_config.horizon, 
+                device, sac_config.gamma, global_step
             )
-            discounts = drqv2_config.gamma * conts
+            discounts = sac_config.gamma * conts
 
             # Update policy using the imagined states
-            metrics.update({f'drqv2/{k}': v for k, v in policy.update_critic(feats, actions, rewards, discounts, next_feats, global_step, weights).items()})
-            metrics.update({f'drqv2/{k}': v for k, v in policy.update_actor(feats.detach(), global_step, weights.detach()).items()})
+            metrics.update(_prefixed(policy.update_critic(feats, actions, rewards, discounts, next_feats, weights), 'sac'))
+            metrics.update(_prefixed(policy.update_actor(feats.detach(), weights.detach()), 'sac'))
             policy.update_target()
-            metrics['drqv2/mean_imag_reward'] = rewards.mean().item()
-            metrics['drqv2/mean_imag_cont'] = conts.mean().item()
+            metrics['sac/mean_imag_reward'] = rewards.mean().item()
+            metrics['sac/mean_imag_cont'] = conts.mean().item()
+
+            # diagnosis/: rewards/conts/weights come back flattened as
+            # (horizon * batch, 1), step-major -- reshape to (horizon, batch)
+            # to see WHERE in the rollout things go wrong, not just the
+            # average across the whole thing. This is what would have
+            # shown the cont-probability drift as a first-step-vs-last-step
+            # split instead of one blended number.
+            H = sac_config.horizon
+            rewards_by_step = rewards.reshape(H, -1)
+            conts_by_step = conts.reshape(H, -1)
+            weights_by_step = weights.reshape(H, -1)
+            metrics['diagnosis/rollout_cont_first_step'] = conts_by_step[0].mean().item()
+            metrics['diagnosis/rollout_cont_last_step'] = conts_by_step[-1].mean().item()
+            metrics['diagnosis/rollout_cont_std'] = conts.std().item()
+            metrics['diagnosis/rollout_reward_first_step'] = rewards_by_step[0].mean().item()
+            metrics['diagnosis/rollout_reward_last_step'] = rewards_by_step[-1].mean().item()
+            metrics['diagnosis/rollout_reward_std'] = rewards.std().item()
+            metrics['diagnosis/rollout_reward_min'] = rewards.min().item()
+            metrics['diagnosis/rollout_reward_max'] = rewards.max().item()
+            # how much of the horizon's weight survives to the last step --
+            # collapses toward 0 if cont keeps predicting early termination
+            metrics['diagnosis/rollout_weight_last_step'] = weights_by_step[-1].mean().item()
+            # imagined-action saturation -- pinned actions were the DrQV2-era
+            # bug this whole SAC switch is meant to fix; worth watching to
+            # confirm it actually stays gone
+            metrics['diagnosis/imag_action_sat_frac'] = (actions.abs() > 0.95).float().mean().item()
+            metrics['diagnosis/imag_action_mean_abs'] = actions.abs().mean().item()
 
         # Log metrics
         if metrics and global_step % general_config.log_every == 0:
@@ -202,13 +250,13 @@ def train(config):
             wandb.log(log_dict, step=global_step)
 
         if global_step % general_config.save_every == 0 and global_step > 0:
-            torch.save(policy.state_dict_all(), out_dir / 'drqv2_latest.pt')
+            torch.save(policy.state_dict_all(), out_dir / 'sac_latest.pt')
             wm_cp = elements.Checkpoint(out_dir / 'wm_latest.pkl')
             wm_cp.agent = wm_agent
             wm_cp.save()
             print(f'Saved checkpoints at step {global_step}')
 
-    torch.save(policy.state_dict_all(), out_dir / 'drqv2_final.pt')
+    torch.save(policy.state_dict_all(), out_dir / 'sac_final.pt')
     env.close()
     wandb.finish()
     print('Finish training')

@@ -1,12 +1,10 @@
 import torch
-from drqv2_wm_utils import schedule
+from drqv2_wm_agent import sample_squashed
 from interop import jax_to_torch
 
-def imagine_rollout(bridge, drqv2_agent, seed_carry, horizon, device, gamma, global_step):
+def imagine_rollout(bridge, sac_agent, seed_carry, horizon, device, gamma, global_step):
     carry = seed_carry # Seed states
     feat_t = jax_to_torch(bridge.get_feat(carry), device)
-    # Determine amount of exploration noise drqv2 actor uses when picking action
-    stddev = schedule(drqv2_agent.stddev_schedule, global_step)
 
     feats, actions, rewards, conts, next_feats, weights = [], [], [], [], [], []
     weight = torch.ones(feat_t.shape[0], 1, device=device)
@@ -14,8 +12,8 @@ def imagine_rollout(bridge, drqv2_agent, seed_carry, horizon, device, gamma, glo
     for _ in range(horizon): # Imagines horizon steps forward
         # Using current policy pick out an action based on the imagined state
         with torch.no_grad():
-            dist = drqv2_agent.actor(feat_t, stddev)
-            action_t = dist.sample(clip=drqv2_agent.stddev_clip)
+            mu, std = sac_agent.actor(feat_t)
+            action_t, _ = sample_squashed(mu, std)
         action_np = action_t.detach().cpu().numpy()
 
         # Step the world model to predict next state based on the action just taken
