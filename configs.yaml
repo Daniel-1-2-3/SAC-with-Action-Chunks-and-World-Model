@@ -1,6 +1,5 @@
 defaults:
 
-  logdir: ~/logdir/{timestamp}
   seed: 0
   batch_size: 16
   batch_length: 64
@@ -14,65 +13,74 @@ defaults:
     prealloc: True
     jit: True
     debug: False
-    profiler: False
     expect_devices: 0
     enable_policy: True
     coordinator_address: ''
 
   agent:
-
-    loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1}
-
-    opt: {lr: 2e-4, agc: 0.5, eps: 1e-20, beta1: 0.9, beta2: 0.999,
-          momentum: True, wd: 0.0, schedule: const, warmup: 1000, anneal: 0}
-
-    horizon: 333
-    contdisc: True
-
+    loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3}
+    opt: {lr: 4e-5, agc: 0.3, eps: 1e-20, beta1: 0.9, beta2: 0.999, momentum: True, wd: 0.0, schedule: const, warmup: 1000, anneal: 0}
+    ac_grads: False
     dyn:
       typ: rssm
-      rssm: {deter: 512, hidden: 128, stoch: 32, classes: 32, act: silu,
-             norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in,
-             imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False,
-             blocks: 8, free_nats: 1.0}
-
+      rssm: {deter: 8192, hidden: 1024, stoch: 32, classes: 64, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False, blocks: 8, free_nats: 1.0}
     enc:
       typ: simple
-      simple: {layers: 3, units: 256, act: silu, norm: rms,
-               winit: trunc_normal_in, symlog: True}
-
+      simple: {depth: 64, mults: [2, 3, 4, 4], layers: 3, units: 1024, act: silu, norm: rms, winit: trunc_normal_in, symlog: True, outer: False, kernel: 5, strided: False}
     dec:
       typ: simple
-      simple: {layers: 3, units: 256, act: silu, norm: rms, outscale: 1.0,
-               winit: trunc_normal_in, symlog: True}
+      simple: {depth: 64, mults: [2, 3, 4, 4], layers: 3, units: 1024, act: silu, norm: rms, outscale: 1.0, winit: trunc_normal_in, outer: False, kernel: 5, bspace: 8, strided: False}
+    rewhead: {layers: 1, units: 1024, act: silu, norm: rms, output: symexp_twohot, outscale: 0.0, winit: trunc_normal_in, bins: 255}
+    conhead: {layers: 1, units: 1024, act: silu, norm: rms, output: binary, outscale: 1.0, winit: trunc_normal_in}
+    policy: {layers: 3, units: 1024, act: silu, norm: rms, minstd: 0.1, maxstd: 1.0, outscale: 0.01, unimix: 0.01, winit: trunc_normal_in}
+    value: {layers: 3, units: 1024, act: silu, norm: rms, output: symexp_twohot, outscale: 0.0, winit: trunc_normal_in, bins: 255}
+    policy_dist_disc: categorical
+    policy_dist_cont: bounded_normal
+    imag_last: 0
+    imag_length: 15
+    horizon: 333
+    contdisc: True
+    imag_loss: {slowtar: False, lam: 0.95, actent: 3e-4, slowreg: 1.0}
+    repl_loss: {slowtar: False, lam: 0.95, slowreg: 1.0}
+    slowvalue: {rate: 0.02, every: 1}
+    retnorm: {impl: perc, rate: 0.01, limit: 1.0, perclo: 5.0, perchi: 95.0, debias: False}
+    valnorm: {impl: none, rate: 0.01, limit: 1e-8}
+    advnorm: {impl: none, rate: 0.01, limit: 1e-8}
+    reward_grad: True
+    repval_loss: True
+    repval_grad: True
+    report: True
+    report_gradnorms: False
 
-    rewhead: {layers: 1, units: 256, act: silu, norm: rms,
-              output: symexp_twohot, outscale: 0.0, winit: trunc_normal_in,
-              bins: 255}
+  joint:
 
-    conhead: {layers: 1, units: 256, act: silu, norm: rms, output: binary,
-              outscale: 1.0, winit: trunc_normal_in}
+    general:
+      env_name: cube-single-play-singletask-v0
+      wm_ckpt: ''
+      seed_from_offline: True
+      num_seed_steps: 4000
+      num_train_steps: 1000000
+      log_every: 100
+      save_every: 10000
+      eval_every: 10000
+      eval_episodes: 10
+      out_dir: joint_train_out
+      wandb_project: world-model-drqv2
+      wandb_mode: online
 
-size_small:
-  .*\.rssm: {deter: 512, hidden: 128, classes: 16}
-  .*\.units: 128
+    dreamer:
+      train_every: 1
+      max_episodes: 2000
 
-size_large:
-  .*\.rssm: {deter: 2048, hidden: 512, classes: 32}
-  .*\.units: 512
-
-cpu:
-  jax: {platform: cpu, prealloc: False}
-
-debug:
-  batch_size: 8
-  batch_length: 10
-  jax: {platform: cpu, debug: True, prealloc: False, profiler: False}
-  .*\.layers: 1
-  .*\.units: 8
-  .*\.stoch: 2
-  .*\.classes: 4
-  .*\.deter: 8
-  .*\.hidden: 3
-  .*\.blocks: 4
-  .*\.bins: 5
+    drqv2:
+      train_every: 30
+      horizon: 15
+      imagination_batch: 2048
+      gamma: 0.99
+      lr: 1e-4
+      feature_dim: 50
+      hidden_dim: 1024
+      critic_target_tau: 0.01
+      num_expl_steps: 2000
+      stddev_schedule: linear(1.0,0.1,500000)
+      stddev_clip: 0.3

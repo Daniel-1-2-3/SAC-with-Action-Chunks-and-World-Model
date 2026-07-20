@@ -8,7 +8,6 @@ import chex
 import elements
 import embodied.embodied as embodied
 import jax
-import jax.experimental.multihost_utils
 import jax.numpy as jnp
 import ninjax as nj
 import numpy as np
