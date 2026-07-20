@@ -202,8 +202,8 @@ def train(config):
             wandb.log(log_dict, step=global_step)
 
         if global_step % general_config.save_every == 0 and global_step > 0:
-            torch.save(policy.state_dict_all(), out_dir / f'drqv2_step{global_step}.pt')
-            wm_cp = elements.Checkpoint(out_dir / f'wm_step{global_step}.pkl')
+            torch.save(policy.state_dict_all(), out_dir / 'drqv2_latest.pt')
+            wm_cp = elements.Checkpoint(out_dir / 'wm_latest.pkl')
             wm_cp.agent = wm_agent
             wm_cp.save()
             print(f'Saved checkpoints at step {global_step}')
