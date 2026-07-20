@@ -1,5 +1,5 @@
 import torch
-from drqv2_wm_agent import sample_squashed
+from sac_wm_agent import sample_squashed
 from interop import jax_to_torch
 
 def imagine_rollout(bridge, sac_agent, seed_carry, horizon, device, gamma, global_step):
