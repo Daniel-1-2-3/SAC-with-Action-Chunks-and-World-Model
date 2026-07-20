@@ -13,7 +13,7 @@ import ogbench
 
 from dreamer.wm_agent import WorldModelAgent # JAX dreamer agent
 from dreamer.wm_bridge import WorldModelBridge # handles JAX and numpy conversions
-from sac_wm_agent import SACWorldModelAgent # SAC + world model (file kept as drqv2_wm_agent.py for continuity)
+from drqv2_wm_agent import SACWorldModelAgent # SAC + world model (file kept as drqv2_wm_agent.py for continuity)
 from evaluation import eval_in_env
 from imagination import imagine_rollout
 from interop import numeric_metrics, subsample_tree_np, unwrap # JAX to torch/dict helpers
@@ -61,10 +61,16 @@ def build_real_env(env_name, load_offline_dataset):
 
 def _param_norm(params):
     """ L2 norm across every leaf of a JAX param pytree -- used to
-        watch the world model's weight scale over the whole run """
+        watch the world model's weight scale over the whole run.
+        Sums on-device, then does ONE explicit device_get at the end --
+        float(jax_array) is an implicit transfer, which GPU transfer
+        guards reject (CPU transfers are always allowed regardless of
+        guard level, which is why this only broke once running on
+        cuda:0, not during local CPU testing). jax.device_get() is an
+        explicit transfer, which guards permit even in "disallow" mode. """
     leaves = jax.tree_util.tree_leaves(params)
-    total = sum(float(jax.numpy.sum(jax.numpy.square(x))) for x in leaves)
-    return total ** 0.5
+    total = sum(jax.numpy.sum(jax.numpy.square(x)) for x in leaves)
+    return float(jax.device_get(total)) ** 0.5
 
 def _prefixed(d, default_prefix):
     """ Prefix every key with default_prefix, EXCEPT keys that already
