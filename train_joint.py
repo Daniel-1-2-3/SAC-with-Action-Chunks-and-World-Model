@@ -13,7 +13,7 @@ import ogbench
 
 from dreamer.wm_agent import WorldModelAgent # JAX dreamer agent
 from dreamer.wm_bridge import WorldModelBridge # handles JAX and numpy conversions
-from sac_wm_agent import SACWorldModelAgent
+from drqv2_wm_agent import SACWorldModelAgent # SAC + world model (file kept as drqv2_wm_agent.py for continuity)
 from evaluation import eval_in_env
 from imagination import imagine_rollout
 from interop import numeric_metrics, subsample_tree_np, unwrap # JAX to torch/dict helpers
@@ -67,9 +67,16 @@ def _param_norm(params):
         guards reject (CPU transfers are always allowed regardless of
         guard level, which is why this only broke once running on
         cuda:0, not during local CPU testing). jax.device_get() is an
-        explicit transfer, which guards permit even in "disallow" mode. """
+        explicit transfer, which guards permit even in "disallow" mode.
+        Also avoids Python's sum() builtin here: sum(iterable) starts
+        its accumulator at the plain int 0, so the first addition mixes
+        a host-side Python int with a JAX array -- an implicit
+        host-to-device transfer, same guard, opposite direction.
+        jax.numpy.stack keeps every value on-device until the single
+        explicit device_get at the end. """
     leaves = jax.tree_util.tree_leaves(params)
-    total = sum(jax.numpy.sum(jax.numpy.square(x)) for x in leaves)
+    squares = [jax.numpy.sum(jax.numpy.square(x)) for x in leaves]
+    total = jax.numpy.sum(jax.numpy.stack(squares))
     return float(jax.device_get(total)) ** 0.5
 
 def _prefixed(d, default_prefix):
