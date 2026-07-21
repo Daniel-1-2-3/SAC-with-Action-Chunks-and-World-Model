@@ -16,6 +16,33 @@ def sample_squashed(mu, std):
     log_prob -= torch.log(1 - action.pow(2) + EPSILON).sum(-1, keepdim=True)
     return action, log_prob
 
+class RunningScale:
+    # tracks a running (EMA) estimate of the critic target's std, so the
+    # critic can regress onto target / scale (bounded) instead of the
+    # raw target (which can drift/compound with nothing anchoring it)
+    def __init__(self, rate=0.01, min_scale=1.0):
+        self.rate = rate
+        self.min_scale = min_scale
+        self.mean = 0.0
+        self.mean_sq = 0.0
+        self.initialized = False
+
+    def update(self, x):
+        with torch.no_grad():
+            batch_mean = x.mean().item()
+            batch_mean_sq = (x ** 2).mean().item()
+        if not self.initialized:
+            self.mean, self.mean_sq = batch_mean, batch_mean_sq
+            self.initialized = True
+        else:
+            self.mean = (1 - self.rate) * self.mean + self.rate * batch_mean
+            self.mean_sq = (1 - self.rate) * self.mean_sq + self.rate * batch_mean_sq
+
+    @property
+    def scale(self):
+        var = max(self.mean_sq - self.mean ** 2, 0.0)
+        return max(var ** 0.5, self.min_scale)
+
 class Actor(nn.Module):
     def __init__(self, repr_dim, action_shape, feature_dim, hidden_dim):
         super().__init__()
@@ -76,6 +103,8 @@ class SACWorldModelAgent:
         self.log_ent_coef = torch.log(torch.ones(1, device=device) * init_ent_coef).requires_grad_(True)
         self.ent_coef_opt = torch.optim.Adam([self.log_ent_coef], lr=lr)
 
+        self.target_scale = RunningScale()  # norm fix: tracks critic target scale
+
         self.train()
         self.critic_target.train()
 
@@ -101,17 +130,21 @@ class SACWorldModelAgent:
 
     def update_critic(self, feat, action, reward, discount, next_feat, weight):
         metrics = {}
+        scale = self.target_scale.scale  # norm fix: current scale, used consistently below
         with torch.no_grad():
             next_mu, next_std = self.actor(next_feat)
             next_action, next_log_prob = sample_squashed(next_mu, next_std)
             target_Q1, target_Q2 = self.critic_target(next_feat, next_action)
-            target_V = torch.min(target_Q1, target_Q2) - self.ent_coef.detach() * next_log_prob
+            target_V = torch.min(target_Q1, target_Q2) * scale - self.ent_coef.detach() * next_log_prob  # norm fix: denormalize critic_target's output
             target_Q = reward + discount * target_V
+            self.target_scale.update(target_Q)  # norm fix: refresh scale for next call
+
+        target_Q_normed = target_Q / scale  # norm fix: critic regresses onto the normalized target
 
         Q1, Q2 = self.critic(feat, action)
         wsum = weight.sum().clamp_min(1e-6)
-        critic_loss = ((weight * (Q1 - target_Q) ** 2).sum() / wsum +
-                        (weight * (Q2 - target_Q) ** 2).sum() / wsum)
+        critic_loss = ((weight * (Q1 - target_Q_normed) ** 2).sum() / wsum +
+                        (weight * (Q2 - target_Q_normed) ** 2).sum() / wsum)
 
         self.critic_opt.zero_grad(set_to_none=True)
         critic_loss.backward()
@@ -120,13 +153,14 @@ class SACWorldModelAgent:
 
         metrics['critic_loss'] = critic_loss.item()
         metrics['critic_target_q'] = target_Q.mean().item()
-        metrics['critic_q1'] = Q1.mean().item()
-        metrics['critic_q2'] = Q2.mean().item()
+        metrics['critic_q1'] = (Q1 * scale).mean().item()  # norm fix: denormalized for readability
+        metrics['critic_q2'] = (Q2 * scale).mean().item()
         metrics['diagnosis/critic_grad_norm'] = critic_grad_norm.item()
-        metrics['diagnosis/critic_q1_std'] = Q1.std().item()
-        metrics['diagnosis/critic_q2_std'] = Q2.std().item()
+        metrics['diagnosis/critic_q1_std'] = (Q1 * scale).std().item()
+        metrics['diagnosis/critic_q2_std'] = (Q2 * scale).std().item()
         metrics['diagnosis/critic_target_q_min'] = target_Q.min().item()
         metrics['diagnosis/critic_target_q_max'] = target_Q.max().item()
+        metrics['diagnosis/target_scale'] = scale  # norm fix
         return metrics
 
     def update_actor(self, feat, weight):
@@ -134,7 +168,7 @@ class SACWorldModelAgent:
         mu, std = self.actor(feat)
         action, log_prob = sample_squashed(mu, std)
         Q1, Q2 = self.critic(feat, action)
-        Q = torch.min(Q1, Q2)
+        Q = torch.min(Q1, Q2) * self.target_scale.scale  # norm fix: denormalize before mixing with the (real-unit) entropy term
         wsum = weight.sum().clamp_min(1e-6)
         actor_loss = (weight * (self.ent_coef.detach() * log_prob - Q)).sum() / wsum
 
@@ -172,6 +206,9 @@ class SACWorldModelAgent:
             'critic': self.critic.state_dict(),
             'critic_target': self.critic_target.state_dict(),
             'log_ent_coef': self.log_ent_coef.detach().cpu(),
+            'target_scale_mean': self.target_scale.mean,
+            'target_scale_mean_sq': self.target_scale.mean_sq,
+            'target_scale_initialized': self.target_scale.initialized,
         }
 
     def load_state_dict_all(self, state):
@@ -181,3 +218,7 @@ class SACWorldModelAgent:
         if 'log_ent_coef' in state:
             with torch.no_grad():
                 self.log_ent_coef.copy_(state['log_ent_coef'].to(self.device))
+        if 'target_scale_mean' in state:
+            self.target_scale.mean = state['target_scale_mean']
+            self.target_scale.mean_sq = state['target_scale_mean_sq']
+            self.target_scale.initialized = state['target_scale_initialized']
