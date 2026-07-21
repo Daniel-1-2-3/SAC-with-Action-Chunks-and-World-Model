@@ -6,14 +6,12 @@
 import random
 import re
 import time
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import distributions as pyd
 from torch.distributions.utils import _standard_normal
-
 
 class eval_mode:
     def __init__(self, *models):
@@ -30,7 +28,6 @@ class eval_mode:
             model.train(state)
         return False
 
-
 def set_seed_everywhere(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -38,16 +35,12 @@ def set_seed_everywhere(seed):
     np.random.seed(seed)
     random.seed(seed)
 
-
 def soft_update_params(net, target_net, tau):
     for param, target_param in zip(net.parameters(), target_net.parameters()):
-        target_param.data.copy_(tau * param.data +
-                                (1 - tau) * target_param.data)
-
+        target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
 def to_torch(xs, device):
     return tuple(torch.as_tensor(x, device=device) for x in xs)
-
 
 def weight_init(m):
     if isinstance(m, nn.Linear):
@@ -60,7 +53,6 @@ def weight_init(m):
         if hasattr(m.bias, 'data'):
             m.bias.data.fill_(0.0)
 
-
 class Until:
     def __init__(self, until, action_repeat=1):
         self._until = until
@@ -71,7 +63,6 @@ class Until:
             return True
         until = self._until // self._action_repeat
         return step < until
-
 
 class Every:
     def __init__(self, every, action_repeat=1):
@@ -86,7 +77,6 @@ class Every:
             return True
         return False
 
-
 class Timer:
     def __init__(self):
         self._start_time = time.time()
@@ -100,7 +90,6 @@ class Timer:
 
     def total_time(self):
         return time.time() - self._start_time
-
 
 class TruncatedNormal(pyd.Normal):
     def __init__(self, loc, scale, low=-1.0, high=1.0, eps=1e-6):
@@ -124,7 +113,6 @@ class TruncatedNormal(pyd.Normal):
             eps = torch.clamp(eps, -clip, clip)
         x = self.loc + eps
         return self._clamp(x)
-
 
 def schedule(schdl, step):
     try:
