@@ -13,7 +13,7 @@ import ogbench
 
 from dreamer.wm_agent import WorldModelAgent # JAX dreamer agent
 from dreamer.wm_bridge import WorldModelBridge # handles JAX and numpy conversions
-from drqv2_wm_agent import SACWorldModelAgent # SAC + world model (file kept as drqv2_wm_agent.py for continuity)
+from sac_wm_agent import SACWorldModelAgent # SAC + world model (file kept as drqv2_wm_agent.py for continuity)
 from evaluation import eval_in_env
 from imagination import imagine_rollout
 from interop import numeric_metrics, subsample_tree_np, unwrap # JAX to torch/dict helpers
