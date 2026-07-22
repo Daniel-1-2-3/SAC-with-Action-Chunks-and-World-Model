@@ -7,6 +7,11 @@ LOG_STD_MIN = -20
 LOG_STD_MAX = 2
 # SB3's exact epsilon for the squash correction (common/distributions.py)
 EPSILON = 1e-6
+# Bug 1 fix: mu was unclamped, letting pre-tanh means grow unbounded and
+# saturate tanh. Matches this project's earlier fix (clip_mean=2.0).
+MU_CLIP = 2.0
+# Bug 2 fix: replaces the previous float('inf') no-op clip.
+GRAD_CLIP_NORM = 10.0
 
 def sample_squashed(mu, std):
     gaussian = torch.distributions.Normal(mu, std)
@@ -30,7 +35,9 @@ class Actor(nn.Module):
 
     def forward(self, feat):
         h = self.net(self.trunk(feat))
-        mu = self.mu(h)
+        # Bug 1 fix: clamp mu like log_std already was, so it can't drift
+        # to a magnitude that saturates tanh downstream.
+        mu = torch.clamp(self.mu(h), -MU_CLIP, MU_CLIP)
         log_std = torch.clamp(self.log_std(h), LOG_STD_MIN, LOG_STD_MAX)
         return mu, log_std.exp()
 
@@ -115,7 +122,9 @@ class SACWorldModelAgent:
 
         self.critic_opt.zero_grad(set_to_none=True)
         critic_loss.backward()
-        critic_grad_norm = torch.nn.utils.clip_grad_norm_(self.critic.parameters(), float('inf'))
+        # Bug 2 fix: was float('inf'), which made this a no-op (norm always
+        # computed, never actually clipped). Now a real threshold.
+        critic_grad_norm = torch.nn.utils.clip_grad_norm_(self.critic.parameters(), GRAD_CLIP_NORM)
         self.critic_opt.step()
 
         metrics['critic_loss'] = critic_loss.item()
@@ -140,7 +149,8 @@ class SACWorldModelAgent:
 
         self.actor_opt.zero_grad(set_to_none=True)
         actor_loss.backward()
-        actor_grad_norm = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), float('inf'))
+        # Bug 2 fix: same as critic above — real clip threshold instead of inf.
+        actor_grad_norm = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), GRAD_CLIP_NORM)
         self.actor_opt.step()
 
         # Updates entropy coefficient

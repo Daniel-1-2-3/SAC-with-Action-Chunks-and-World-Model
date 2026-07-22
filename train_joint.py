@@ -160,6 +160,11 @@ def train(config):
         # Take step and store the observations in replay
         env_action = ENV_ACTION_LOW + (action + 1.0) * 0.5 * (ENV_ACTION_HIGH - ENV_ACTION_LOW)
         next_obs, reward, terminated, truncated, info = env.step(env_action)
+        # Print whenever the real env gives a non-baseline reward (-1 is the
+        # sparse "no progress" default for this task, so anything else means
+        # the agent actually made progress/succeeded).
+        if reward != -1.0:
+            print(f'step {global_step:7d} | got reward {reward:.4f} | terminated={terminated}')
         replay.add_step(state[0], action, reward, np.asarray(next_obs, dtype=np.float32), terminated, truncated)
 
         done = bool(terminated or truncated)

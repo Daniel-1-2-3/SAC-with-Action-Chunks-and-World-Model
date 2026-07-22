@@ -218,6 +218,8 @@ class OGBenchMethods:
         action_key: str = "action",
         rng: np.random.Generator | None = None,
         force_reset_at_chunk_start: bool = True,
+        bias_start_to_reward: bool = False,
+        reward_thresh: float = -1.0,
     ):
         """
         Refer to class description for the shape of the 
@@ -245,13 +247,45 @@ class OGBenchMethods:
             if ep_len < seq_len:
                 raise ValueError(f"Episode length {ep_len} is shorter than seq_len {seq_len}.")
 
-            start = rng.integers(0, ep_len - seq_len + 1)
+            # bias_start_to_reward: instead of a uniform start, pick one
+            # above-baseline reward step at random and constrain start to
+            # the range of windows that contain it. Start still varies
+            # uniformly within that valid range, so the reward step lands
+            # at a different offset within the chunk each draw (not always
+            # first or last) -- the model still sees varied lead-up/lead-out
+            # context around it, just guaranteed to see the reward itself.
+            if bias_start_to_reward:
+                hits = np.flatnonzero(ep["reward"] > reward_thresh)
+            else:
+                hits = np.empty(0, dtype=np.int64)
+
+            if len(hits):
+                r = hits[rng.integers(0, len(hits))]
+                lo = max(0, r - seq_len + 1)
+                hi = min(r, ep_len - seq_len)
+                start = rng.integers(lo, hi + 1)
+            else:
+                start = rng.integers(0, ep_len - seq_len + 1)
+
             end = start + seq_len
             chunk = {k: np.asarray(v[start:end]).copy() for k, v in ep.items()}
 
             if force_reset_at_chunk_start:
+                # is_first/is_last/is_terminal/discount are forced here
+                # because replay_context=0 means every sampled chunk is
+                # treated as a fresh episode start for RSSM carry-reset
+                # purposes -- that's a structural requirement, independent
+                # of whether this chunk happens to start mid-episode.
+                #
+                # reward is NOT forced anymore (used to be zeroed here
+                # too): reward[0] is a supervised regression TARGET, not
+                # RSSM carry state -- it doesn't depend on prior hidden
+                # state continuity the way is_first does. Zeroing it
+                # injected a false "zero reward" label onto ~1/seq_len of
+                # every training chunk, since most chunks start mid-episode
+                # where the true incoming reward is normally nonzero. Left
+                # as whatever the real reward was for arriving at that state.
                 chunk["is_first"][0] = True
-                chunk["reward"][0] = 0.0
                 chunk["is_terminal"][0] = False
                 chunk["is_last"][0] = False
                 chunk["discount"][0] = 1.0
