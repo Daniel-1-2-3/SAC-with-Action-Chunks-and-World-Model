@@ -190,7 +190,13 @@ def train(config):
             wm_carry = wm_agent.init_train(batch_size)
 
             wm_carry, outs, wm_mets = wm_agent.train(wm_carry, batch)
-            metrics.update({f'wm/{k}': v for k, v in wm_mets.items()})
+            # Changed from a blanket f'wm/{k}' comprehension to _prefixed
+            # (already defined above, previously only used for SAC metrics)
+            # so that the new 'diagnose_actor_mu_explosion/...' keys emitted
+            # directly from WorldModelAgent.loss() bypass the 'wm/' prefix,
+            # same bypass behavior _prefixed already gives 'diagnosis/...'.
+            # Every other wm_mets key is unaffected -- still gets 'wm/'.
+            metrics.update(_prefixed(wm_mets, 'wm'))
 
             # diagnosis/: gated behind log_every since the WM trains every
             # step but a param-norm tree traversal isn't free -- no point
@@ -199,6 +205,16 @@ def train(config):
                 metrics['diagnosis/wm_param_norm'] = _param_norm(wm_agent.params)
                 metrics['diagnosis/replay_transitions'] = len(replay)
                 metrics['diagnosis/replay_episodes'] = len(replay.dreamer_episodes)
+                # DIAGNOSTIC (temporary): success-pool composition. If
+                # success_episodes_offline_remaining drops to 0 while
+                # success_episodes_online_remaining is at/near the cap
+                # (200 by default), that confirms the offline demonstrations
+                # have been evicted from the shared FIFO list -- same
+                # anti-pattern as the original Bug 3, recurring here.
+                metrics['diagnose_actor_mu_explosion/success_episodes_total'] = len(replay.success_episodes)
+                metrics['diagnose_actor_mu_explosion/success_episodes_offline_remaining'] = sum(replay.success_episode_is_offline)
+                metrics['diagnose_actor_mu_explosion/success_episodes_online_remaining'] = (
+                    len(replay.success_episode_is_offline) - sum(replay.success_episode_is_offline))
 
         # Update SAC policy
         if ready and global_step % sac_config.train_every == 0:
@@ -208,6 +224,15 @@ def train(config):
             seed_pool = bridge.seed_pool(seed_batch, batch_size)
             seed_pool = subsample_tree_np(seed_pool, sac_config.imagination_batch, rng)
             seed_carry = bridge.place_seed(seed_pool)
+
+            # DIAGNOSTIC (temporary): how many of the seed-batch timesteps
+            # (before flattening/subsampling) actually sit at an
+            # above-baseline reward step -- distinguishes "the reward head is
+            # generalizing to nearby states" from "no true-success seed was
+            # even present this pass" per the rollout_reward_max discussion.
+            n_success_seeds = int((seed_batch_np['reward'] > -1.0).sum())
+            metrics['diagnose_actor_mu_explosion/imag_seed_success_count'] = n_success_seeds
+            metrics['diagnose_actor_mu_explosion/imag_seed_success_frac'] = n_success_seeds / seed_batch_np['reward'].size
 
             # Using seed states imagine horizon steps forward
             feats, actions, rewards, conts, next_feats, weights = imagine_rollout(
@@ -249,6 +274,11 @@ def train(config):
             # confirm it actually stays gone
             metrics['diagnosis/imag_action_sat_frac'] = (actions.abs() > 0.95).float().mean().item()
             metrics['diagnosis/imag_action_mean_abs'] = actions.abs().mean().item()
+            # DIAGNOSTIC (temporary): copies of already-computed values into
+            # the new tab so everything relevant sits in one place while
+            # root-causing, without recomputing anything.
+            metrics['diagnose_actor_mu_explosion/rollout_reward_std'] = metrics['diagnosis/rollout_reward_std']
+            metrics['diagnose_actor_mu_explosion/rollout_cont_std'] = metrics['diagnosis/rollout_cont_std']
 
         # Log metrics
         if metrics and global_step % general_config.log_every == 0:

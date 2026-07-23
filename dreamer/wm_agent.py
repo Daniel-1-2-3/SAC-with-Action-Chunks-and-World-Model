@@ -181,6 +181,20 @@ class WorldModelAgent(embodied.embodied.jax.Agent): # From Dreamer, policy code 
             sorted(losses.keys()), sorted(self.scales.keys()))
 
         metrics.update({f'loss/{k}': v.mean() for k, v in losses.items()})
+
+        # DIAGNOSTIC (temporary): loss/rew averaged over the whole (B, T)
+        # batch is dominated by the overwhelming majority of trivially-easy
+        # baseline-reward steps, so it stays flat regardless of whether the
+        # rare above-baseline case is actually being learned. This isolates
+        # loss on just that subset. -1.0 matches OnlineReplay's
+        # success_reward_thresh (this task's sparse "no progress" baseline).
+        # Not scaled into the training loss below -- diagnostic only.
+        pos_mask = f32(obs['reward'] > -1.0)
+        n_pos = pos_mask.sum()
+        metrics['diagnose_actor_mu_explosion/loss_rew_positive'] = jnp.where(
+            n_pos > 0, (losses['rew'] * pos_mask).sum() / jnp.maximum(n_pos, 1), jnp.nan)
+        metrics['diagnose_actor_mu_explosion/frac_reward_positive'] = pos_mask.mean()
+
         loss = sum([v.mean() * self.scales[k] for k, v in losses.items()])
 
         carry = (enc_carry, dyn_carry, dec_carry)

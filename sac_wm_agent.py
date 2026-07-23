@@ -35,9 +35,14 @@ class Actor(nn.Module):
 
     def forward(self, feat):
         h = self.net(self.trunk(feat))
-        # Bug 1 fix: clamp mu like log_std already was, so it can't drift
-        # to a magnitude that saturates tanh downstream.
-        mu = torch.clamp(self.mu(h), -MU_CLIP, MU_CLIP)
+        raw_mu = self.mu(h)
+        # DIAGNOSTIC (temporary): stored so update_actor can report pre-clamp
+        # statistics -- this is the only way to tell "clamp is masking an
+        # unbounded raw output" apart from "raw output is naturally bounded
+        # and the clamp rarely engages". No behavior change: mu returned
+        # below is still clamped exactly as before.
+        self.raw_mu = raw_mu
+        mu = torch.clamp(raw_mu, -MU_CLIP, MU_CLIP)
         log_std = torch.clamp(self.log_std(h), LOG_STD_MIN, LOG_STD_MAX)
         return mu, log_std.exp()
 
@@ -136,16 +141,26 @@ class SACWorldModelAgent:
         metrics['diagnosis/critic_q2_std'] = Q2.std().item()
         metrics['diagnosis/critic_target_q_min'] = target_Q.min().item()
         metrics['diagnosis/critic_target_q_max'] = target_Q.max().item()
+        # DIAGNOSTIC (temporary): single number for the min/max-convergence
+        # collapse signature -- expect this to shrink toward 0 at the same
+        # point mu explodes, per the earlier target_q_min/max analysis.
+        metrics['diagnose_actor_mu_explosion/critic_target_q_range'] = (target_Q.max() - target_Q.min()).item()
         return metrics
 
     def update_actor(self, feat, weight):
         metrics = {}
         mu, std = self.actor(feat)
+        raw_mu = self.actor.raw_mu
         action, log_prob = sample_squashed(mu, std)
         Q1, Q2 = self.critic(feat, action)
         Q = torch.min(Q1, Q2)
         wsum = weight.sum().clamp_min(1e-6)
-        actor_loss = (weight * (self.ent_coef.detach() * log_prob - Q)).sum() / wsum
+        # DIAGNOSTIC (temporary): split into its two components so we can see
+        # exactly when the Q-term starts dominating the entropy term, rather
+        # than only seeing their already-summed total.
+        ent_term = (weight * self.ent_coef.detach() * log_prob).sum() / wsum
+        q_term = (weight * (-Q)).sum() / wsum
+        actor_loss = ent_term + q_term
 
         self.actor_opt.zero_grad(set_to_none=True)
         actor_loss.backward()
@@ -171,6 +186,21 @@ class SACWorldModelAgent:
         metrics['diagnosis/actor_mu_abs_mean'] = mu.abs().mean().item() # mu is mean of the action dist
         metrics['diagnosis/actor_mu_abs_max'] = mu.abs().max().item()
         metrics['diagnosis/actor_std_mean'] = std.mean().item()
+        # DIAGNOSTIC (temporary): everything below is new, all under the tab
+        # requested for this investigation.
+        metrics['diagnose_actor_mu_explosion/actor_mu_raw_abs_mean'] = raw_mu.detach().abs().mean().item()
+        metrics['diagnose_actor_mu_explosion/actor_mu_raw_abs_max'] = raw_mu.detach().abs().max().item()
+        # fraction of the batch where the clamp actually engaged -- ties
+        # directly to "did mu abs_mean also increase drastically" from
+        # earlier: a rising fraction here is the population-wide version,
+        # not just a few outlier samples.
+        metrics['diagnose_actor_mu_explosion/frac_actions_saturated'] = (raw_mu.detach().abs() > MU_CLIP).float().mean().item()
+        metrics['diagnose_actor_mu_explosion/actor_std_min'] = std.min().item()
+        # positive gap = measured entropy still above target = ent_coef still
+        # being pushed down. Watch for this crossing zero right as mu climbs.
+        metrics['diagnose_actor_mu_explosion/entropy_gap'] = (-log_prob.mean() - self.target_entropy).item()
+        metrics['diagnose_actor_mu_explosion/actor_loss_ent_term'] = ent_term.item()
+        metrics['diagnose_actor_mu_explosion/actor_loss_q_term'] = q_term.item()
         return metrics
 
     def update_target(self):

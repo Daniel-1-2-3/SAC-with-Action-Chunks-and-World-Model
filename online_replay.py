@@ -20,6 +20,14 @@ class OnlineReplay:
         self.offline_episodes = []
         self.online_episodes = []
         self.success_episodes = []
+        # DIAGNOSTIC (temporary): parallel list, same length/order as
+        # success_episodes, tagging whether each entry originated offline or
+        # online. Does NOT change eviction behavior -- still a single shared
+        # FIFO list, popped in lockstep below -- this only lets us see
+        # whether offline-sourced successes are the ones getting evicted
+        # once online successes accumulate past max_success_episodes, same
+        # anti-pattern as the original Bug 3 in the main buffer.
+        self.success_episode_is_offline = []
         self._raw = collections.defaultdict(list)
         self.total_transitions = 0
 
@@ -56,13 +64,15 @@ class OnlineReplay:
         if len(self.online_episodes) > self.max_episodes:
             self.online_episodes.pop(0) # Drop the oldest episode, FIFO
 
-        self._maybe_add_success(dreamer_ep)
+        self._maybe_add_success(dreamer_ep, is_offline=False)
 
-    def _maybe_add_success(self, dreamer_ep):
+    def _maybe_add_success(self, dreamer_ep, is_offline=False):
         if np.any(dreamer_ep['reward'] > self.success_reward_thresh):
             self.success_episodes.append(dreamer_ep)
+            self.success_episode_is_offline.append(is_offline)  # DIAGNOSTIC (temporary)
             if len(self.success_episodes) > self.max_success_episodes:
                 self.success_episodes.pop(0)
+                self.success_episode_is_offline.pop(0)  # DIAGNOSTIC (temporary): kept in lockstep
 
     # Warm start from the static OGBench dataset, put some dataset episodes into replay at start
     def seed_from_offline(self, dreamer_episodes, n=None, rng=None):
@@ -73,7 +83,7 @@ class OnlineReplay:
             eps = [eps[i] for i in idx]
         self.offline_episodes.extend(eps)
         for ep in eps:
-            self._maybe_add_success(ep)
+            self._maybe_add_success(ep, is_offline=True)
 
     # Check if has enough data to sample a training batch
     def ready(self, seq_len, min_episodes=1):
