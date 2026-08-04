@@ -89,20 +89,32 @@ def render_video(env, states, out_path, fps=10, width=256, height=256):
     """
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     writer = cv2.VideoWriter(str(out_path), fourcc, fps, (width, height))
+    u = env.unwrapped
 
     for state in states:
         qpos = state[:QPOS_DIM]
         qvel = state[QPOS_DIM:QPOS_DIM + QVEL_DIM]
         try:
-            env.unwrapped.set_state(qpos, qvel)
-            frame = env.render()
+            # set_state needs exact nq/nv sizes -- pad or trim if needed
+            nq = u.model.nq
+            nv = u.model.nv
+            qpos_in = np.zeros(nq, dtype=np.float64)
+            qvel_in = np.zeros(nv, dtype=np.float64)
+            qpos_in[:min(len(qpos), nq)] = qpos[:min(len(qpos), nq)]
+            qvel_in[:min(len(qvel), nv)] = qvel[:min(len(qvel), nv)]
+            u.set_state(qpos_in, qvel_in)
+
+            # Try multiple render paths -- OGBench envs vary
+            frame = None
+            if hasattr(u, 'mujoco_renderer'):
+                frame = u.mujoco_renderer.render('rgb_array')
+            elif hasattr(u, 'render'):
+                frame = u.render()
             if frame is None:
-                # env may need render_mode set at construction
                 frame = np.zeros((height, width, 3), dtype=np.uint8)
-            # resize to target resolution
-            frame = cv2.resize(frame, (width, height))
-            # RGB -> BGR for cv2
-            writer.write(frame[..., ::-1])
+
+            frame = cv2.resize(np.asarray(frame, dtype=np.uint8), (width, height))
+            writer.write(frame[..., ::-1])  # RGB -> BGR
         except Exception as e:
             print(f'    render warning: {e}')
             writer.write(np.zeros((height, width, 3), dtype=np.uint8))
