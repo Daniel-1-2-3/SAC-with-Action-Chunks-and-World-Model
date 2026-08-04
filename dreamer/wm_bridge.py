@@ -79,6 +79,28 @@ class WorldModelBridge:
     def init_encode(self, batch_size):
         return self._init_encode(self.agent.params, self._next_seed(), batch_size)
 
+    def decode_state(self, dyn_carry):
+        """Decode dyn_carry -> reconstructed observation dict (numpy, float32).
+        Used by the rollout animation check: encode a real state, imagine N
+        steps with fixed/random actions, decode each latent, and watch whether
+        the decoded state actually changes -- if it doesn't, the dynamics are
+        static regardless of what the actor does."""
+        self._decode_state_fn = getattr(self, '_decode_state_fn', None)
+        if self._decode_state_fn is None:
+            tp = self.agent.train_params_sharding
+            tm = self.agent.train_mirrored
+            ar = self.agent.partition_rules[1]
+            self._decode_state_fn = transform.apply(
+                nj.pure(self.model.decode_feat), self.mesh,
+                (tp, tm, self.ts),
+                ({k: self.ts for k in self.agent.obs_space
+                  if k not in ('is_first', 'is_last', 'is_terminal', 'reward')},),
+                ar,
+                single_output=True,
+            )
+        raw = self._decode_state_fn(self.agent.params, self._next_seed(), dyn_carry)
+        return {k: np.asarray(jax.device_get(v)) for k, v in raw.items()}
+
     def encode_step(self, enc_carry, dyn_carry, state_np, action_np, is_first_np):
         """ Feedsone real environment observation through the encoder to
             update the posterior RSSM state used both for online acting

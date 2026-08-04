@@ -2,7 +2,8 @@ import torch
 from sac_wm_agent import sample_squashed
 from interop import jax_to_torch
 
-def imagine_rollout(bridge, sac_agent, seed_carry, horizon, device, gamma, global_step):
+def imagine_rollout(bridge, sac_agent, seed_carry, horizon, device, gamma, global_step,
+                    reward_shift=0.0):
     carry = seed_carry # Seed states
     feat_t = jax_to_torch(bridge.get_feat(carry), device)
 
@@ -19,7 +20,12 @@ def imagine_rollout(bridge, sac_agent, seed_carry, horizon, device, gamma, globa
         # Step the world model to predict next state based on the action just taken
         next_carry, next_feat_flat, reward_j, cont_j = bridge.img_step(carry, action_np)
         next_feat_t = jax_to_torch(next_feat_flat, device)
-        reward_t = jax_to_torch(reward_j, device).reshape(-1, 1)
+        # reward_shift moves this task's sparse reward from {-1, 0} to
+        # {0, +1}. Same optimal policy, but the critic no longer has to learn
+        # a large constant offset (-1/(1-gamma) ~= -100) before any of the
+        # sparse signal is visible against it, and its zero-init output is
+        # already the correct baseline.
+        reward_t = jax_to_torch(reward_j, device).reshape(-1, 1) + reward_shift
         cont_t = jax_to_torch(cont_j, device).reshape(-1, 1)
 
         # Store imagined state to return all together

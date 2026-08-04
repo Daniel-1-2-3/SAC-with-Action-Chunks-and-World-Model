@@ -256,6 +256,13 @@ class OGBenchMethods:
             # context around it, just guaranteed to see the reward itself.
             if bias_start_to_reward:
                 hits = np.flatnonzero(ep["reward"] > reward_thresh)
+                # Index 0 holds the fabricated reward=0.0 that
+                # ogbench_to_dreamer_episode prepends for Dreamer's
+                # "reward for arriving at state[t]" convention. It clears
+                # reward_thresh on EVERY episode, so leaving it in made this
+                # branch always pick r=0 -> lo=hi=0 -> start=0, collapsing the
+                # whole success sub-batch onto episode openings.
+                hits = hits[hits > 0]
             else:
                 hits = np.empty(0, dtype=np.int64)
 

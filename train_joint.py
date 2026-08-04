@@ -230,19 +230,25 @@ def train(config):
             # above-baseline reward step -- distinguishes "the reward head is
             # generalizing to nearby states" from "no true-success seed was
             # even present this pass" per the rollout_reward_max discussion.
-            n_success_seeds = int((seed_batch_np['reward'] > -1.0).sum())
+            n_success_seeds = int((seed_batch_np['reward'][:, 1:] > -1.0).sum())
             metrics['diagnose_actor_mu_explosion/imag_seed_success_count'] = n_success_seeds
-            metrics['diagnose_actor_mu_explosion/imag_seed_success_frac'] = n_success_seeds / seed_batch_np['reward'].size
+            metrics['diagnose_actor_mu_explosion/imag_seed_success_frac'] = n_success_seeds / seed_batch_np['reward'][:, 1:].size
 
             # Using seed states imagine horizon steps forward
             feats, actions, rewards, conts, next_feats, weights = imagine_rollout(
                 bridge, policy, seed_carry, sac_config.horizon, 
-                device, sac_config.gamma, global_step
+                device, sac_config.gamma, global_step,
+                reward_shift=sac_config.reward_shift
             )
-            discounts = sac_config.gamma * conts
+
+            # lambda-returns over the whole imagined horizon, replacing the
+            # 1-step TD target that could not propagate sparse reward.
+            targets = policy.lambda_targets(
+                rewards, conts, next_feats,
+                sac_config.gamma, sac_config.lam, sac_config.horizon)
 
             # Update policy using the imagined states
-            metrics.update(_prefixed(policy.update_critic(feats, actions, rewards, discounts, next_feats, weights), 'sac'))
+            metrics.update(_prefixed(policy.update_critic(feats, actions, targets, weights), 'sac'))
             metrics.update(_prefixed(policy.update_actor(feats.detach(), weights.detach()), 'sac'))
             policy.update_target()
             metrics['sac/mean_imag_reward'] = rewards.mean().item()

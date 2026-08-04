@@ -134,6 +134,22 @@ class WorldModelAgent(embodied.embodied.jax.Agent): # From Dreamer, policy code 
     def init_encode(self, batch_size):
         return self.enc.initial(batch_size), self.dyn.initial(batch_size)
 
+    def decode_feat(self, dyn_carry):
+        """Decode a dyn_carry latent back to the observation space.
+        Returns a dict {obs_key: array} with the mean prediction from the
+        decoder, so callers can watch whether the latent changes meaningfully
+        as imagination steps forward."""
+        dec_carry = self.dec.initial(1)
+        reset = jnp.zeros((1, 1), dtype=bool)  # (B=1, T=1), no reset
+        # repfeat must be (B, T, ...) for the decoder scan
+        repfeat = jax.tree_util.tree_map(
+            lambda x: x[:, None].astype(nn.COMPUTE_DTYPE), dyn_carry)
+        _, _, recons = self.dec(dec_carry, repfeat, reset, training=False)
+        # Each value in recons is a distribution object; .pred() gives the mean
+        out = {k: jnp.asarray(v.pred()[0, 0]).astype(jnp.float32)
+               for k, v in recons.items()}
+        return out
+
     def encode_step(self, enc_carry, dyn_carry, obs, prevact, is_first):
         enc_carry, enc_entries, tokens = self.enc(enc_carry, obs, is_first, training=False, single=True)
         dyn_carry, entry, feat = self.dyn.observe(dyn_carry, tokens, prevact, is_first, training=False, single=True)
@@ -159,7 +175,12 @@ class WorldModelAgent(embodied.embodied.jax.Agent): # From Dreamer, policy code 
 
         inp = self.feat2tensor(repfeat)
         rew_dist = self.rew(inp, 2)
-        losses['rew'] = rew_dist.loss(obs['reward'])
+        # Column 0 of every sampled chunk carries the fabricated reward=0.0
+        # (chunks are forced to is_first at their own index 0), which is a
+        # false above-baseline label on a state whose true reward is -1.0.
+        # Mask it out instead of training the reward head to hallucinate
+        # success at reset-like latents.
+        losses['rew'] = rew_dist.loss(obs['reward']) * f32(~obs['is_first'])
         metrics['pred/rew'] = rew_dist.pred()
 
         con = f32(~obs['is_terminal'])
@@ -189,7 +210,7 @@ class WorldModelAgent(embodied.embodied.jax.Agent): # From Dreamer, policy code 
         # loss on just that subset. -1.0 matches OnlineReplay's
         # success_reward_thresh (this task's sparse "no progress" baseline).
         # Not scaled into the training loss below -- diagnostic only.
-        pos_mask = f32(obs['reward'] > -1.0)
+        pos_mask = f32(obs['reward'] > -1.0) * f32(~obs['is_first'])
         n_pos = pos_mask.sum()
         metrics['diagnose_actor_mu_explosion/loss_rew_positive'] = jnp.where(
             n_pos > 0, (losses['rew'] * pos_mask).sum() / jnp.maximum(n_pos, 1), jnp.nan)

@@ -12,6 +12,10 @@ EPSILON = 1e-6
 MU_CLIP = 2.0
 # Bug 2 fix: replaces the previous float('inf') no-op clip.
 GRAD_CLIP_NORM = 10.0
+# Bug 5 fix: pre-tanh L2 penalty. Nothing in the objective previously opposed
+# growing |raw_mu| -- past tanh saturation a larger mean costs nothing and buys
+# a more deterministic action, so it grows without bound.
+MU_REG = 1e-3
 
 def sample_squashed(mu, std):
     gaussian = torch.distributions.Normal(mu, std)
@@ -42,7 +46,13 @@ class Actor(nn.Module):
         # and the clamp rarely engages". No behavior change: mu returned
         # below is still clamped exactly as before.
         self.raw_mu = raw_mu
-        mu = torch.clamp(raw_mu, -MU_CLIP, MU_CLIP)
+        # Bug 4 fix: torch.clamp has exactly zero gradient outside
+        # [-MU_CLIP, MU_CLIP], so once a unit's pre-tanh mean left the range
+        # nothing could pull it back -- a one-way ratchet, which is what
+        # actor_mu_raw_abs_max climbing to ~50 while mu stayed pinned at 2.0
+        # was showing. A tanh squash keeps the same bound but leaves a
+        # restoring gradient everywhere.
+        mu = MU_CLIP * torch.tanh(raw_mu / MU_CLIP)
         log_std = torch.clamp(self.log_std(h), LOG_STD_MIN, LOG_STD_MAX)
         return mu, log_std.exp()
 
@@ -111,14 +121,34 @@ class SACWorldModelAgent:
             action, _ = sample_squashed(mu, std)
         return action.cpu().numpy()[0]
 
-    def update_critic(self, feat, action, reward, discount, next_feat, weight):
+    @torch.no_grad()
+    def lambda_targets(self, rewards, conts, next_feats, gamma, lam, horizon):
+        """ Dreamer-style lambda-returns over the imagined horizon. The old
+            1-step TD target moved reward information exactly one step per
+            update, so in a 200-step sparse task it never reached the seed
+            states. Inputs are the flattened (horizon * batch, ...) tensors
+            imagine_rollout returns, step-major. """
+        batch = rewards.shape[0] // horizon
+        r = rewards.reshape(horizon, batch, 1)
+        c = conts.reshape(horizon, batch, 1)
+        nf = next_feats.reshape(horizon * batch, -1)
+
+        next_mu, next_std = self.actor(nf)
+        next_action, next_log_prob = sample_squashed(next_mu, next_std)
+        target_Q1, target_Q2 = self.critic_target(nf, next_action)
+        target_V = torch.min(target_Q1, target_Q2) - self.ent_coef.detach() * next_log_prob
+        v = target_V.reshape(horizon, batch, 1)
+
+        ret = v[-1]
+        outs = []
+        for t in reversed(range(horizon)):
+            ret = r[t] + gamma * c[t] * ((1 - lam) * v[t] + lam * ret)
+            outs.append(ret)
+        return torch.stack(outs[::-1], dim=0).reshape(horizon * batch, 1)
+
+    def update_critic(self, feat, action, target_Q, weight):
         metrics = {}
-        with torch.no_grad():
-            next_mu, next_std = self.actor(next_feat)
-            next_action, next_log_prob = sample_squashed(next_mu, next_std)
-            target_Q1, target_Q2 = self.critic_target(next_feat, next_action)
-            target_V = torch.min(target_Q1, target_Q2) - self.ent_coef.detach() * next_log_prob
-            target_Q = reward + discount * target_V
+        target_Q = target_Q.detach()
 
         Q1, Q2 = self.critic(feat, action)
         wsum = weight.sum().clamp_min(1e-6)
@@ -160,7 +190,8 @@ class SACWorldModelAgent:
         # than only seeing their already-summed total.
         ent_term = (weight * self.ent_coef.detach() * log_prob).sum() / wsum
         q_term = (weight * (-Q)).sum() / wsum
-        actor_loss = ent_term + q_term
+        mu_reg = MU_REG * raw_mu.pow(2).mean()
+        actor_loss = ent_term + q_term + mu_reg
 
         self.actor_opt.zero_grad(set_to_none=True)
         actor_loss.backward()
@@ -178,6 +209,7 @@ class SACWorldModelAgent:
         metrics['actor_logprob'] = log_prob.mean().item()
         metrics['actor_ent'] = -log_prob.mean().item()
         metrics['diagnosis/actor_grad_norm'] = actor_grad_norm.item()
+        metrics['diagnosis/actor_mu_reg'] = mu_reg.item()
         metrics['diagnosis/ent_coef'] = self.ent_coef.item()
         metrics['diagnosis/ent_coef_loss'] = ent_coef_loss.item()
         # the actual tanh-saturation early-warning signal: watch this

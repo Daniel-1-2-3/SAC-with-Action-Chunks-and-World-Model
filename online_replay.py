@@ -67,12 +67,22 @@ class OnlineReplay:
         self._maybe_add_success(dreamer_ep, is_offline=False)
 
     def _maybe_add_success(self, dreamer_ep, is_offline=False):
-        if np.any(dreamer_ep['reward'] > self.success_reward_thresh):
+        # reward[0] is the fabricated 0.0 that ogbench_to_dreamer_episode
+        # prepends. It is above this task's -1.0 baseline for EVERY episode,
+        # so testing the full array classified every online episode as a
+        # success and filled this pool with reward-free rollouts.
+        if np.any(dreamer_ep['reward'][1:] > self.success_reward_thresh):
             self.success_episodes.append(dreamer_ep)
             self.success_episode_is_offline.append(is_offline)  # DIAGNOSTIC (temporary)
             if len(self.success_episodes) > self.max_success_episodes:
-                self.success_episodes.pop(0)
-                self.success_episode_is_offline.pop(0)  # DIAGNOSTIC (temporary): kept in lockstep
+                # Evict the oldest ONLINE entry only. Offline demonstrations
+                # are the only guaranteed reward signal in this sparse task,
+                # so a shared FIFO must never be allowed to push them out.
+                drop = next(
+                    (i for i, off in enumerate(self.success_episode_is_offline) if not off), None)
+                if drop is not None:
+                    self.success_episodes.pop(drop)
+                    self.success_episode_is_offline.pop(drop)  # DIAGNOSTIC (temporary): kept in lockstep
 
     # Warm start from the static OGBench dataset, put some dataset episodes into replay at start
     def seed_from_offline(self, dreamer_episodes, n=None, rng=None):

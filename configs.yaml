@@ -73,12 +73,14 @@ defaults:
       max_episodes: 2000
 
     sac:
-      train_every: 30
+      train_every: 5
       horizon: 15
-      imagination_batch: 2048
+      imagination_batch: 1024
       gamma: 0.99
+      lam: 0.95
+      reward_shift: 1.0
       lr: 3e-4
-      feature_dim: 50
+      feature_dim: 512
       hidden_dim: 256
       critic_target_tau: 0.005
       init_ent_coef: 1.0
