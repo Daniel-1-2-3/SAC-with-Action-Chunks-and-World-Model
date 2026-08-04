@@ -3,18 +3,13 @@ check_rollout_animation.py
 --------------------------
 Proprioceptive equivalent of the decode_and_save / evaluate pattern from models.py.
 
-In models.py:
-    z = encoder(s)
-    z_eval = latent_imagination(..., forced=True)   # teacher-forced with real actions
-    decode_and_save(z_eval, "single_frame")         # -> frames that should animate
-    z_eval = latent_imagination(..., random=True)   # free imagination, random actions
-    decode_and_save(z_eval, 'random')               # -> frames that show dynamics
+Runs two rollouts from a seed state:
+  1. Teacher-forced: world model steps forward with REAL actions
+  2. Random actions: world model steps forward with random actions
 
-We do the same two rollouts, but instead of decoding to pixels and saving PNGs,
-we decode to the 28-dim proprioceptive state and plot each joint angle over the
-horizon as a line. If the world model has learned dynamics:
-  - teacher-forced:  decoded state should closely track the REAL next observations
-  - random actions:  decoded state should visibly diverge from the seed over time
+For each rollout, saves:
+  - A PNG plot of each state dimension over the horizon
+  - An MP4 video of the robot arm moving (decoded states replayed into MuJoCo)
 
 Usage:
     python check_rollout_animation.py \
@@ -38,7 +33,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import ruamel.yaml as yaml
-import ogbench
+import cv2
 
 from dreamer.wm_agent import WorldModelAgent
 from dreamer.wm_bridge import WorldModelBridge
@@ -47,6 +42,10 @@ from ogbench_methods import OGBenchMethods
 
 OBS_KEY = 'state'
 ACTION_KEY = 'action'
+
+# cube-single-play-v0 state layout: qpos=15 dims, qvel=13 dims = 28 total
+QPOS_DIM = 15
+QVEL_DIM = 13
 
 
 def load_config(folder):
@@ -59,10 +58,10 @@ def load_config(folder):
     return config
 
 
-def rollout_teacher_forced(bridge, enc_carry, dyn_carry, real_actions, action_dim):
+def rollout_teacher_forced(bridge, dyn_carry, real_actions):
     decoded_states = []
     carry = dyn_carry
-    for t, action_np in enumerate(real_actions):
+    for action_np in real_actions:
         action_np = action_np.reshape(1, -1).astype(np.float32)
         next_carry, _, _, _ = bridge.img_step(carry, action_np)
         decoded = bridge.decode_state(next_carry)
@@ -83,9 +82,37 @@ def rollout_random_actions(bridge, dyn_carry, action_dim, horizon, rng):
     return decoded_states
 
 
+def render_video(env, states, out_path, fps=10, width=256, height=256):
+    """
+    Replay decoded states into MuJoCo and render each frame to an MP4.
+    states: list of 28-dim numpy arrays (qpos[15] + qvel[13])
+    """
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(str(out_path), fourcc, fps, (width, height))
+
+    for state in states:
+        qpos = state[:QPOS_DIM]
+        qvel = state[QPOS_DIM:QPOS_DIM + QVEL_DIM]
+        try:
+            env.unwrapped.set_state(qpos, qvel)
+            frame = env.render()
+            if frame is None:
+                # env may need render_mode set at construction
+                frame = np.zeros((height, width, 3), dtype=np.uint8)
+            # resize to target resolution
+            frame = cv2.resize(frame, (width, height))
+            # RGB -> BGR for cv2
+            writer.write(frame[..., ::-1])
+        except Exception as e:
+            print(f'    render warning: {e}')
+            writer.write(np.zeros((height, width, 3), dtype=np.uint8))
+
+    writer.release()
+    print(f'  Video saved: {out_path}')
+
+
 def plot_rollout(decoded_states, real_states, title, out_path, obs_dim,
                  n_dims_shown=8):
-    steps = len(decoded_states)
     decoded_arr = np.stack(decoded_states)
     real_arr = np.stack(real_states) if real_states is not None else None
 
@@ -96,9 +123,6 @@ def plot_rollout(decoded_states, real_states, title, out_path, obs_dim,
     axes = axes.flatten()
     fig.suptitle(title, fontsize=12, y=1.01)
 
-    diffs = np.linalg.norm(np.diff(decoded_arr, axis=0), axis=1)
-    avg_l2 = diffs.mean()
-
     for dim in range(n_show):
         ax = axes[dim]
         ax.plot(decoded_arr[:, dim], color='steelblue', label='decoded')
@@ -106,7 +130,7 @@ def plot_rollout(decoded_states, real_states, title, out_path, obs_dim,
             ax.plot(real_arr[:, dim], color='tomato', linestyle='--', label='real')
         ax.set_title(f'dim {dim}', fontsize=9)
         ax.set_xlabel('step')
-        ax.set_ylabel(f'value', fontsize=7)
+        ax.set_ylabel('value', fontsize=7)
         if dim == 0:
             ax.legend(fontsize=7)
 
@@ -116,7 +140,7 @@ def plot_rollout(decoded_states, real_states, title, out_path, obs_dim,
     plt.tight_layout()
     fig.savefig(out_path, dpi=100, bbox_inches='tight')
     plt.close(fig)
-    print(f'  Saved: {out_path}')
+    print(f'  Plot saved: {out_path}')
 
 
 def compute_l2_stats(decoded_states, label):
@@ -140,6 +164,9 @@ def main():
     parser.add_argument('--horizon', type=int, default=30)
     parser.add_argument('--n_seeds', type=int, default=3)
     parser.add_argument('--n_dims_shown', type=int, default=8)
+    parser.add_argument('--fps', type=int, default=10)
+    parser.add_argument('--video_w', type=int, default=256)
+    parser.add_argument('--video_h', type=int, default=256)
     parser.add_argument('--out_dir', type=str, default='rollout_check')
     args = parser.parse_args()
 
@@ -158,7 +185,6 @@ def main():
         obs_dim, action_dim, OBS_KEY, ACTION_KEY)
 
     seq_len = config.batch_length
-    # batch_size=1 avoids the XLA divisibility error in _compile_train
     agent_config = elements.Config(
         **config.agent,
         logdir=str(folder / 'wm_ckpts'),
@@ -176,8 +202,6 @@ def main():
     wm_agent = WorldModelAgent(obs_space, act_space, agent_config)
 
     print(f'Loading checkpoint: {args.wm_ckpt}')
-    # elements.Checkpoint saves as a directory, not a flat .pkl file.
-    # Use the same load pattern as the checkpoint was saved with.
     wm_cp = elements.Checkpoint(pathlib.Path(args.wm_ckpt))
     wm_cp.agent = wm_agent
     wm_cp.load()
@@ -187,7 +211,7 @@ def main():
     offline_eps = OGBenchMethods.make_dreamer_episodes(
         train_dataset, min_length=seq_len + args.horizon,
         obs_key=OBS_KEY, action_key=ACTION_KEY)
-    print(f'Loaded {len(offline_eps)} offline episodes (min_length={seq_len+args.horizon})')
+    print(f'Loaded {len(offline_eps)} offline episodes')
 
     print(f'\n{"="*70}')
     print(f'Rollout animation check | horizon={args.horizon} | n_seeds={args.n_seeds}')
@@ -202,8 +226,8 @@ def main():
         real_act_seq = ep[ACTION_KEY][start : start + args.horizon]
 
         print(f'\nSeed {seed_idx+1} | episode step {start}')
-        print(f'  Real state[:5]: {real_state[0, :5].round(3)}')
 
+        # Encode seed state
         enc_carry, dyn_carry = bridge.init_encode(1)
         enc_carry, dyn_carry, _ = bridge.encode_step(
             enc_carry, dyn_carry, real_state,
@@ -214,24 +238,31 @@ def main():
         seed_l2 = float(np.linalg.norm(seed_decoded - real_state[0]))
         print(f'  Seed reconstruction L2={seed_l2:.4f}')
 
+        # ---- Teacher-forced rollout ----
         print('  Teacher-forced rollout (real actions):')
-        tf_decoded = rollout_teacher_forced(
-            bridge, enc_carry, dyn_carry, real_act_seq, action_dim)
+        tf_decoded = rollout_teacher_forced(bridge, dyn_carry, real_act_seq)
         tf_real_next = [real_obs_seq[t + 1] for t in range(len(tf_decoded))]
         tf_l2 = compute_l2_stats(tf_decoded, 'teacher-forced')
-
-        tf_pred_err = np.mean([
-            np.linalg.norm(tf_decoded[t] - tf_real_next[t])
-            for t in range(len(tf_decoded))])
-        print(f'  Teacher-forced prediction error vs real: {tf_pred_err:.4f}')
+        tf_pred_err = np.mean([np.linalg.norm(tf_decoded[t] - tf_real_next[t])
+                               for t in range(len(tf_decoded))])
+        print(f'  Prediction error vs real: {tf_pred_err:.4f}')
 
         plot_rollout(
             tf_decoded, tf_real_next,
             title=f'Seed {seed_idx+1} | Teacher-forced | avg L2/step={tf_l2:.4f} | pred_err={tf_pred_err:.4f}',
             out_path=out_dir / f'seed{seed_idx+1}_teacher_forced.png',
-            obs_dim=obs_dim,
-            n_dims_shown=args.n_dims_shown)
+            obs_dim=obs_dim, n_dims_shown=args.n_dims_shown)
 
+        # render decoded states as video
+        render_video(env, tf_decoded,
+                     out_path=out_dir / f'seed{seed_idx+1}_teacher_forced.mp4',
+                     fps=args.fps, width=args.video_w, height=args.video_h)
+        # render real states as video for comparison
+        render_video(env, list(real_obs_seq[1:]),
+                     out_path=out_dir / f'seed{seed_idx+1}_real.mp4',
+                     fps=args.fps, width=args.video_w, height=args.video_h)
+
+        # ---- Random-action rollout ----
         print('  Random-action rollout:')
         rand_decoded = rollout_random_actions(
             bridge, dyn_carry, action_dim, args.horizon, rng)
@@ -241,18 +272,21 @@ def main():
             rand_decoded, real_states=None,
             title=f'Seed {seed_idx+1} | Random actions | avg L2/step={rand_l2:.4f}',
             out_path=out_dir / f'seed{seed_idx+1}_random_actions.png',
-            obs_dim=obs_dim,
-            n_dims_shown=args.n_dims_shown)
+            obs_dim=obs_dim, n_dims_shown=args.n_dims_shown)
+
+        render_video(env, rand_decoded,
+                     out_path=out_dir / f'seed{seed_idx+1}_random_actions.mp4',
+                     fps=args.fps, width=args.video_w, height=args.video_h)
 
         print(f'  Summary: teacher_forced_L2={tf_l2:.4f}  random_L2={rand_l2:.4f}')
         if tf_l2 < 0.01 and rand_l2 < 0.01:
-            print('  *** COMPLETELY STATIC: world model not learning dynamics ***')
+            print('  *** COMPLETELY STATIC ***')
         elif rand_l2 < tf_l2 * 0.5:
-            print('  *** SUSPICIOUS: random actions move the latent LESS than real actions ***')
+            print('  *** SUSPICIOUS: random actions move less than real actions ***')
         elif tf_pred_err < 0.5 and tf_l2 > 0.02:
-            print('  OK: world model is both dynamic and tracks real transitions')
+            print('  OK: dynamic and tracking real transitions')
 
-    print(f'\nAll plots saved to {out_dir}/')
+    print(f'\nAll outputs saved to {out_dir}/')
     env.close()
 
 
