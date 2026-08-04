@@ -176,9 +176,11 @@ def main():
     wm_agent = WorldModelAgent(obs_space, act_space, agent_config)
 
     print(f'Loading checkpoint: {args.wm_ckpt}')
-    raw = np.load(args.wm_ckpt, allow_pickle=True)
-    state = {k: unwrap(raw[k]) for k in raw.files}
-    wm_agent.load(state)
+    # elements.Checkpoint saves as a directory, not a flat .pkl file.
+    # Use the same load pattern as the checkpoint was saved with.
+    wm_cp = elements.Checkpoint(pathlib.Path(args.wm_ckpt))
+    wm_cp.agent = wm_agent
+    wm_cp.load()
     bridge = WorldModelBridge(wm_agent, ACTION_KEY, obs_key=OBS_KEY)
 
     rng = np.random.default_rng(0)
