@@ -1,7 +1,8 @@
 torch
 ogbench
 jax[cpu]==0.4.33
-numpy<2
+jaxlib==0.4.33
+numpy>=1.24,<2
 optax
 chex
 einops
@@ -18,6 +19,3 @@ ipdb
 requests
 tqdm
 wandb
-
-# git clone https://github.com/danijar/embodied.git
-# wandb login
