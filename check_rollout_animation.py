@@ -31,8 +31,9 @@ os.environ.setdefault('MUJOCO_GL', 'egl')
 import argparse
 import pathlib
 
-import elements
 import jax
+import jax.numpy as jnp
+import elements
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -172,22 +173,29 @@ def main():
     folder = pathlib.Path(__file__).parent
     config = load_config(folder)
 
-    print('Loading environment + offline dataset...')
-    env, train_dataset, _ = OGBenchMethods.load_ogbench(
-        config.joint.general.env_name)
-    obs_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
+    print('Loading offline dataset (no env needed)...')
+    # Load dataset directly without creating the MuJoCo env so we don't need
+    # a rendering backend (osmesa / EGL / GLFW) on Windows.
+    import ogbench as _ogb
+    env_name = config.joint.general.env_name
+    train_dataset, _ = _ogb.load_dataset(env_name)
+    # Infer dims from the dataset arrays directly
+    obs_dim    = train_dataset['observations'].shape[-1]
+    action_dim = train_dataset['actions'].shape[-1]
     obs_space, act_space = OGBenchMethods.make_spaces(
         obs_dim, action_dim, OBS_KEY, ACTION_KEY)
 
-    batch_size = config.batch_size
     seq_len = config.batch_length
+    # Use batch_size=1 for inference -- avoids the XLA divisibility error that
+    # fires when _compile_train sees a batch that isn't divisible by the device
+    # count. We only need the agent for encode_step / img_step / decode_state,
+    # none of which go through the compiled training path.
     agent_config = elements.Config(
         **config.agent,
         logdir=str(folder / 'wm_ckpts'),
         seed=config.seed,
         jax=config.jax,
-        batch_size=batch_size,
+        batch_size=1,
         batch_length=seq_len,
         replay_context=0,
         report_length=seq_len,
@@ -295,7 +303,7 @@ def main():
             print('  OK: world model is both dynamic and tracks real transitions')
 
     print(f'\nAll plots saved to {out_dir}/')
-    env.close()
+    pass  # no env to close
 
 
 if __name__ == '__main__':
