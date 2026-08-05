@@ -206,6 +206,16 @@ def train(config):
                 metrics['diagnosis/wm_param_norm'] = _param_norm(wm_agent.params)
                 metrics['diagnosis/replay_transitions'] = len(replay)
                 metrics['diagnosis/replay_episodes'] = len(replay.dreamer_episodes)
+                # Share of buffered episodes that contain a real success.
+                # replay/success_frac_online is the one to watch -- it starts
+                # at 0 and only climbs if the policy actually reaches the
+                # goal in the real env. offline is a fixed reference line.
+                _succ = replay.success_stats
+                metrics['replay/success_frac_total'] = _succ['total_frac']
+                metrics['replay/success_frac_online'] = _succ['online_frac']
+                metrics['replay/success_frac_offline'] = _succ['offline_frac']
+                metrics['replay/success_episodes_online'] = _succ['online_success']
+                metrics['replay/success_episodes_total'] = _succ['offline_success'] + _succ['online_success']
 
         # Update SAC policy
         if ready and global_step % sac_config.train_every == 0:
