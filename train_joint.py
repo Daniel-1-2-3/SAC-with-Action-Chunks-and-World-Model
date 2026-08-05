@@ -53,11 +53,10 @@ def build_agent_config(config, batch_size, seq_len, logdir): # Config for wm age
         replicas=1,
     )
 
-def build_real_env(env_name, load_offline_dataset):
-    if load_offline_dataset:
-        return OGBenchMethods.load_ogbench(env_name) # Download OGBench, later prefill some of replay buffer
+def build_real_env(env_name):
+    # Pure online training -- no offline dataset loaded.
     env, _, _ = ogbench.make_env_and_datasets(env_name, env_only=True)
-    return env, None, None
+    return env
 
 def _param_norm(params):
     """ L2 norm across every leaf of a JAX param pytree -- used to
@@ -99,7 +98,7 @@ def train(config):
     rng = np.random.default_rng(config.seed)
     print(f'PyTorch device: {device} | JAX devices: {jax.devices()}')
     wandb.init(project=general_config.wandb_project, mode=general_config.wandb_mode, config=config.flat)
-    env, train_dataset, _ = build_real_env(general_config.env_name, general_config.seed_from_offline)
+    env = build_real_env(general_config.env_name)
 
     print(f'env.observation_space = {env.observation_space}')
     obs_dim = env.observation_space.shape[0]
@@ -123,12 +122,6 @@ def train(config):
 
     # Create replay buffer
     replay = OnlineReplay(obs_key=OBS_KEY, action_key=ACTION_KEY, max_episodes=dreamer_config.max_episodes)
-    if train_dataset is not None:
-        offline_episodes = OGBenchMethods.make_dreamer_episodes(
-            train_dataset, min_length=seq_len, obs_key=OBS_KEY, action_key=ACTION_KEY)
-        replay.seed_from_offline(offline_episodes, rng=rng) # Put offline episodes into buffer for warm start
-        print(f'Seeded replay buffer with {len(replay.dreamer_episodes)} offline episodes')
-
     # Create SAC policy
     policy = SACWorldModelAgent( # repr_dim same as world-model feature dim
         repr_dim=feat_dim, action_shape=(action_dim,), device=device,
@@ -205,16 +198,6 @@ def train(config):
                 metrics['diagnosis/wm_param_norm'] = _param_norm(wm_agent.params)
                 metrics['diagnosis/replay_transitions'] = len(replay)
                 metrics['diagnosis/replay_episodes'] = len(replay.dreamer_episodes)
-                # DIAGNOSTIC (temporary): success-pool composition. If
-                # success_episodes_offline_remaining drops to 0 while
-                # success_episodes_online_remaining is at/near the cap
-                # (200 by default), that confirms the offline demonstrations
-                # have been evicted from the shared FIFO list -- same
-                # anti-pattern as the original Bug 3, recurring here.
-                metrics['diagnose_actor_mu_explosion/success_episodes_total'] = len(replay.success_episodes)
-                metrics['diagnose_actor_mu_explosion/success_episodes_offline_remaining'] = sum(replay.success_episode_is_offline)
-                metrics['diagnose_actor_mu_explosion/success_episodes_online_remaining'] = (
-                    len(replay.success_episode_is_offline) - sum(replay.success_episode_is_offline))
 
         # Update SAC policy
         if ready and global_step % sac_config.train_every == 0:
