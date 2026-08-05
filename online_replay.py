@@ -7,6 +7,9 @@ class OnlineReplay:
         self.obs_key = obs_key
         self.action_key = action_key
         self.max_episodes = max_episodes
+        # Offline demonstrations are seeded once at startup and never evicted
+        # -- the online FIFO below only ever pops from online_episodes.
+        self.offline_episodes = []
         self.online_episodes = []
         self._raw = collections.defaultdict(list)
         self.total_transitions = 0
@@ -16,7 +19,7 @@ class OnlineReplay:
 
     @property
     def dreamer_episodes(self):
-        return self.online_episodes
+        return self.offline_episodes + self.online_episodes
 
     def add_step(self, obs, action, reward, next_obs, terminated, truncated):
         self._raw['observations'].append(np.asarray(obs, dtype=np.float32))
@@ -40,6 +43,15 @@ class OnlineReplay:
         self.online_episodes.append(dreamer_ep)
         if len(self.online_episodes) > self.max_episodes:
             self.online_episodes.pop(0) # Drop the oldest episode, FIFO
+
+    # Warm start from the static OGBench dataset, put some dataset episodes into replay at start
+    def seed_from_offline(self, dreamer_episodes, n=None, rng=None):
+        eps = dreamer_episodes
+        if n is not None and n < len(eps):
+            rng = rng or np.random.default_rng()
+            idx = rng.choice(len(eps), size=n, replace=False)
+            eps = [eps[i] for i in idx]
+        self.offline_episodes.extend(eps)
 
     # Check if has enough data to sample a training batch
     def ready(self, seq_len, min_episodes=1):

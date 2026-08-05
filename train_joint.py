@@ -53,10 +53,12 @@ def build_agent_config(config, batch_size, seq_len, logdir): # Config for wm age
         replicas=1,
     )
 
-def build_real_env(env_name):
-    # Pure online training -- no offline dataset loaded.
+def build_real_env(env_name, load_offline_dataset):
+    if load_offline_dataset:
+        return OGBenchMethods.load_ogbench(env_name) # Download OGBench, later prefill some of replay buffer
+    # env_only=True returns the env itself, NOT a 3-tuple -- do not unpack it.
     env = ogbench.make_env_and_datasets(env_name, env_only=True)
-    return env
+    return env, None, None
 
 def _param_norm(params):
     """ L2 norm across every leaf of a JAX param pytree -- used to
@@ -98,7 +100,7 @@ def train(config):
     rng = np.random.default_rng(config.seed)
     print(f'PyTorch device: {device} | JAX devices: {jax.devices()}')
     wandb.init(project=general_config.wandb_project, mode=general_config.wandb_mode, config=config.flat)
-    env = build_real_env(general_config.env_name)
+    env, train_dataset, _ = build_real_env(general_config.env_name, general_config.seed_from_offline)
 
     print(f'env.observation_space = {env.observation_space}')
     obs_dim = env.observation_space.shape[0]
@@ -122,6 +124,12 @@ def train(config):
 
     # Create replay buffer
     replay = OnlineReplay(obs_key=OBS_KEY, action_key=ACTION_KEY, max_episodes=dreamer_config.max_episodes)
+    if train_dataset is not None:
+        offline_episodes = OGBenchMethods.make_dreamer_episodes(
+            train_dataset, min_length=seq_len, obs_key=OBS_KEY, action_key=ACTION_KEY)
+        replay.seed_from_offline(offline_episodes, rng=rng) # Put offline episodes into buffer for warm start
+        print(f'Seeded replay buffer with {len(replay.offline_episodes)} offline episodes')
+
     # Create SAC policy
     policy = SACWorldModelAgent( # repr_dim same as world-model feature dim
         repr_dim=feat_dim, action_shape=(action_dim,), device=device,
