@@ -55,7 +55,7 @@ def build_agent_config(config, batch_size, seq_len, logdir): # Config for wm age
 
 def build_real_env(env_name):
     # Pure online training -- no offline dataset loaded.
-    env, _, _ = ogbench.make_env_and_datasets(env_name, env_only=True)
+    env = ogbench.make_env_and_datasets(env_name, env_only=True)
     return env
 
 def _param_norm(params):
