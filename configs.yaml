@@ -59,10 +59,10 @@ defaults:
       wm_ckpt: ''
       seed_from_offline: True
       num_seed_steps: 4000
-      num_train_steps: 1000000
+      num_train_steps: 500000
       log_every: 100
       save_every: 10000
-      eval_every: 50000
+      eval_every: 10000
       eval_episodes: 10
       out_dir: joint_train_out
       wandb_project: world-model-sac
