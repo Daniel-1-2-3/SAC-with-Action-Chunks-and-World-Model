@@ -14,6 +14,7 @@ import ogbench
 from dreamer.wm_agent import WorldModelAgent # JAX dreamer agent
 from dreamer.wm_bridge import WorldModelBridge # handles JAX and numpy conversions
 from sac_wm_agent import SACWorldModelAgent # SAC + world model (file kept as drqv2_wm_agent.py for continuity)
+from sac_wm_utils import set_seed_everywhere
 from evaluation import eval_in_env
 from imagination import imagine_rollout
 from interop import numeric_metrics, subsample_tree_np, unwrap # JAX to torch/dict helpers
@@ -98,9 +99,14 @@ def train(config):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     rng = np.random.default_rng(config.seed)
+    # Seeds torch (incl. CUDA), numpy's global RNG and Python's random.
+    # Without this, network init and sample_squashed action noise were
+    # unseeded, so reruns at the same config.seed were not reproducible.
+    set_seed_everywhere(config.seed)
     print(f'PyTorch device: {device} | JAX devices: {jax.devices()}')
     wandb.init(project=general_config.wandb_project, mode=general_config.wandb_mode, config=config.flat)
     env, train_dataset, _ = build_real_env(general_config.env_name, general_config.seed_from_offline)
+    env.action_space.seed(config.seed) # otherwise the seed-steps phase differs every run
 
     print(f'env.observation_space = {env.observation_space}')
     obs_dim = env.observation_space.shape[0]
@@ -139,7 +145,7 @@ def train(config):
     )
 
     # Reset
-    obs, info = env.reset()
+    obs, info = env.reset(seed=config.seed)
     enc_carry, dyn_carry = bridge.init_encode(1)
     prevact = np.zeros((1, action_dim), dtype=np.float32) # No actions taken yet
     is_first = np.array([True])
