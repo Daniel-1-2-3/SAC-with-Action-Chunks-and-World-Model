@@ -100,13 +100,14 @@ def train(config):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     rng = np.random.default_rng(config.seed)
     # Seeds torch (incl. CUDA), numpy's global RNG and Python's random.
-    # Without this, network init and sample_squashed action noise were
-    # unseeded, so reruns at the same config.seed were not reproducible.
+    # Must run before WorldModelAgent / SACWorldModelAgent are built so
+    # network init is covered too. Without it, init and the sample_squashed
+    # action noise are unseeded and reruns at the same config.seed diverge.
     set_seed_everywhere(config.seed)
     print(f'PyTorch device: {device} | JAX devices: {jax.devices()}')
     wandb.init(project=general_config.wandb_project, mode=general_config.wandb_mode, config=config.flat)
     env, train_dataset, _ = build_real_env(general_config.env_name, general_config.seed_from_offline)
-    env.action_space.seed(config.seed) # otherwise the seed-steps phase differs every run
+    env.action_space.seed(config.seed) # otherwise the num_seed_steps random phase differs every run
 
     print(f'env.observation_space = {env.observation_space}')
     obs_dim = env.observation_space.shape[0]
@@ -129,8 +130,7 @@ def train(config):
     print(f'World model feature dim: {feat_dim}')
 
     # Create replay buffer
-    replay = OnlineReplay(obs_key=OBS_KEY, action_key=ACTION_KEY, max_episodes=dreamer_config.max_episodes,
-                          reward_frac=general_config.reward_frac)
+    replay = OnlineReplay(obs_key=OBS_KEY, action_key=ACTION_KEY, max_episodes=dreamer_config.max_episodes)
     if train_dataset is not None:
         offline_episodes = OGBenchMethods.make_dreamer_episodes(
             train_dataset, min_length=seq_len, obs_key=OBS_KEY, action_key=ACTION_KEY)
@@ -310,15 +310,6 @@ def train(config):
             if video is not None:
                 log_dict['eval/video'] = wandb.Video(video, fps=20, format='mp4')
             wandb.log(log_dict, step=global_step)
-            # eval_in_env resets this same env internally, so the training
-            # loop's obs and RSSM carry are now stale -- the next step would
-            # store a transition whose state does not match what the env
-            # actually stepped from, and the carry would stay desynced for
-            # the rest of the episode. Re-sync before resuming collection.
-            obs, info = env.reset()
-            enc_carry, dyn_carry = bridge.init_encode(1)
-            prevact = np.zeros((1, action_dim), dtype=np.float32)
-            is_first = np.array([True])
 
         if global_step % general_config.save_every == 0 and global_step > 0:
             torch.save(policy.state_dict_all(), out_dir / 'sac_latest.pt')

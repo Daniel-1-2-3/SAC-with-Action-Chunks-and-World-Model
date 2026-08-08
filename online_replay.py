@@ -4,8 +4,7 @@ from ogbench_methods import OGBenchMethods
 
 class OnlineReplay:
     def __init__(self, obs_key='state', action_key='action', max_episodes=2000,
-                 success_reward_thresh=-1.0, reward_frac=0.0,
-                 max_reward_episodes=500):
+                 success_reward_thresh=-1.0):
         self.obs_key = obs_key
         self.action_key = action_key
         self.max_episodes = max_episodes
@@ -23,15 +22,6 @@ class OnlineReplay:
         # kept parallel to online_episodes and popped in lockstep.
         self.offline_success_count = 0
         self.online_success_flags = []
-        # reward_frac > 0 reserves that share of every batch for episodes
-        # that actually contain an above-baseline reward, sampled with
-        # bias_start_to_reward so the reward step lands INSIDE the window.
-        # Success in this task terminates the episode, so the reward sits at
-        # the very end and a uniform 64-step window covers it only ~7% of the
-        # time -- this is what gets it in front of the reward head.
-        self.reward_frac = reward_frac
-        self.max_reward_episodes = max_reward_episodes
-        self.reward_episodes = []
         self._raw = collections.defaultdict(list)
         self.total_transitions = 0
 
@@ -62,12 +52,7 @@ class OnlineReplay:
             ep, obs_key=self.obs_key, action_key=self.action_key)
 
         self.online_episodes.append(dreamer_ep)
-        ep_is_success = self._is_success(dreamer_ep)
-        self.online_success_flags.append(ep_is_success)
-        if ep_is_success:
-            self.reward_episodes.append(dreamer_ep)
-            if len(self.reward_episodes) > self.max_reward_episodes:
-                self.reward_episodes.pop(0)
+        self.online_success_flags.append(self._is_success(dreamer_ep))
         if len(self.online_episodes) > self.max_episodes:
             self.online_episodes.pop(0) # Drop the oldest episode, FIFO
             self.online_success_flags.pop(0) # kept in lockstep
@@ -81,7 +66,6 @@ class OnlineReplay:
             eps = [eps[i] for i in idx]
         self.offline_episodes.extend(eps)
         self.offline_success_count += sum(self._is_success(ep) for ep in eps)
-        self.reward_episodes.extend(ep for ep in eps if self._is_success(ep))
 
     def _is_success(self, dreamer_ep):
         # reward[0] is the fabricated 0.0 that ogbench_to_dreamer_episode
@@ -123,24 +107,6 @@ class OnlineReplay:
                 f'No episodes long enough (need >= {seq_len} steps) to sample yet. '
                 f'Check replay.ready(seq_len) before calling sample_batch.')
 
-        usable_reward = [e for e in self.reward_episodes
-                         if len(e[self.obs_key]) >= seq_len]
-        n_reward = (min(int(round(batch_size * self.reward_frac)), batch_size)
-                    if (self.reward_frac > 0 and usable_reward) else 0)
-
-        if n_reward == 0:
-            return OGBenchMethods.sample_dreamer_batch(
-                usable, batch_size, seq_len,
-                obs_key=self.obs_key, action_key=self.action_key, rng=rng)
-
-        # bias_start_to_reward=True only on this slice -- these episodes are
-        # already known to contain reward, so this just makes sure the window
-        # is placed over it. The remainder below stays uniform.
-        reward_batch = OGBenchMethods.sample_dreamer_batch(
-            usable_reward, n_reward, seq_len,
-            obs_key=self.obs_key, action_key=self.action_key, rng=rng,
-            bias_start_to_reward=True)
-        rest = OGBenchMethods.sample_dreamer_batch(
-            usable, batch_size - n_reward, seq_len,
+        return OGBenchMethods.sample_dreamer_batch(
+            usable, batch_size, seq_len,
             obs_key=self.obs_key, action_key=self.action_key, rng=rng)
-        return {k: np.concatenate([reward_batch[k], rest[k]], axis=0) for k in rest}
