@@ -129,7 +129,8 @@ def train(config):
     print(f'World model feature dim: {feat_dim}')
 
     # Create replay buffer
-    replay = OnlineReplay(obs_key=OBS_KEY, action_key=ACTION_KEY, max_episodes=dreamer_config.max_episodes)
+    replay = OnlineReplay(obs_key=OBS_KEY, action_key=ACTION_KEY, max_episodes=dreamer_config.max_episodes,
+                          reward_frac=general_config.reward_frac)
     if train_dataset is not None:
         offline_episodes = OGBenchMethods.make_dreamer_episodes(
             train_dataset, min_length=seq_len, obs_key=OBS_KEY, action_key=ACTION_KEY)

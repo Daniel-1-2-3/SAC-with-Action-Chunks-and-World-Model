@@ -58,8 +58,9 @@ defaults:
       env_name: cube-single-play-singletask-v0
       wm_ckpt: ''
       seed_from_offline: True
+      reward_frac: 0.25
       num_seed_steps: 4000
-      num_train_steps: 1000000
+      num_train_steps: 500000
       log_every: 100
       save_every: 10000
       eval_every: 10000

@@ -59,7 +59,7 @@ class TransitionReplay:
         SAC bootstraps one step at a time, so it only ever needs independent
         transitions and can sample them uniformly at random. """
 
-    def __init__(self, obs_dim, action_dim, capacity=REPLAY_CAPACITY):
+    def __init__(self, obs_dim, action_dim, capacity=REPLAY_CAPACITY, reward_frac=0.0):
         self.capacity = int(capacity)
         self.obs = np.zeros((self.capacity, obs_dim), dtype=np.float32)
         self.action = np.zeros((self.capacity, action_dim), dtype=np.float32)
@@ -76,6 +76,13 @@ class TransitionReplay:
         self.online_episodes = 0
         self.online_success = 0
         self._ep_success = False
+        # Flat-buffer equivalent of bias_start_to_reward: reserve this share
+        # of every batch for transitions that actually carry an
+        # above-baseline reward. There are no windows to place here, so the
+        # correspondence is oversampling the rewarding transitions
+        # themselves. reward_idx holds their buffer positions.
+        self.reward_frac = reward_frac
+        self.reward_idx = []
 
     def __len__(self):
         return self.capacity if self.full else self.idx
@@ -90,6 +97,8 @@ class TransitionReplay:
         # truncation at the 200-step limit means the episode did not really
         # end, so the value function must still bootstrap past it.
         self.not_done[i] = 0.0 if terminated else 1.0
+        if reward > -1.0:
+            self.reward_idx.append(i)
         self.idx = (self.idx + 1) % self.capacity
         if self.idx == 0:
             self.full = True
@@ -125,6 +134,8 @@ class TransitionReplay:
         if n >= self.capacity:
             self.full = True
 
+        self.reward_idx.extend(np.flatnonzero(rew[:n, 0] > -1.0).tolist())
+
         # per-episode success counts, split on the dataset's terminal flags
         ep_ok = False
         for t in range(n):
@@ -138,6 +149,18 @@ class TransitionReplay:
 
     def sample(self, batch_size, device, rng):
         idx = rng.integers(0, len(self), size=batch_size)
+
+        n_reward = (min(int(round(batch_size * self.reward_frac)), batch_size)
+                    if self.reward_frac > 0 else 0)
+        if n_reward:
+            # The ring buffer can overwrite a recorded position, so re-check
+            # the stored reward rather than trusting the index list.
+            valid = np.array([i for i in self.reward_idx
+                              if self.reward[i, 0] > -1.0], dtype=np.int64)
+            if len(valid):
+                self.reward_idx = valid.tolist()
+                idx[:n_reward] = rng.choice(valid, size=n_reward, replace=True)
+
         to = lambda x: torch.as_tensor(x[idx], device=device)
         return to(self.obs), to(self.action), to(self.reward), to(self.next_obs), to(self.not_done)
 
@@ -240,7 +263,8 @@ def train(config):
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
 
-    replay = TransitionReplay(obs_dim, action_dim)
+    replay = TransitionReplay(obs_dim, action_dim,
+                              reward_frac=general_config.reward_frac)
     if train_dataset is not None:
         n = replay.seed_from_offline(train_dataset)
         print(f'Seeded replay buffer with {n} offline transitions '
@@ -303,6 +327,9 @@ def train(config):
             metrics['diagnosis/batch_reward_max'] = b_rew.max().item()
             metrics['diagnosis/batch_reward_min'] = b_rew.min().item()
             metrics['diagnosis/batch_not_done'] = b_nd.mean().item()
+            # share of the batch that actually carries reward -- confirms
+            # reward_frac is doing something rather than silently sitting at 0
+            metrics['diagnosis/batch_reward_frac'] = (b_rew > sac_config.reward_shift - 1.0).float().mean().item()
 
         if global_step % general_config.log_every == 0:
             metrics['diagnosis/replay_transitions'] = len(replay)
