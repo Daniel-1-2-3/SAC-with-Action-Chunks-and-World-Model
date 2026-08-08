@@ -325,6 +325,11 @@ def train(config):
             if video is not None:
                 log_dict['eval/video'] = wandb.Video(video, fps=20, format='mp4')
             wandb.log(log_dict, step=global_step)
+            # eval_sac_in_env resets this same env internally, so the
+            # training loop's obs is now stale -- the next step would store a
+            # transition whose state does not match what the env actually
+            # stepped from. Re-sync before resuming collection.
+            obs, info = env.reset()
 
         if global_step % general_config.save_every == 0 and global_step > 0:
             torch.save(policy.state_dict_all(), out_dir / 'sac_latest.pt')
