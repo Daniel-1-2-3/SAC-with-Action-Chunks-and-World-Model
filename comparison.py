@@ -8,7 +8,9 @@ import elements
 import jax
 import numpy as np
 import torch
-import wandb
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 from dreamer.wm_agent import WorldModelAgent
 from dreamer.wm_bridge import WorldModelBridge
@@ -24,11 +26,10 @@ ENV_ACTION_LOW = -1.0
 ENV_ACTION_HIGH = 1.0
 
 
-def run_eval(env, policy, n_episodes, tag, bridge=None, action_dim=None, seed=0,
-             step_offset=0):
+def run_eval(env, policy, n_episodes, tag, bridge=None, action_dim=None, seed=0):
     """ bridge=None  -> pure SAC, actor reads the raw observation.
         bridge given -> WM+SAC, observation is encoded through the RSSM first. """
-    returns, successes = [], []
+    returns, successes, steps_to_success = [], [], []
 
     for ep in range(n_episodes):
         obs, info = env.reset(seed=seed + ep) # same episode set for both arms
@@ -73,17 +74,14 @@ def run_eval(env, policy, n_episodes, tag, bridge=None, action_dim=None, seed=0,
         returns.append(ep_return)
         successes.append(float(ep_success))
 
-        # wandb refuses writes to a step it has already moved past, so the
-        # second arm must not reuse 0..n-1 or its points are silently dropped.
-        log = {f'{tag}/episode_return': ep_return, f'{tag}/episode': ep}
-        if hit_at is not None:
-            log[f'{tag}/steps_to_success'] = hit_at
-        wandb.log(log, step=step_offset + ep)
+        # nan for failed episodes so the array stays aligned with `eps` and
+        # matplotlib simply leaves a gap where there was no success
+        steps_to_success.append(hit_at if hit_at is not None else np.nan)
 
         if (ep + 1) % 50 == 0:
             print(f'    {ep+1}/{n_episodes} | running success {np.mean(successes):.3f}')
 
-    return np.array(returns), np.array(successes)
+    return np.array(returns), np.array(successes), np.array(steps_to_success)
 
 
 def load_sac_only(ckpt, env, config, device):
@@ -123,6 +121,66 @@ def load_wm_sac(sac_ckpt, wm_ckpt, env, config, device):
     return policy, bridge
 
 
+def plot_all(out_dir, sac, wm, n):
+    """ sac / wm are (returns, successes, steps_to_success) tuples. """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sac_ret, sac_succ, sac_sts = sac
+    wm_ret, wm_succ, wm_sts = wm
+    eps = np.arange(n)
+    C_SAC, C_WM = 'tab:orange', 'tab:blue'
+
+    # 1. per-episode return
+    fig, ax = plt.subplots(figsize=(11, 4))
+    ax.plot(eps, sac_ret, color=C_SAC, alpha=0.45, lw=0.8, label='Pure SAC')
+    ax.plot(eps, wm_ret, color=C_WM, alpha=0.45, lw=0.8, label='WM + SAC')
+    ax.axhline(sac_ret.mean(), color=C_SAC, ls='--', lw=1.5)
+    ax.axhline(wm_ret.mean(), color=C_WM, ls='--', lw=1.5)
+    ax.set_xlabel('episode'); ax.set_ylabel('return')
+    ax.set_title(f'Episode return over {n} episodes (dashed = mean)')
+    ax.legend(); fig.tight_layout()
+    fig.savefig(out_dir / 'episode_return.png', dpi=120); plt.close(fig)
+
+    # 2. steps to success -- only episodes that succeeded, so gaps are real
+    fig, ax = plt.subplots(figsize=(11, 4))
+    ax.plot(eps, sac_sts, '.', color=C_SAC, ms=4, label='Pure SAC')
+    ax.plot(eps, wm_sts, '.', color=C_WM, ms=4, label='WM + SAC')
+    ax.set_xlabel('episode'); ax.set_ylabel('steps to success')
+    ax.set_title('Steps to success (only successful episodes plotted)')
+    ax.legend(); fig.tight_layout()
+    fig.savefig(out_dir / 'steps_to_success.png', dpi=120); plt.close(fig)
+
+    # 3. success rate + mean return bars
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(9, 4))
+    a1.bar(['Pure SAC', 'WM + SAC'], [sac_succ.mean(), wm_succ.mean()],
+           color=[C_SAC, C_WM])
+    a1.set_ylim(0, 1); a1.set_ylabel('success rate')
+    for i, v in enumerate([sac_succ.mean(), wm_succ.mean()]):
+        a1.text(i, v + 0.02, f'{v:.3f}', ha='center')
+    a2.bar(['Pure SAC', 'WM + SAC'], [sac_ret.mean(), wm_ret.mean()],
+           color=[C_SAC, C_WM])
+    a2.set_ylabel('mean return')
+    for i, v in enumerate([sac_ret.mean(), wm_ret.mean()]):
+        a2.text(i, v, f'{v:.1f}', ha='center', va='bottom')
+    fig.suptitle(f'Summary over {n} episodes')
+    fig.tight_layout()
+    fig.savefig(out_dir / 'summary.png', dpi=120); plt.close(fig)
+
+    # 4. running success rate -- shows whether the gap is stable
+    fig, ax = plt.subplots(figsize=(11, 4))
+    ax.plot(eps, np.cumsum(sac_succ) / (eps + 1), color=C_SAC, label='Pure SAC')
+    ax.plot(eps, np.cumsum(wm_succ) / (eps + 1), color=C_WM, label='WM + SAC')
+    ax.set_xlabel('episode'); ax.set_ylabel('running success rate')
+    ax.set_ylim(0, 1)
+    ax.set_title('Cumulative success rate')
+    ax.legend(); fig.tight_layout()
+    fig.savefig(out_dir / 'running_success_rate.png', dpi=120); plt.close(fig)
+
+    np.savez(out_dir / 'raw_results.npz',
+             sac_returns=sac_ret, sac_successes=sac_succ, sac_steps_to_success=sac_sts,
+             wm_returns=wm_ret, wm_successes=wm_succ, wm_steps_to_success=wm_sts)
+    print(f'\nSaved 4 plots + raw_results.npz to {out_dir}/')
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--sac_ckpt', type=str,
@@ -140,10 +198,6 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     set_seed_everywhere(args.seed)
 
-    wandb.init(project=config.joint.general.wandb_project,
-               mode=config.joint.general.wandb_mode,
-               name='comparison')
-
     env, _, _ = OGBenchMethods.load_ogbench(config.joint.general.env_name)
     action_dim = env.action_space.shape[0]
     n = args.episodes
@@ -151,17 +205,18 @@ def main():
     print(f'\nLoading pure SAC: {args.sac_ckpt}')
     sac_policy = load_sac_only(args.sac_ckpt, env, config, device)
     print(f'=== Pure SAC, {n} episodes ===')
-    sac_ret, sac_succ = run_eval(env, sac_policy, n, 'sac_only',
-                                 bridge=None, action_dim=action_dim, seed=args.seed,
-                                 step_offset=0)
+    sac = run_eval(env, sac_policy, n, 'sac_only',
+                   bridge=None, action_dim=action_dim, seed=args.seed)
 
     print(f'\nLoading WM + SAC: {args.joint_sac_ckpt}')
     wm_policy, bridge = load_wm_sac(
         args.joint_sac_ckpt, args.joint_wm_ckpt, env, config, device)
     print(f'=== WM + SAC, {n} episodes ===')
-    wm_ret, wm_succ = run_eval(env, wm_policy, n, 'wm_sac',
-                               bridge=bridge, action_dim=action_dim, seed=args.seed,
-                               step_offset=n)
+    wm = run_eval(env, wm_policy, n, 'wm_sac',
+                  bridge=bridge, action_dim=action_dim, seed=args.seed)
+
+    sac_ret, sac_succ, _ = sac
+    wm_ret, wm_succ, _ = wm
 
     print('\n' + '=' * 60)
     print(f'{"metric":24s} {"Pure SAC":>16s} {"WM + SAC":>16s}')
@@ -170,16 +225,8 @@ def main():
     print(f'{"mean return":24s} {sac_ret.mean():>16.2f} {wm_ret.mean():>16.2f}')
     print('=' * 60)
 
-    wandb.log({
-        'summary/sac_only_success_rate': float(sac_succ.mean()),
-        'summary/sac_only_mean_return': float(sac_ret.mean()),
-        'summary/wm_sac_success_rate': float(wm_succ.mean()),
-        'summary/wm_sac_mean_return': float(wm_ret.mean()),
-        'summary/episodes': n,
-    }, step=2 * n)
-
+    plot_all(pathlib.Path('comparison'), sac, wm, n)
     env.close()
-    wandb.finish()
 
 
 if __name__ == '__main__':
