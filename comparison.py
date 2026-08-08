@@ -120,7 +120,7 @@ def load_wm_sac(sac_ckpt, wm_ckpt, env, config, device):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--sac_ckpt', type=str,
-                    default='joint_train_out_sac_only/sac_final.pt')
+                    default='sac_train_out/sac_final.pt')
     ap.add_argument('--joint_sac_ckpt', type=str,
                     default='joint_train_out/sac_final.pt')
     ap.add_argument('--joint_wm_ckpt', type=str,
