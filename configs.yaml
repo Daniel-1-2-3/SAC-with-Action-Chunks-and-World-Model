@@ -52,7 +52,7 @@ defaults:
     report: True
     report_gradnorms: False
 
-  joint:
+  train_joint:
 
     general:
       env_name: cube-single-play-singletask-v0
@@ -64,7 +64,7 @@ defaults:
       save_every: 10000
       eval_every: 10000
       eval_episodes: 10
-      out_dir: joint_train_out
+      out_dir: train_joint_out
       wandb_project: world-model-sac
       wandb_mode: online
 
@@ -78,6 +78,39 @@ defaults:
       imagination_batch: 1024
       gamma: 0.99
       lam: 0.95
+      reward_shift: 1.0
+      lr: 3e-4
+      feature_dim: 512
+      hidden_dim: 256
+      critic_target_tau: 0.005
+      init_ent_coef: 1.0
+
+  # Baseline arm. Keep every value below that also appears under
+  # train_joint.sac IDENTICAL to it -- gamma, reward_shift, lr, feature_dim,
+  # hidden_dim, critic_target_tau, init_ent_coef are shared by design and the
+  # comparison stops being controlled the moment one side is tuned alone.
+  # train_every and batch_size are the exceptions: those are legitimately
+  # method-specific and sit here at their standard SAC values.
+  train_sac:
+
+    general:
+      env_name: cube-single-play-singletask-v0
+      seed_from_offline: True
+      num_seed_steps: 4000
+      num_train_steps: 500000
+      log_every: 100
+      save_every: 10000
+      eval_every: 10000
+      eval_episodes: 10
+      out_dir: train_sac_out
+      wandb_project: world-model-sac
+      wandb_mode: online
+
+    sac:
+      train_every: 1
+      batch_size: 256
+      replay_capacity: 1000000
+      gamma: 0.99
       reward_shift: 1.0
       lr: 3e-4
       feature_dim: 512

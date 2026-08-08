@@ -22,8 +22,8 @@ ENV_ACTION_HIGH = 1.0
 # Classic SAC keeps a flat transition buffer, not episodes -- there is no
 # recurrent model here that needs contiguous time, so sequence structure is
 # unnecessary and a 1M-transition ring buffer is the standard choice.
+# Actual value comes from train_sac.sac.replay_capacity.
 REPLAY_CAPACITY = 1_000_000
-SAC_BATCH_SIZE = 256
 
 def load_config(folder, argv=None):
     configs_txt = elements.Path(folder / 'configs.yaml').read()
@@ -220,15 +220,20 @@ def eval_sac_in_env(env, policy, num_episodes, device, obs_key, record_video=Fal
     return float(np.mean(returns)), float(np.mean(successes)), video
 
 def train(config):
-    general_config, sac_config = config.joint.general, config.joint.sac
+    general_config, sac_config = config.train_sac.general, config.train_sac.sac
+    # train_every=1 and batch_size=256 are SAC's standard settings and live
+    # under train_sac.sac; every value there is deliberately kept equal
+    # to train_joint.sac so the two arms differ only where they must.
+    batch_size = sac_config.batch_size
+    train_every = sac_config.train_every
 
-    out_dir = pathlib.Path('sac_train_out')
+    out_dir = pathlib.Path(general_config.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     rng = np.random.default_rng(config.seed)
-    # train_joint.py never calls this, so its torch init / action noise are
-    # unseeded. Called here so the baseline is reproducible.
+    # Seeds torch (incl. CUDA), numpy's global RNG and Python's random.
+    # Must run before SACWorldModelAgent is built so network init is covered.
     set_seed_everywhere(config.seed)
     print(f'PyTorch device: {device}')
     wandb.init(project=general_config.wandb_project, mode=general_config.wandb_mode, config=config.flat)
@@ -240,7 +245,8 @@ def train(config):
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
 
-    replay = TransitionReplay(obs_dim, action_dim)
+    replay = TransitionReplay(obs_dim, action_dim,
+                              capacity=sac_config.replay_capacity)
     if train_dataset is not None:
         n = replay.seed_from_offline(train_dataset)
         print(f'Seeded replay buffer with {n} offline transitions '
@@ -257,7 +263,9 @@ def train(config):
 
     obs, info = env.reset(seed=config.seed)
     global_step = 0
-    print('Starting SAC-only training loop (no world model)')
+    n_updates = 0
+    print(f'Starting SAC-only training loop (no world model) | '
+          f'train_every={train_every} batch_size={batch_size}')
 
     while global_step < general_config.num_train_steps:
         state = np.asarray(obs, dtype=np.float32).reshape(-1)
@@ -282,8 +290,8 @@ def train(config):
         global_step += 1
         metrics = {}
 
-        if len(replay) >= SAC_BATCH_SIZE and global_step % sac_config.train_every == 0:
-            b_obs, b_act, b_rew, b_next, b_nd = replay.sample(SAC_BATCH_SIZE, device, rng)
+        if len(replay) >= batch_size and global_step % train_every == 0:
+            b_obs, b_act, b_rew, b_next, b_nd = replay.sample(batch_size, device, rng)
             # Same {-1, 0} -> {0, +1} shift train_joint.py applies to its
             # imagined rewards, applied here to the real ones so the critic
             # in both runs sees the same reward scale.
@@ -298,6 +306,7 @@ def train(config):
             metrics.update(_prefixed(policy.update_critic(b_obs, b_act, targets, weights), 'sac'))
             metrics.update(_prefixed(policy.update_actor(b_obs, weights), 'sac'))
             policy.update_target()
+            n_updates += 1
 
             metrics['sac/mean_batch_reward'] = b_rew.mean().item()
             metrics['diagnosis/batch_reward_max'] = b_rew.max().item()
@@ -306,6 +315,10 @@ def train(config):
 
         if global_step % general_config.log_every == 0:
             metrics['diagnosis/replay_transitions'] = len(replay)
+            # gradient updates so far -- the two arms differ in update cadence,
+            # so equal env steps does NOT mean equal compute; report this
+            # alongside any comparison rather than leaving it to be inferred
+            metrics['diagnosis/gradient_updates'] = n_updates
             _succ = replay.success_stats
             metrics['replay/success_frac_total'] = _succ['total_frac']
             metrics['replay/success_frac_online'] = _succ['online_frac']
@@ -345,4 +358,4 @@ if __name__ == '__main__':
     _config = load_config(_folder)
     train(_config)
 
-# python train_sac.py --joint.general.env_name=cube-single-play-singletask-v0
+# python train_sac.py --train_sac.general.env_name=cube-single-play-singletask-v0

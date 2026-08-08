@@ -85,7 +85,7 @@ def run_eval(env, policy, n_episodes, tag, bridge=None, action_dim=None, seed=0)
 
 
 def load_sac_only(ckpt, env, config, device):
-    sac = config.joint.sac
+    sac = config.train_joint.sac
     policy = SACWorldModelAgent(
         repr_dim=env.observation_space.shape[0],
         action_shape=(env.action_space.shape[0],), device=device,
@@ -112,7 +112,7 @@ def load_wm_sac(sac_ckpt, wm_ckpt, env, config, device):
 
     rssm = agent_config.dyn.rssm
     feat_dim = int(rssm.deter + rssm.stoch * rssm.classes)
-    sac = config.joint.sac
+    sac = config.train_joint.sac
     policy = SACWorldModelAgent(
         repr_dim=feat_dim, action_shape=(action_dim,), device=device,
         lr=sac.lr, feature_dim=sac.feature_dim, hidden_dim=sac.hidden_dim,
@@ -149,11 +149,11 @@ def plot_all(sac, wm, n):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--sac_ckpt', type=str,
-                    default='sac_train_out/sac_final.pt')
+                    default='train_sac_out/sac_final.pt')
     ap.add_argument('--joint_sac_ckpt', type=str,
-                    default='joint_train_out/sac_final.pt')
+                    default='train_joint_out/sac_final.pt')
     ap.add_argument('--joint_wm_ckpt', type=str,
-                    default='joint_train_out/wm_latest.pkl')
+                    default='train_joint_out/wm_latest.pkl')
     ap.add_argument('--episodes', type=int, default=500)
     ap.add_argument('--seed', type=int, default=12345)
     args = ap.parse_args()
@@ -163,7 +163,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     set_seed_everywhere(args.seed)
 
-    env, _, _ = OGBenchMethods.load_ogbench(config.joint.general.env_name)
+    env, _, _ = OGBenchMethods.load_ogbench(config.train_joint.general.env_name)
     action_dim = env.action_space.shape[0]
     n = args.episodes
 

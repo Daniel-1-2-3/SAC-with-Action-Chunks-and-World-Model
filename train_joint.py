@@ -89,7 +89,7 @@ def _prefixed(d, default_prefix):
     return {k if '/' in k else f'{default_prefix}/{k}': v for k, v in d.items()}
 
 def train(config):
-    general_config, dreamer_config, sac_config = config.joint.general, config.joint.dreamer, config.joint.sac
+    general_config, dreamer_config, sac_config = config.train_joint.general, config.train_joint.dreamer, config.train_joint.sac
 
     out_dir = pathlib.Path(general_config.out_dir) # Checkpoints and outs dir
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -328,4 +328,4 @@ if __name__ == '__main__':
     _config = load_config(_folder)
     train(_config)
 
-# python train_joint.py --joint.general.env_name=cube-single-play-singletask-v0
+# python train_joint.py --train_joint.general.env_name=cube-single-play-singletask-v0

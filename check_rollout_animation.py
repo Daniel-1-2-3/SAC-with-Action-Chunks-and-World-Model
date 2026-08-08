@@ -13,7 +13,7 @@ For each rollout, saves:
 
 Usage:
     python check_rollout_animation.py \
-        --wm_ckpt joint_train_out/wm_latest.pkl \
+        --wm_ckpt train_joint_out/wm_latest.pkl \
         --horizon 30 \
         --n_seeds 3 \
         --out_dir rollout_check
@@ -190,7 +190,7 @@ def main():
 
     print('Loading environment + offline dataset...')
     env, train_dataset, _ = OGBenchMethods.load_ogbench(
-        config.joint.general.env_name)
+        config.train_joint.general.env_name)
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     obs_space, act_space = OGBenchMethods.make_spaces(
