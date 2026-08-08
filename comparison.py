@@ -45,9 +45,12 @@ def run_eval(env, policy, n_episodes, tag, bridge=None, action_dim=None, seed=0)
             if bridge is None:
                 feat_np = state.reshape(-1)
             else:
-                enc_carry, dyn_carry, feat = bridge.encode_step(
+                enc_carry, dyn_carry, feat_j = bridge.encode_step(
                     enc_carry, dyn_carry, state, prevact, is_first)
-                feat_np = np.asarray(feat).reshape(-1)
+                # JAX blocks implicit device-to-host transfers, so np.asarray
+                # on a device array raises. Same explicit device_get that
+                # evaluation.py and train_joint.py use.
+                feat_np = np.asarray(jax.device_get(feat_j))[0].copy()
 
             action = policy.act(feat_np, step=0, eval_mode=True)
             env_action = ENV_ACTION_LOW + (action + 1.0) * 0.5 * (ENV_ACTION_HIGH - ENV_ACTION_LOW)
