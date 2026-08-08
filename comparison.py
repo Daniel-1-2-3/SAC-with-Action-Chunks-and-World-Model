@@ -121,64 +121,29 @@ def load_wm_sac(sac_ckpt, wm_ckpt, env, config, device):
     return policy, bridge
 
 
-def plot_all(out_dir, sac, wm, n):
+def plot_all(sac, wm, n):
     """ sac / wm are (returns, successes, steps_to_success) tuples. """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    sac_ret, sac_succ, sac_sts = sac
-    wm_ret, wm_succ, wm_sts = wm
+    sac_ret, sac_succ, _ = sac
+    wm_ret, wm_succ, _ = wm
     eps = np.arange(n)
     C_SAC, C_WM = 'tab:orange', 'tab:blue'
 
-    # 1. per-episode return
-    fig, ax = plt.subplots(figsize=(11, 4))
-    ax.plot(eps, sac_ret, color=C_SAC, alpha=0.45, lw=0.8, label='Pure SAC')
-    ax.plot(eps, wm_ret, color=C_WM, alpha=0.45, lw=0.8, label='WM + SAC')
-    ax.axhline(sac_ret.mean(), color=C_SAC, ls='--', lw=1.5)
-    ax.axhline(wm_ret.mean(), color=C_WM, ls='--', lw=1.5)
-    ax.set_xlabel('episode'); ax.set_ylabel('return')
-    ax.set_title(f'Episode return over {n} episodes (dashed = mean)')
-    ax.legend(); fig.tight_layout()
-    fig.savefig(out_dir / 'episode_return.png', dpi=120); plt.close(fig)
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(eps, sac_ret, '.', color=C_SAC, ms=4, alpha=0.5,
+            label=f'Pure SAC   (success {sac_succ.mean():.3f}, mean return {sac_ret.mean():.1f})')
+    ax.plot(eps, wm_ret, '.', color=C_WM, ms=4, alpha=0.5,
+            label=f'WM + SAC   (success {wm_succ.mean():.3f}, mean return {wm_ret.mean():.1f})')
+    ax.axhline(sac_ret.mean(), color=C_SAC, ls='--', lw=2)
+    ax.axhline(wm_ret.mean(), color=C_WM, ls='--', lw=2)
 
-    # 2. steps to success -- only episodes that succeeded, so gaps are real
-    fig, ax = plt.subplots(figsize=(11, 4))
-    ax.plot(eps, sac_sts, '.', color=C_SAC, ms=4, label='Pure SAC')
-    ax.plot(eps, wm_sts, '.', color=C_WM, ms=4, label='WM + SAC')
-    ax.set_xlabel('episode'); ax.set_ylabel('steps to success')
-    ax.set_title('Steps to success (only successful episodes plotted)')
-    ax.legend(); fig.tight_layout()
-    fig.savefig(out_dir / 'steps_to_success.png', dpi=120); plt.close(fig)
-
-    # 3. success rate + mean return bars
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(9, 4))
-    a1.bar(['Pure SAC', 'WM + SAC'], [sac_succ.mean(), wm_succ.mean()],
-           color=[C_SAC, C_WM])
-    a1.set_ylim(0, 1); a1.set_ylabel('success rate')
-    for i, v in enumerate([sac_succ.mean(), wm_succ.mean()]):
-        a1.text(i, v + 0.02, f'{v:.3f}', ha='center')
-    a2.bar(['Pure SAC', 'WM + SAC'], [sac_ret.mean(), wm_ret.mean()],
-           color=[C_SAC, C_WM])
-    a2.set_ylabel('mean return')
-    for i, v in enumerate([sac_ret.mean(), wm_ret.mean()]):
-        a2.text(i, v, f'{v:.1f}', ha='center', va='bottom')
-    fig.suptitle(f'Summary over {n} episodes')
+    ax.set_xlabel('episode')
+    ax.set_ylabel('return')
+    ax.set_title(f'Return per episode over {n} episodes (dashed = mean)')
+    ax.legend(loc='best')
     fig.tight_layout()
-    fig.savefig(out_dir / 'summary.png', dpi=120); plt.close(fig)
-
-    # 4. running success rate -- shows whether the gap is stable
-    fig, ax = plt.subplots(figsize=(11, 4))
-    ax.plot(eps, np.cumsum(sac_succ) / (eps + 1), color=C_SAC, label='Pure SAC')
-    ax.plot(eps, np.cumsum(wm_succ) / (eps + 1), color=C_WM, label='WM + SAC')
-    ax.set_xlabel('episode'); ax.set_ylabel('running success rate')
-    ax.set_ylim(0, 1)
-    ax.set_title('Cumulative success rate')
-    ax.legend(); fig.tight_layout()
-    fig.savefig(out_dir / 'running_success_rate.png', dpi=120); plt.close(fig)
-
-    np.savez(out_dir / 'raw_results.npz',
-             sac_returns=sac_ret, sac_successes=sac_succ, sac_steps_to_success=sac_sts,
-             wm_returns=wm_ret, wm_successes=wm_succ, wm_steps_to_success=wm_sts)
-    print(f'\nSaved 4 plots + raw_results.npz to {out_dir}/')
+    fig.savefig('summary.jpg', dpi=140)
+    plt.close(fig)
+    print('\nSaved summary.jpg')
 
 
 def main():
@@ -225,7 +190,7 @@ def main():
     print(f'{"mean return":24s} {sac_ret.mean():>16.2f} {wm_ret.mean():>16.2f}')
     print('=' * 60)
 
-    plot_all(pathlib.Path('comparison'), sac, wm, n)
+    plot_all(sac, wm, n)
     env.close()
 
 
