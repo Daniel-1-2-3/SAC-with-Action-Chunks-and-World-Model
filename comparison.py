@@ -24,7 +24,8 @@ ENV_ACTION_LOW = -1.0
 ENV_ACTION_HIGH = 1.0
 
 
-def run_eval(env, policy, n_episodes, tag, bridge=None, action_dim=None, seed=0):
+def run_eval(env, policy, n_episodes, tag, bridge=None, action_dim=None, seed=0,
+             step_offset=0):
     """ bridge=None  -> pure SAC, actor reads the raw observation.
         bridge given -> WM+SAC, observation is encoded through the RSSM first. """
     returns, successes = [], []
@@ -72,10 +73,12 @@ def run_eval(env, policy, n_episodes, tag, bridge=None, action_dim=None, seed=0)
         returns.append(ep_return)
         successes.append(float(ep_success))
 
-        log = {f'{tag}/episode_return': ep_return}
+        # wandb refuses writes to a step it has already moved past, so the
+        # second arm must not reuse 0..n-1 or its points are silently dropped.
+        log = {f'{tag}/episode_return': ep_return, f'{tag}/episode': ep}
         if hit_at is not None:
             log[f'{tag}/steps_to_success'] = hit_at
-        wandb.log(log, step=ep)
+        wandb.log(log, step=step_offset + ep)
 
         if (ep + 1) % 50 == 0:
             print(f'    {ep+1}/{n_episodes} | running success {np.mean(successes):.3f}')
@@ -149,14 +152,16 @@ def main():
     sac_policy = load_sac_only(args.sac_ckpt, env, config, device)
     print(f'=== Pure SAC, {n} episodes ===')
     sac_ret, sac_succ = run_eval(env, sac_policy, n, 'sac_only',
-                                 bridge=None, action_dim=action_dim, seed=args.seed)
+                                 bridge=None, action_dim=action_dim, seed=args.seed,
+                                 step_offset=0)
 
     print(f'\nLoading WM + SAC: {args.joint_sac_ckpt}')
     wm_policy, bridge = load_wm_sac(
         args.joint_sac_ckpt, args.joint_wm_ckpt, env, config, device)
     print(f'=== WM + SAC, {n} episodes ===')
     wm_ret, wm_succ = run_eval(env, wm_policy, n, 'wm_sac',
-                               bridge=bridge, action_dim=action_dim, seed=args.seed)
+                               bridge=bridge, action_dim=action_dim, seed=args.seed,
+                               step_offset=n)
 
     print('\n' + '=' * 60)
     print(f'{"metric":24s} {"Pure SAC":>16s} {"WM + SAC":>16s}')
@@ -171,7 +176,7 @@ def main():
         'summary/wm_sac_success_rate': float(wm_succ.mean()),
         'summary/wm_sac_mean_return': float(wm_ret.mean()),
         'summary/episodes': n,
-    })
+    }, step=2 * n)
 
     env.close()
     wandb.finish()

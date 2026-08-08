@@ -222,7 +222,7 @@ def eval_sac_in_env(env, policy, num_episodes, device, obs_key, record_video=Fal
 def train(config):
     general_config, sac_config = config.joint.general, config.joint.sac
 
-    out_dir = pathlib.Path(str(general_config.out_dir) + '_sac_only')
+    out_dir = pathlib.Path('sac_train_out')
     out_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
