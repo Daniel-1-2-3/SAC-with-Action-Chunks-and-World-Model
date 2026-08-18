@@ -78,7 +78,7 @@ defaults:
       imagination_batch: 1024
       gamma: 0.99
       lam: 0.95
-      reward_shift: 2.0
+      reward_shift: 1.0
       lr: 3e-4
       feature_dim: 512
       hidden_dim: 256
@@ -161,7 +161,9 @@ defaults:
       train_every: 5
       gamma: 0.99
       lam: 0.95
-      reward_shift: 1.0
+      # = number of cubes in the task (double 2.0, triple 3.0, quadruple 4.0).
+      # Shifts reward from {-n..0} to {0..+n}. Change it with env_name.
+      reward_shift: 2.0
       lr: 3e-4
       feature_dim: 512
       hidden_dim: 256
@@ -202,7 +204,9 @@ defaults:
       batch_size: 256
       replay_capacity: 1000000
       gamma: 0.99
-      reward_shift: 1.0
+      # = number of cubes in the task (double 2.0, triple 3.0, quadruple 4.0).
+      # Shifts reward from {-n..0} to {0..+n}. Change it with env_name.
+      reward_shift: 2.0
       lr: 3e-4
       feature_dim: 512
       hidden_dim: 256
