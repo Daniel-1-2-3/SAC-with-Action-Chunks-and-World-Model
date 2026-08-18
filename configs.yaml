@@ -78,7 +78,7 @@ defaults:
       imagination_batch: 1024
       gamma: 0.99
       lam: 0.95
-      reward_shift: 1.0
+      reward_shift: 2.0
       lr: 3e-4
       feature_dim: 512
       hidden_dim: 256
