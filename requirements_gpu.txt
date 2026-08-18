@@ -1,22 +1,40 @@
-ogbench
-jax[cuda12]<0.7.0
 numpy<2
+
+# world model (JAX side)
+jax[cuda12]<0.7.0
 optax
 chex
 einops
 jaxtyping
 ninjax>=3.5.1
 elements>=3.17.0
+
+# policy (PyTorch side) -- install from the CUDA index above, not plain PyPI,
+# or pip serves a CPU-only wheel
+torch
+
+# environment
+ogbench
+mujoco
+
+# config loading
+ruamel.yaml
+
+# rendering and plots: wm/check_rollout_animation.py, helpers/comparison.py,
+# helpers/test_physics.py
+opencv-python
+matplotlib
+
+# elements / embodied support
 google-resumable-media>=2.7.2
 granular>=0.20.3
 portal>=3.5.0
 scope>=0.4.4
 av
-colored_traceback
-ipdb
+
+# logging and misc
+wandb[media]
 requests
 tqdm
-wandb[media]
-
-# git clone https://github.com/danijar/embodied.git
-# wandb login
+colored_traceback
+ipdb
