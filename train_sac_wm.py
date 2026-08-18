@@ -13,13 +13,13 @@ import ogbench
 
 from dreamer.wm_agent import WorldModelAgent # JAX dreamer agent
 from dreamer.wm_bridge import WorldModelBridge # handles JAX and numpy conversions
-from sac_wm_agent import SACWorldModelAgent # SAC + world model (file kept as drqv2_wm_agent.py for continuity)
-from sac_wm_utils import set_seed_everywhere
-from evaluation import eval_in_env
-from imagination import imagine_rollout
-from interop import numeric_metrics, subsample_tree_np, unwrap # JAX to torch/dict helpers
-from ogbench_methods import OGBenchMethods # for formatting OGBench batches to be used by world model
-from online_replay import OnlineReplay
+from sac.sac_wm_agent import SACWorldModelAgent # SAC + world model (file kept as drqv2_wm_agent.py for continuity)
+from helpers.sac_wm_utils import set_seed_everywhere
+from sac.evaluation import eval_in_env
+from wm.imagination import imagine_rollout
+from helpers.interop import numeric_metrics, subsample_tree_np, unwrap # JAX to torch/dict helpers
+from helpers.ogbench_methods import OGBenchMethods # for formatting OGBench batches to be used by world model
+from helpers.online_replay import OnlineReplay
 
 OBS_KEY = 'state'
 ACTION_KEY = 'action'
@@ -89,7 +89,7 @@ def _prefixed(d, default_prefix):
     return {k if '/' in k else f'{default_prefix}/{k}': v for k, v in d.items()}
 
 def train(config):
-    general_config, dreamer_config, sac_config = config.train_joint.general, config.train_joint.dreamer, config.train_joint.sac
+    general_config, dreamer_config, sac_config = config.train_sac_wm.general, config.train_sac_wm.dreamer, config.train_sac_wm.sac
 
     out_dir = pathlib.Path(general_config.out_dir) # Checkpoints and outs dir
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -328,4 +328,4 @@ if __name__ == '__main__':
     _config = load_config(_folder)
     train(_config)
 
-# python train_joint.py --train_joint.general.env_name=cube-single-play-singletask-v0
+# python train_sac_wm.py --train_sac_wm.general.env_name=cube-single-play-singletask-v0

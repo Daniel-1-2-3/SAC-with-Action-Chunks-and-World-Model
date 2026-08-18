@@ -1,3 +1,6 @@
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1])) # run from anywhere: put the repo root on the path
+
 import os
 os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
 os.environ.setdefault('MUJOCO_GL', 'egl')
@@ -14,11 +17,11 @@ import matplotlib.pyplot as plt
 
 from dreamer.wm_agent import WorldModelAgent
 from dreamer.wm_bridge import WorldModelBridge
-from sac_wm_agent import SACWorldModelAgent
-from sac_wm_utils import set_seed_everywhere
-from interop import extract_state
-from ogbench_methods import OGBenchMethods
-from train_joint import load_config, build_agent_config
+from sac.sac_wm_agent import SACWorldModelAgent
+from helpers.sac_wm_utils import set_seed_everywhere
+from helpers.interop import extract_state
+from helpers.ogbench_methods import OGBenchMethods
+from train_sac_wm import load_config, build_agent_config
 
 OBS_KEY = 'state'
 ACTION_KEY = 'action'
@@ -51,7 +54,7 @@ def run_eval(env, policy, n_episodes, tag, bridge=None, action_dim=None, seed=0)
                     enc_carry, dyn_carry, state, prevact, is_first)
                 # JAX blocks implicit device-to-host transfers, so np.asarray
                 # on a device array raises. Same explicit device_get that
-                # evaluation.py and train_joint.py use.
+                # evaluation.py and train_sac_wm.py use.
                 feat_np = np.asarray(jax.device_get(feat_j))[0].copy()
 
             action = policy.act(feat_np, step=0, eval_mode=True)
@@ -85,7 +88,7 @@ def run_eval(env, policy, n_episodes, tag, bridge=None, action_dim=None, seed=0)
 
 
 def load_sac_only(ckpt, env, config, device):
-    sac = config.train_joint.sac
+    sac = config.train_sac_wm.sac
     policy = SACWorldModelAgent(
         repr_dim=env.observation_space.shape[0],
         action_shape=(env.action_space.shape[0],), device=device,
@@ -112,7 +115,7 @@ def load_wm_sac(sac_ckpt, wm_ckpt, env, config, device):
 
     rssm = agent_config.dyn.rssm
     feat_dim = int(rssm.deter + rssm.stoch * rssm.classes)
-    sac = config.train_joint.sac
+    sac = config.train_sac_wm.sac
     policy = SACWorldModelAgent(
         repr_dim=feat_dim, action_shape=(action_dim,), device=device,
         lr=sac.lr, feature_dim=sac.feature_dim, hidden_dim=sac.hidden_dim,
@@ -151,19 +154,19 @@ def main():
     ap.add_argument('--sac_ckpt', type=str,
                     default='train_sac_out/sac_final.pt')
     ap.add_argument('--joint_sac_ckpt', type=str,
-                    default='train_joint_out/sac_final.pt')
+                    default='train_sac_wm_out/sac_final.pt')
     ap.add_argument('--joint_wm_ckpt', type=str,
-                    default='train_joint_out/wm_latest.pkl')
+                    default='train_sac_wm_out/wm_latest.pkl')
     ap.add_argument('--episodes', type=int, default=500)
     ap.add_argument('--seed', type=int, default=12345)
     args = ap.parse_args()
 
-    folder = pathlib.Path(__file__).parent
+    folder = pathlib.Path(__file__).resolve().parents[1] # configs.yaml lives at the repo root
     config = load_config(folder, argv=[])
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     set_seed_everywhere(args.seed)
 
-    env, _, _ = OGBenchMethods.load_ogbench(config.train_joint.general.env_name)
+    env, _, _ = OGBenchMethods.load_ogbench(config.train_sac_wm.general.env_name)
     action_dim = env.action_space.shape[0]
     n = args.episodes
 

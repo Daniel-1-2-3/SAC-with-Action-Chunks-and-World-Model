@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from sac_wm_utils import soft_update_params, weight_init
+from helpers.sac_wm_utils import soft_update_params, weight_init
 
 # SB3's exact bounds (stable_baselines3/sac/policies.py)
 LOG_STD_MIN = -20

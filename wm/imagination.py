@@ -1,6 +1,6 @@
 import torch
-from sac_wm_agent import sample_squashed
-from interop import jax_to_torch
+from sac.sac_wm_agent import sample_squashed
+from helpers.interop import jax_to_torch
 
 def imagine_rollout(bridge, sac_agent, seed_carry, horizon, device, gamma, global_step,
                     reward_shift=0.0):

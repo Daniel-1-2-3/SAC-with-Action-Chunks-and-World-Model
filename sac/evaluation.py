@@ -1,6 +1,6 @@
 import jax
 import numpy as np
-from interop import extract_state
+from helpers.interop import extract_state
 
 def eval_in_env(env, bridge, policy, action_dim, num_episodes, device, obs_key, record_video=False):
     returns, successes = [], []

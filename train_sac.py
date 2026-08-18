@@ -9,10 +9,10 @@ import torch
 import wandb
 import ogbench
 
-from sac_wm_agent import SACWorldModelAgent, sample_squashed
-from sac_wm_utils import set_seed_everywhere
-from interop import numeric_metrics, extract_state
-from ogbench_methods import OGBenchMethods
+from sac.sac_wm_agent import SACWorldModelAgent, sample_squashed
+from helpers.sac_wm_utils import set_seed_everywhere
+from helpers.interop import numeric_metrics, extract_state
+from helpers.ogbench_methods import OGBenchMethods
 
 OBS_KEY = 'state'
 # Joint actions take [-1, 1]
@@ -46,7 +46,7 @@ def _prefixed(d, default_prefix):
     """ Prefix every key with default_prefix, EXCEPT keys that already
         carry their own namespace (e.g. 'diagnosis/critic_grad_norm')
         -- those pass through unprefixed so they land in their own
-        wandb tab. Same helper as train_joint.py so the two runs'
+        wandb tab. Same helper as train_sac_wm.py so the two runs'
         charts overlay directly. """
     return {k if '/' in k else f'{default_prefix}/{k}': v for k, v in d.items()}
 
@@ -54,7 +54,7 @@ class TransitionReplay:
     """ Flat (s, a, r, s', not_done) ring buffer.
 
         Deliberately NOT the episode-based OnlineReplay used by
-        train_joint.py: that one preserves contiguous time because the RSSM
+        train_sac_wm.py: that one preserves contiguous time because the RSSM
         needs 64-step sequences to roll its recurrent state forward. Classic
         SAC bootstraps one step at a time, so it only ever needs independent
         transitions and can sample them uniformly at random. """
@@ -69,7 +69,7 @@ class TransitionReplay:
         self.idx = 0
         self.full = False
         # Success bookkeeping for reporting only -- mirrors the
-        # replay/success_frac_* metrics train_joint.py logs, so the baseline
+        # replay/success_frac_* metrics train_sac_wm.py logs, so the baseline
         # and the world-model run can be compared on the same axes.
         self.offline_episodes = 0
         self.offline_success = 0
@@ -163,7 +163,7 @@ def td_target(policy, reward, next_obs, not_done, gamma):
         Exactly ONE real reward enters -- r_t. Everything beyond s' reaches
         this target only through the critic's own existing estimate, never as
         summed reward values. That is the whole difference from the
-        lambda-returns train_joint.py uses over its imagined horizon, and it
+        lambda-returns train_sac_wm.py uses over its imagined horizon, and it
         is the point of this baseline. """
     next_mu, next_std = policy.actor(next_obs)
     next_action, next_log_prob = sample_squashed(next_mu, next_std)
@@ -223,7 +223,7 @@ def train(config):
     general_config, sac_config = config.train_sac.general, config.train_sac.sac
     # train_every=1 and batch_size=256 are SAC's standard settings and live
     # under train_sac.sac; every value there is deliberately kept equal
-    # to train_joint.sac so the two arms differ only where they must.
+    # to train_sac_wm.sac so the two arms differ only where they must.
     batch_size = sac_config.batch_size
     train_every = sac_config.train_every
 
@@ -292,7 +292,7 @@ def train(config):
 
         if len(replay) >= batch_size and global_step % train_every == 0:
             b_obs, b_act, b_rew, b_next, b_nd = replay.sample(batch_size, device, rng)
-            # Same {-1, 0} -> {0, +1} shift train_joint.py applies to its
+            # Same {-1, 0} -> {0, +1} shift train_sac_wm.py applies to its
             # imagined rewards, applied here to the real ones so the critic
             # in both runs sees the same reward scale.
             b_rew = b_rew + sac_config.reward_shift
@@ -301,7 +301,7 @@ def train(config):
 
             # Classic SAC weights every transition equally; the weights
             # argument exists only because the imagined rollouts in
-            # train_joint.py decay by cont probability over the horizon.
+            # train_sac_wm.py decay by cont probability over the horizon.
             weights = torch.ones_like(b_rew)
             metrics.update(_prefixed(policy.update_critic(b_obs, b_act, targets, weights), 'sac'))
             metrics.update(_prefixed(policy.update_actor(b_obs, weights), 'sac'))

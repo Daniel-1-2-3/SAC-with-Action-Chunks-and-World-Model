@@ -1,6 +1,6 @@
 import collections
 import numpy as np
-from ogbench_methods import OGBenchMethods
+from helpers.ogbench_methods import OGBenchMethods
 
 class OnlineReplay:
     def __init__(self, obs_key='state', action_key='action', max_episodes=2000,

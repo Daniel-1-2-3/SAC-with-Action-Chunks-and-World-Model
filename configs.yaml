@@ -52,7 +52,7 @@ defaults:
     report: True
     report_gradnorms: False
 
-  train_joint:
+  train_sac_wm:
 
     general:
       env_name: cube-single-play-singletask-v0
@@ -64,7 +64,7 @@ defaults:
       save_every: 10000
       eval_every: 10000
       eval_episodes: 10
-      out_dir: train_joint_out
+      out_dir: train_sac_wm_out
       wandb_project: world-model-sac
       wandb_mode: online
 
@@ -86,7 +86,7 @@ defaults:
       init_ent_coef: 1.0
 
   # Baseline arm. Keep every value below that also appears under
-  # train_joint.sac IDENTICAL to it -- gamma, reward_shift, lr, feature_dim,
+  # train_sac_wm.sac IDENTICAL to it -- gamma, reward_shift, lr, feature_dim,
   # hidden_dim, critic_target_tau, init_ent_coef are shared by design and the
   # comparison stops being controlled the moment one side is tuned alone.
   # train_every and batch_size are the exceptions: those are legitimately
@@ -117,3 +117,98 @@ defaults:
       hidden_dim: 256
       critic_target_tau: 0.005
       init_ent_coef: 1.0
+
+  # ---------------------------------------------------------------------
+  # Action-chunked arms. Same rule as above: every key that appears in BOTH
+  # train_sac_chunked_wm.chunk and train_sac_chunked.chunk must hold the same
+  # value. chunk_len, ensemble, bc_alpha, flow_steps and normalize_q define
+  # the policy, and the policy is the controlled variable -- the only thing
+  # that is allowed to differ between the two arms is whether a world model
+  # exists. train_every, batch_size and imagination_batch are the exceptions,
+  # since the two arms genuinely draw their training data differently.
+  # ---------------------------------------------------------------------
+
+  train_sac_chunked_wm:
+
+    general:
+      env_name: cube-double-play-singletask-v0
+      wm_ckpt: ''
+      seed_from_offline: True
+      num_seed_steps: 4000
+      num_train_steps: 500000
+      log_every: 100
+      save_every: 10000
+      eval_every: 10000
+      eval_episodes: 20
+      out_dir: train_sac_chunked_wm_out
+      wandb_project: world-model-chunk
+      wandb_mode: online
+
+    dreamer:
+      train_every: 1
+      max_episodes: 2000
+
+    chunk:
+      chunk_len: 5
+      # chunk_len * num_chunks = 15 imagined environment steps, the same depth
+      # the single-step run was verified at. Raising num_chunks to 15 would
+      # ask the model to hallucinate 75 steps ahead.
+      num_chunks: 3
+      # 4x the single-step imagination_batch, to partly offset getting 3
+      # critic examples per rollout instead of 15. Drop this first if the
+      # rollout becomes the bottleneck.
+      imagination_batch: 4096
+      train_every: 5
+      gamma: 0.99
+      lam: 0.95
+      reward_shift: 1.0
+      lr: 3e-4
+      feature_dim: 512
+      hidden_dim: 256
+      critic_target_tau: 0.005
+      ensemble: 10
+      # QC-FQL's behavior regularization coefficient for the cube domains.
+      # This is THE hyperparameter of the method: too low and the chunk
+      # collapses to open-loop noise, too high and the critic cannot improve
+      # on the demonstrations. Sweep {100, 300, 1000} before anything else.
+      bc_alpha: 300.0
+      bc_batch: 1024
+      flow_steps: 10
+      normalize_q: True
+      # Slice of the observation holding end-effector xyz, used for the
+      # temporal-coherence metric. VERIFY THIS against the actual OGBench
+      # observation layout before trusting the coherence numbers -- a wrong
+      # slice produces a plausible-looking but meaningless curve.
+      eef_slice: [0, 3]
+
+  train_sac_chunked:
+
+    general:
+      env_name: cube-double-play-singletask-v0
+      seed_from_offline: True
+      num_seed_steps: 4000
+      num_train_steps: 500000
+      log_every: 100
+      save_every: 10000
+      eval_every: 10000
+      eval_episodes: 20
+      out_dir: train_sac_chunked_out
+      wandb_project: world-model-chunk
+      wandb_mode: online
+
+    chunk:
+      chunk_len: 5
+      train_every: 1
+      batch_size: 256
+      replay_capacity: 1000000
+      gamma: 0.99
+      reward_shift: 1.0
+      lr: 3e-4
+      feature_dim: 512
+      hidden_dim: 256
+      critic_target_tau: 0.005
+      ensemble: 10
+      bc_alpha: 300.0
+      flow_steps: 10
+      normalize_q: True
+      eef_slice: [0, 3]

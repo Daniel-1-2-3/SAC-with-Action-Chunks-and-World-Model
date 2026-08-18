@@ -13,11 +13,14 @@ For each rollout, saves:
 
 Usage:
     python check_rollout_animation.py \
-        --wm_ckpt train_joint_out/wm_latest.pkl \
+        --wm_ckpt train_sac_wm_out/wm_latest.pkl \
         --horizon 30 \
         --n_seeds 3 \
         --out_dir rollout_check
 """
+
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1])) # run from anywhere: put the repo root on the path
 
 import os
 os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
@@ -37,8 +40,8 @@ import cv2
 
 from dreamer.wm_agent import WorldModelAgent
 from dreamer.wm_bridge import WorldModelBridge
-from interop import unwrap
-from ogbench_methods import OGBenchMethods
+from helpers.interop import unwrap
+from helpers.ogbench_methods import OGBenchMethods
 
 OBS_KEY = 'state'
 ACTION_KEY = 'action'
@@ -185,12 +188,12 @@ def main():
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    folder = pathlib.Path(__file__).parent
+    folder = pathlib.Path(__file__).resolve().parents[1] # configs.yaml lives at the repo root
     config = load_config(folder)
 
     print('Loading environment + offline dataset...')
     env, train_dataset, _ = OGBenchMethods.load_ogbench(
-        config.train_joint.general.env_name)
+        config.train_sac_wm.general.env_name)
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     obs_space, act_space = OGBenchMethods.make_spaces(

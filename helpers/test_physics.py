@@ -1,6 +1,9 @@
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1])) # run from anywhere: put the repo root on the path
+
 import numpy as np
 import cv2
-from ogbench_methods import OGBenchMethods
+from helpers.ogbench_methods import OGBenchMethods
 
 ENV_NAME = 'cube-single-play-singletask-v0'
 CUBE_HINTS = ('cube', 'block', 'object', 'obj')

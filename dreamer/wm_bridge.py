@@ -3,7 +3,7 @@
 import jax
 import numpy as np
 import ninjax as nj
-from interop import flatten_leading_two_dims_np
+from helpers.interop import flatten_leading_two_dims_np
 from embodied.embodied.jax import transform
 
 class WorldModelBridge:
