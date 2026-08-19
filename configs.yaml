@@ -181,7 +181,7 @@ defaults:
       # temporal-coherence metric. VERIFY THIS against the actual OGBench
       # observation layout before trusting the coherence numbers -- a wrong
       # slice produces a plausible-looking but meaningless curve.
-      eef_slice: [0, 3]
+      eef_slice: [12, 15]
 
   train_sac_chunked:
 
@@ -215,4 +215,4 @@ defaults:
       bc_alpha: 300.0
       flow_steps: 10
       normalize_q: True
-      eef_slice: [0, 3]
+      eef_slice: [12, 15]

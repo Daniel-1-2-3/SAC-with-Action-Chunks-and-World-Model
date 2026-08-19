@@ -123,6 +123,7 @@ def train(config):
         ensemble=chunk_config.ensemble, bc_alpha=chunk_config.bc_alpha,
         normalize_q=chunk_config.normalize_q,
     )
+    print(f'BC ALPHA IN AGENT: {policy.bc_alpha}')
     flow_bc = FlowBC(
         repr_dim=feat_dim, chunk_dim=action_dim * chunk_len, device=device,
         lr=chunk_config.lr, feature_dim=chunk_config.feature_dim,
