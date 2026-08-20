@@ -165,7 +165,14 @@ class ChunkAgent:
 
         bc_chunk = flow_bc.sample(feat, z)
         bc_term = (weight * ((chunk - bc_chunk) ** 2).mean(-1, keepdim=True)).sum() / wsum
-        actor_loss = q_term + self.bc_alpha * bc_term
+        # Dividing by (1 + alpha) leaves the BC-to-Q influence ratio at exactly
+        # alpha:1 -- the tuning knob is unchanged -- but keeps the loss scale
+        # near O(1) for every alpha. Without this the gradient norm at alpha in
+        # the hundreds is far above GRAD_CLIP_NORM, so clip_grad_norm_ rescales
+        # every update back to the same magnitude and alpha stops having any
+        # effect at all. Clipping should catch spikes, not silently undo the
+        # hyperparameter being swept.
+        actor_loss = (q_term + self.bc_alpha * bc_term) / (1.0 + self.bc_alpha)
 
         self.actor_opt.zero_grad(set_to_none=True)
         actor_loss.backward()
@@ -175,6 +182,14 @@ class ChunkAgent:
         metrics['actor_loss'] = actor_loss.item()
         metrics['actor_q_term'] = q_term.item()
         metrics['actor_bc_term'] = bc_term.item()
+        # Fraction of the actor loss coming from the behavior constraint. This
+        # is the number to sweep against: near 1.0 the policy is pure imitation
+        # and the critic cannot improve on the data, near 0.0 the chunk is
+        # unconstrained. Note bc_term shrinks over training while the
+        # normalized q_term stays O(1), so this share drifts down on its own --
+        # read it late in the run, not at step 0.
+        _bc = self.bc_alpha * bc_term.detach()
+        metrics['diagnosis/actor_bc_share'] = (_bc / (q_term.detach().abs() + _bc).clamp_min(1e-8)).item()
         metrics['diagnosis/actor_grad_norm'] = actor_grad_norm.item()
         metrics['diagnosis/actor_chunk_abs_mean'] = chunk.detach().abs().mean().item()
         metrics['diagnosis/actor_chunk_sat_frac'] = (chunk.detach().abs() > 0.95).float().mean().item()
