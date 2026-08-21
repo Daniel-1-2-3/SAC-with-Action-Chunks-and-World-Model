@@ -126,6 +126,14 @@ defaults:
   # that is allowed to differ between the two arms is whether a world model
   # exists. train_every, batch_size and imagination_batch are the exceptions,
   # since the two arms genuinely draw their training data differently.
+  #
+  # SETTLED (Aug 2026) -- these were tuned the hard way, don't re-litigate:
+  #   normalize_q: False   pinning q_term at 1.0 killed the first cube-double
+  #                        run outright; see the note below
+  #   hidden_dim:  512     the QC paper's width; 256 was inherited by accident
+  #   bc_alpha:    300     swept {30,100,300,1000}; 0 breaks training entirely
+  #   eef_slice:   [12,15] measured on both cube-single and cube-double
+  # Only reward_shift needs changing when you change env_name.
   # ---------------------------------------------------------------------
 
   train_sac_chunked_wm:
@@ -150,37 +158,47 @@ defaults:
 
     chunk:
       chunk_len: 5
-      # chunk_len * num_chunks = 15 imagined environment steps, the same depth
-      # the single-step run was verified at. Raising num_chunks to 15 would
-      # ask the model to hallucinate 75 steps ahead.
+      # chunk_len * num_chunks = imagined environment steps. 3 keeps it at 15,
+      # the depth the world model was verified at. Raising num_chunks deepens
+      # the critic's lookahead but asks the model to hallucinate further.
       num_chunks: 3
       # 4x the single-step imagination_batch, to partly offset getting 3
       # critic examples per rollout instead of 15. Drop this first if the
-      # rollout becomes the bottleneck.
+      # rollout becomes the bottleneck. Measured cheap: batch 4096 costs only
+      # ~5% more wall-clock than 256, because the rollout is launch-bound.
       imagination_batch: 4096
       train_every: 5
       gamma: 0.99
       lam: 0.95
-      # = number of cubes in the task (double 2.0, triple 3.0, quadruple 4.0).
-      # Shifts reward from {-n..0} to {0..+n}. Change it with env_name.
+      # MUST equal the number of cubes in env_name -- single 1.0, double 2.0,
+      # triple 3.0, quadruple 4.0. Shifts reward from {-n..0} to {0..+n} so a
+      # zero-initialized critic starts at the right baseline. Getting this
+      # wrong does not error; it silently hands the agent free reward.
       reward_shift: 2.0
       lr: 3e-4
       feature_dim: 512
-      hidden_dim: 256
+      hidden_dim: 512
       critic_target_tau: 0.005
       ensemble: 10
-      # QC-FQL's behavior regularization coefficient for the cube domains.
-      # This is THE hyperparameter of the method: too low and the chunk
-      # collapses to open-loop noise, too high and the critic cannot improve
-      # on the demonstrations. Sweep {100, 300, 1000} before anything else.
+      # Swept {30,100,300,1000} on cube-double, judged by
+      # diagnosis/actor_bc_share: 300 puts the constraint at ~0.74 of the
+      # actor loss at 10k, and is also the QC paper's value for the cube
+      # domains. bc_alpha: 0 breaks training outright -- the behavior
+      # constraint is load-bearing, matching the paper's RLPD-AC ablation.
       bc_alpha: 300.0
       bc_batch: 1024
       flow_steps: 10
-      normalize_q: True
-      # Slice of the observation holding end-effector xyz, used for the
-      # temporal-coherence metric. VERIFY THIS against the actual OGBench
-      # observation layout before trusting the coherence numbers -- a wrong
-      # slice produces a plausible-looking but meaningless curve.
+      # KEEP FALSE. Normalizing q_term to 1.0 is not in the QC paper and it
+      # sank the first cube-double run: it freezes the critic's magnitude
+      # while bc_term decays quadratically, so the behavior constraint loses
+      # influence on its own and the policy shrinks its motions -- coherence
+      # fell 0.35 -> 0.15 and there were zero successes in 500k. With it off,
+      # the same config reaches ~-680 return and produces completions.
+      normalize_q: False
+      # End-effector xyz, for the temporal-coherence metric. Measured with
+      # helpers/find_eef_slice.py: dims 12/13/14 on BOTH cube-single (28-dim)
+      # and cube-double (37-dim) -- arm state leads the observation and extra
+      # cubes are appended after it.
       eef_slice: [12, 15]
 
   train_sac_chunked:
@@ -204,15 +222,14 @@ defaults:
       batch_size: 256
       replay_capacity: 1000000
       gamma: 0.99
-      # = number of cubes in the task (double 2.0, triple 3.0, quadruple 4.0).
-      # Shifts reward from {-n..0} to {0..+n}. Change it with env_name.
+      # Must match train_sac_chunked_wm.chunk.reward_shift and the cube count.
       reward_shift: 2.0
       lr: 3e-4
       feature_dim: 512
-      hidden_dim: 256
+      hidden_dim: 512
       critic_target_tau: 0.005
       ensemble: 10
       bc_alpha: 300.0
       flow_steps: 10
-      normalize_q: True
+      normalize_q: False # see the note under train_sac_chunked_wm.chunk
       eef_slice: [12, 15]
