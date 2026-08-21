@@ -185,7 +185,7 @@ defaults:
       # actor loss at 10k, and is also the QC paper's value for the cube
       # domains. bc_alpha: 0 breaks training outright -- the behavior
       # constraint is load-bearing, matching the paper's RLPD-AC ablation.
-      bc_alpha: 300.0
+      bc_alpha: 0.0
       bc_batch: 1024
       flow_steps: 10
       # KEEP FALSE. Normalizing q_term to 1.0 is not in the QC paper and it
@@ -229,7 +229,7 @@ defaults:
       hidden_dim: 512
       critic_target_tau: 0.005
       ensemble: 10
-      bc_alpha: 300.0
+      bc_alpha: 0.0
       flow_steps: 10
       normalize_q: False # see the note under train_sac_chunked_wm.chunk
       eef_slice: [12, 15]
