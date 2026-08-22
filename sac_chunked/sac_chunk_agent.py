@@ -1,83 +1,97 @@
 import torch
 import torch.nn as nn
-from helpers.sac_wm_utils import soft_update_params, weight_init
 
-GRAD_CLIP_NORM = 10.0
+def build_mlp(in_dim, hidden_dim, num_layers, out_dim, layer_norm):
+    """ utils/networks.py MLP. Dense -> activation -> LayerNorm per hidden
+        layer, activation is gelu, no activation on the output layer. """
+    layers = []
+    d = in_dim
+    for _ in range(num_layers):
+        layers.append(nn.Linear(d, hidden_dim))
+        layers.append(nn.GELU())
+        if layer_norm:
+            layers.append(nn.LayerNorm(hidden_dim))
+        d = hidden_dim
+    layers.append(nn.Linear(d, out_dim))
+    return nn.Sequential(*layers)
 
-class ChunkActor(nn.Module):
-    """ Noise-conditioned chunk policy: one noise vector in, the whole chunk
-        out in a single forward pass.
+class ActorVectorField(nn.Module):
+    """ utils/networks.py ActorVectorField. Used for BOTH flow networks:
+        actor_bc_flow takes a time argument, actor_onestep_flow does not.
 
-        The randomness is an INPUT, not something added to the output. That is
-        the difference that makes chunks coherent: with a per-dimension
-        Gaussian head, each of the chunk_len actions gets its own independent
-        draw and the arm shakes; here the network sees the whole draw at once
-        and can spend it on a single consistent motion.
+        No output squashing. QC clips to [-1, 1] at the call site instead,
+        and the distillation loss is computed on the UNCLIPPED output. """
 
-        There is no log_std, no log_prob and no entropy coefficient. Nothing
-        downstream of this class needs them. The unbounded pre-tanh mean that
-        MU_CLIP / MU_REG existed to contain also cannot arise, because the
-        distillation term in update_actor is a direct opposing force on the
-        output. """
-
-    def __init__(self, repr_dim, chunk_dim, feature_dim, hidden_dim):
+    def __init__(self, repr_dim, chunk_dim, hidden_dim, num_layers, layer_norm, with_time):
         super().__init__()
-        self.trunk = nn.Sequential(
-            nn.Linear(repr_dim, feature_dim), nn.LayerNorm(feature_dim), nn.Tanh())
-        self.net = nn.Sequential(
-            nn.Linear(feature_dim + chunk_dim, hidden_dim), nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, chunk_dim))
-        self.apply(weight_init)
+        in_dim = repr_dim + chunk_dim + (1 if with_time else 0)
+        self.with_time = with_time
+        self.mlp = build_mlp(in_dim, hidden_dim, num_layers, chunk_dim, layer_norm)
 
-    def forward(self, feat, z):
-        h = self.trunk(feat)
-        return torch.tanh(self.net(torch.cat([h, z], dim=-1)))
+    def forward(self, feat, chunk, t=None):
+        if self.with_time:
+            return self.mlp(torch.cat([feat, chunk, t], dim=-1))
+        return self.mlp(torch.cat([feat, chunk], dim=-1))
 
 class ChunkCritic(nn.Module):
-    """ Scores a whole chunk: Q(feat, a_t ... a_t+h-1). Returns all ensemble
-        members stacked as (ensemble, batch, 1). """
+    """ utils/networks.py Value with num_ensembles=num_qs, layer_norm=True.
+        Returns all ensemble members stacked as (ensemble, batch, 1). """
 
-    def __init__(self, repr_dim, chunk_dim, feature_dim, hidden_dim, ensemble):
+    def __init__(self, repr_dim, chunk_dim, hidden_dim, num_layers, ensemble, layer_norm=True):
         super().__init__()
-        self.trunk = nn.Sequential(
-            nn.Linear(repr_dim, feature_dim), nn.LayerNorm(feature_dim), nn.Tanh())
         self.qs = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(feature_dim + chunk_dim, hidden_dim), nn.ReLU(inplace=True),
-                nn.Linear(hidden_dim, hidden_dim), nn.ReLU(inplace=True),
-                nn.Linear(hidden_dim, 1))
+            build_mlp(repr_dim + chunk_dim, hidden_dim, num_layers, 1, layer_norm)
             for _ in range(ensemble)])
-        self.apply(weight_init)
 
     def forward(self, feat, chunk):
-        h = torch.cat([self.trunk(feat), chunk], dim=-1)
+        h = torch.cat([feat, chunk], dim=-1)
         return torch.stack([q(h) for q in self.qs], dim=0)
 
 class ChunkAgent:
-    """ Action-chunked off-policy actor-critic, QC-FQL style. Shared by both
-        arms of the comparison: the world-model arm feeds it RSSM features and
-        imagined chunk transitions, the baseline arm feeds it raw observations
-        and real chunk transitions from replay. Everything below is identical
-        across the two, which is what keeps the comparison controlled. """
+    """ QC-FQL: action-chunked Flow Q-learning, ported from
+        github.com/ColinQiyangLi/qc agents/acfql.py (actor_type=distill-ddpg).
 
-    def __init__(self, repr_dim, action_dim, chunk_len, device, lr, feature_dim,
-                 hidden_dim, critic_target_tau, ensemble=10, bc_alpha=300.0,
-                 normalize_q=True):
+        Three networks. actor_bc_flow is a rectified-flow velocity field that
+        models the behavior distribution over chunks. actor_onestep_flow maps
+        a noise vector to a chunk in one pass and is distilled against it.
+        The critic scores whole chunks.
+
+        Both flow networks share one optimizer and one loss, exactly as the
+        reference does -- there is no separate behavior-model update step.
+
+        Shared by both arms of the comparison: the world-model arm feeds RSSM
+        features and imagined chunk transitions, the baseline arm feeds raw
+        observations and real chunk transitions from replay. """
+
+    def __init__(self, repr_dim, action_dim, chunk_len, device, lr, hidden_dim,
+                 num_layers, critic_target_tau, ensemble=2, alpha=300.0,
+                 flow_steps=10, q_agg='mean', actor_layer_norm=False,
+                 critic_layer_norm=True):
         self.device = device
         self.action_dim = action_dim
         self.chunk_len = chunk_len
         self.chunk_dim = action_dim * chunk_len
         self.critic_target_tau = critic_target_tau
-        self.bc_alpha = bc_alpha
-        self.normalize_q = normalize_q
+        self.alpha = alpha
+        self.flow_steps = flow_steps
+        self.q_agg = q_agg
 
-        self.actor = ChunkActor(repr_dim, self.chunk_dim, feature_dim, hidden_dim).to(device)
-        self.critic = ChunkCritic(repr_dim, self.chunk_dim, feature_dim, hidden_dim, ensemble).to(device)
-        self.critic_target = ChunkCritic(repr_dim, self.chunk_dim, feature_dim, hidden_dim, ensemble).to(device)
+        self.actor_bc_flow = ActorVectorField(
+            repr_dim, self.chunk_dim, hidden_dim, num_layers, actor_layer_norm, with_time=True).to(device)
+        self.actor_onestep_flow = ActorVectorField(
+            repr_dim, self.chunk_dim, hidden_dim, num_layers, actor_layer_norm, with_time=False).to(device)
+        self.critic = ChunkCritic(
+            repr_dim, self.chunk_dim, hidden_dim, num_layers, ensemble, critic_layer_norm).to(device)
+        self.critic_target = ChunkCritic(
+            repr_dim, self.chunk_dim, hidden_dim, num_layers, ensemble, critic_layer_norm).to(device)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=lr)
+        # One optimizer over both flow networks, matching the reference's
+        # single ModuleDict + single optax.adam. No gradient clipping: QC uses
+        # plain adam, and a clip on a loss scaled by alpha silently rescales
+        # every update back to the same magnitude, cancelling alpha entirely.
+        self.actor_opt = torch.optim.Adam(
+            list(self.actor_bc_flow.parameters()) + list(self.actor_onestep_flow.parameters()), lr=lr)
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr)
 
         self.train()
@@ -85,145 +99,175 @@ class ChunkAgent:
 
     def train(self, training=True):
         self.training = training
-        self.actor.train(training)
+        self.actor_bc_flow.train(training)
+        self.actor_onestep_flow.train(training)
         self.critic.train(training)
 
     def noise(self, batch):
         return torch.randn(batch, self.chunk_dim, device=self.device)
 
+    def _agg(self, qs):
+        return qs.min(0).values if self.q_agg == 'min' else qs.mean(0)
+
+    def sample_chunk(self, feat, noises=None):
+        """ acfql.sample_actions for actor_type='distill-ddpg': one forward
+            pass through the one-step policy, then clip. """
+        if noises is None:
+            noises = self.noise(feat.shape[0])
+        return torch.clamp(self.actor_onestep_flow(feat, noises), -1.0, 1.0)
+
+    @torch.no_grad()
+    def compute_flow_actions(self, feat, noises):
+        """ acfql.compute_flow_actions: Euler integration of the behavior flow
+            from noise to a chunk. Note the reference divides the velocity by
+            flow_steps -- the paper's Algorithm 1 writes a bare assignment and
+            drops the step size, so the code is right and the paper is not.
+            Clipping happens once at the end, not per step. """
+        chunk = noises
+        for i in range(self.flow_steps):
+            t = torch.full((chunk.shape[0], 1), i / self.flow_steps,
+                           device=chunk.device, dtype=chunk.dtype)
+            chunk = chunk + self.actor_bc_flow(feat, chunk, t) / self.flow_steps
+        return torch.clamp(chunk, -1.0, 1.0)
+
     @torch.no_grad()
     def act(self, feat, eval_mode, step=None):
         """ feat: (repr_dim,) numpy array. Returns (chunk_len, action_dim).
 
-            Eval uses z = 0, the noise-conditioned analogue of taking the mean
-            of a Gaussian policy. """
+            eval_mode is ignored. The one-step policy is a noise-to-chunk map
+            with no meaningful mean to take -- feeding it zeros would be off
+            distribution. The reference samples noise for evaluation too
+            (evaluation.py calls the same sample_actions). """
         feat_t = torch.as_tensor(feat, device=self.device).float().unsqueeze(0)
-        z = torch.zeros(1, self.chunk_dim, device=self.device) if eval_mode else self.noise(1)
-        chunk = self.actor(feat_t, z)
+        chunk = self.sample_chunk(feat_t)
         return chunk.cpu().numpy()[0].reshape(self.chunk_len, self.action_dim)
 
     @torch.no_grad()
     def chunk_target_values(self, next_feats):
-        """ Value at a chunk boundary: the target critic's score for the chunk
-            the current actor would take from there.
-
-            The ensemble is averaged rather than min-reduced, matching the
-            critic loss in the QC-FQL paper. With 10 members a min would be
-            severely pessimistic. """
-        z = self.noise(next_feats.shape[0])
-        next_chunk = self.actor(next_feats, z)
-        return self.critic_target(next_feats, next_chunk).mean(0)
+        """ Value at a chunk boundary: target critic scored on the chunk the
+            one-step policy would take from there, aggregated with q_agg
+            ('mean' in the reference, for every agent including its SAC one). """
+        next_chunk = self.sample_chunk(next_feats)
+        return self._agg(self.critic_target(next_feats, next_chunk))
 
     def update_critic(self, feat, chunk, target_Q, weight):
+        """ acfql.critic_loss. weight is `valid` for the replay arm and the
+            imagined survival weight for the world-model arm. The reference
+            multiplies by the mask and takes a plain mean -- it does NOT
+            renormalize by the mask's sum. """
         metrics = {}
         target_Q = target_Q.detach()
 
         qs = self.critic(feat, chunk)
-        wsum = weight.sum().clamp_min(1e-6)
-        critic_loss = sum(
-            (weight * (q - target_Q) ** 2).sum() / wsum for q in qs)
+        critic_loss = sum((weight * (q - target_Q) ** 2).mean() for q in qs)
 
         self.critic_opt.zero_grad(set_to_none=True)
         critic_loss.backward()
-        critic_grad_norm = torch.nn.utils.clip_grad_norm_(self.critic.parameters(), GRAD_CLIP_NORM)
         self.critic_opt.step()
 
         q_mean = qs.mean(0)
         metrics['critic_loss'] = critic_loss.item()
         metrics['critic_target_q'] = target_Q.mean().item()
         metrics['critic_q'] = q_mean.mean().item()
-        metrics['diagnosis/critic_grad_norm'] = critic_grad_norm.item()
-        metrics['diagnosis/critic_q_std'] = q_mean.std().item()
+        metrics['diagnosis/critic_q_max'] = q_mean.max().item()
+        metrics['diagnosis/critic_q_min'] = q_mean.min().item()
         metrics['diagnosis/critic_ensemble_spread'] = qs.std(0).mean().item()
-        metrics['diagnosis/critic_target_q_min'] = target_Q.min().item()
-        metrics['diagnosis/critic_target_q_max'] = target_Q.max().item()
         metrics['diagnosis/critic_target_q_range'] = (target_Q.max() - target_Q.min()).item()
         return metrics
 
-    def update_actor(self, feat, weight, flow_bc):
-        """ Two terms:
-              -Q(feat, chunk)                       push toward high value
-              alpha * ||chunk - flow_chunk||^2      stay near real behavior
+    def update_actor(self, feat, weight, bc_feat, bc_chunk, bc_valid=None):
+        """ acfql.actor_loss:
 
-            Both the actor and the flow model are given the SAME z. Without
-            that, the second term would pull the actor toward the average of
-            every valid motion, and the average of "reach left" and "reach
-            right" is a motion that does neither. Sharing z asks instead: for
-            this particular draw, what would the behavior model have done? """
+              actor_loss = bc_flow_loss + alpha * distill_loss + q_loss
+
+            One backward, one optimizer step, both flow networks. No division
+            by (1 + alpha) and no gradient clipping -- the reference has
+            neither, and those two were only ever cancelling each other.
+
+            feat drives the distillation and Q terms; bc_feat / bc_chunk drive
+            the flow-matching term. In the baseline arm they are the same
+            batch, exactly as the reference. In the world-model arm feat is
+            imagined and bc_feat is real latents, because imagined chunks are
+            not behavior data. """
         metrics = {}
-        z = self.noise(feat.shape[0])
-        chunk = self.actor(feat, z)
 
-        q = self.critic(feat, chunk).mean(0)
-        wsum = weight.sum().clamp_min(1e-6)
-        q_term = (weight * (-q)).sum() / wsum
-        # Dividing by |Q| keeps alpha comparable across reward scales and
-        # across training, so a value tuned early does not silently become
-        # weak once Q grows.
-        if self.normalize_q:
-            q_term = q_term / q.abs().mean().detach().clamp_min(1e-6)
+        # BC flow loss: interpolate noise -> real chunk at a random time and
+        # predict the straight-line velocity.
+        z0 = torch.randn_like(bc_chunk)
+        t = torch.rand(bc_chunk.shape[0], 1, device=bc_chunk.device, dtype=bc_chunk.dtype)
+        x_t = (1.0 - t) * z0 + t * bc_chunk
+        vel = bc_chunk - z0
+        pred = self.actor_bc_flow(bc_feat, x_t, t)
+        sq = (pred - vel) ** 2
+        if bc_valid is not None:
+            # Masked per position inside the chunk, then a plain mean over all
+            # elements including the masked ones -- not a masked mean.
+            sq = sq.reshape(-1, self.chunk_len, self.action_dim) * bc_valid[..., None]
+        bc_flow_loss = sq.mean()
 
-        bc_chunk = flow_bc.sample(feat, z)
-        bc_term = (weight * ((chunk - bc_chunk) ** 2).mean(-1, keepdim=True)).sum() / wsum
-        # Dividing by (1 + alpha) leaves the BC-to-Q influence ratio at exactly
-        # alpha:1 -- the tuning knob is unchanged -- but keeps the loss scale
-        # near O(1) for every alpha. Without this the gradient norm at alpha in
-        # the hundreds is far above GRAD_CLIP_NORM, so clip_grad_norm_ rescales
-        # every update back to the same magnitude and alpha stops having any
-        # effect at all. Clipping should catch spikes, not silently undo the
-        # hyperparameter being swept.
-        actor_loss = (q_term + self.bc_alpha * bc_term) / (1.0 + self.bc_alpha)
+        # Distillation: the same noise through the one-step policy and through
+        # the integrated behavior flow. The flow target is detached.
+        noises = self.noise(feat.shape[0])
+        target_flow_chunk = self.compute_flow_actions(feat, noises)
+        actor_chunk = self.actor_onestep_flow(feat, noises)
+        distill_loss = ((actor_chunk - target_flow_chunk) ** 2).mean()
+
+        # The Q term is computed on the CLIPPED chunk; the distillation term
+        # above is computed on the unclipped one.
+        clipped = torch.clamp(actor_chunk, -1.0, 1.0)
+        q = self._agg(self.critic(feat, clipped))
+        q_loss = -(weight * q).mean()
+
+        actor_loss = bc_flow_loss + self.alpha * distill_loss + q_loss
 
         self.actor_opt.zero_grad(set_to_none=True)
         actor_loss.backward()
-        actor_grad_norm = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), GRAD_CLIP_NORM)
         self.actor_opt.step()
 
         metrics['actor_loss'] = actor_loss.item()
-        metrics['actor_q_term'] = q_term.item()
-        metrics['actor_bc_term'] = bc_term.item()
-        # Fraction of the actor loss coming from the behavior constraint. This
-        # is the number to sweep against: near 1.0 the policy is pure imitation
-        # and the critic cannot improve on the data, near 0.0 the chunk is
-        # unconstrained. Note bc_term shrinks over training while the
-        # normalized q_term stays O(1), so this share drifts down on its own --
-        # read it late in the run, not at step 0.
-        _bc = self.bc_alpha * bc_term.detach()
-        metrics['diagnosis/actor_bc_share'] = (_bc / (q_term.detach().abs() + _bc).clamp_min(1e-8)).item()
-        metrics['diagnosis/actor_grad_norm'] = actor_grad_norm.item()
-        metrics['diagnosis/actor_chunk_abs_mean'] = chunk.detach().abs().mean().item()
-        metrics['diagnosis/actor_chunk_sat_frac'] = (chunk.detach().abs() > 0.95).float().mean().item()
-        metrics['diagnosis/actor_bc_gap'] = (chunk.detach() - bc_chunk).abs().mean().item()
+        metrics['bc_flow_loss'] = bc_flow_loss.item()
+        metrics['distill_loss'] = distill_loss.item()
+        metrics['actor_q_term'] = q_loss.item()
+        # Fraction of the actor loss coming from the behavior terms. Near 1.0
+        # the policy is pure imitation; a share that RISES over training is
+        # the signature of alpha set too high for this task's Q scale.
+        _bc = bc_flow_loss.detach() + self.alpha * distill_loss.detach()
+        metrics['diagnosis/actor_bc_share'] = (_bc / (q_loss.detach().abs() + _bc).clamp_min(1e-8)).item()
+        metrics['diagnosis/actor_chunk_abs_mean'] = clipped.detach().abs().mean().item()
+        metrics['diagnosis/actor_chunk_clip_frac'] = (actor_chunk.detach().abs() > 1.0).float().mean().item()
+        metrics['diagnosis/actor_bc_gap'] = (actor_chunk.detach() - target_flow_chunk).abs().mean().item()
         # Within-chunk jerk: mean absolute difference between consecutive
-        # actions inside a chunk. This is the direct readout of whether the
-        # chunk is a committed motion or open-loop noise, measured on the
-        # actor's own output rather than on the executed trajectory.
-        c = chunk.detach().reshape(-1, self.chunk_len, self.action_dim)
+        # actions inside a chunk. Direct readout of whether the chunk is a
+        # committed motion or open-loop noise.
+        c = clipped.detach().reshape(-1, self.chunk_len, self.action_dim)
         metrics['diagnosis/actor_intra_chunk_jerk'] = (c[:, 1:] - c[:, :-1]).abs().mean().item()
         return metrics
 
     @torch.no_grad()
     def chunk_diversity(self, feat, n_samples=8):
-        """ The failure mode Option A has instead of entropy collapse: the
-            actor learns to ignore z, every noise draw maps to the same chunk,
-            and exploration dies. Nothing auto-corrects this, so it has to be
-            watched. Trending toward zero means bc_alpha is too low. """
+        """ Spread across noise draws at the same state. The one-step policy
+            can in principle learn to ignore its noise input; the distillation
+            term against a multimodal flow model is what prevents it. Watch
+            this -- a trend toward zero means alpha is too low. """
         sub = feat[:min(256, feat.shape[0])]
-        chunks = torch.stack([
-            self.actor(sub, self.noise(sub.shape[0])) for _ in range(n_samples)], dim=0)
+        chunks = torch.stack([self.sample_chunk(sub) for _ in range(n_samples)], dim=0)
         return chunks.std(0).mean().item()
 
     def update_target(self):
-        soft_update_params(self.critic, self.critic_target, self.critic_target_tau)
+        with torch.no_grad():
+            for p, tp in zip(self.critic.parameters(), self.critic_target.parameters()):
+                tp.data.mul_(1.0 - self.critic_target_tau).add_(self.critic_target_tau * p.data)
 
     def state_dict_all(self):
         return {
-            'actor': self.actor.state_dict(),
+            'actor_bc_flow': self.actor_bc_flow.state_dict(),
+            'actor_onestep_flow': self.actor_onestep_flow.state_dict(),
             'critic': self.critic.state_dict(),
             'critic_target': self.critic_target.state_dict(),
         }
 
     def load_state_dict_all(self, state):
-        self.actor.load_state_dict(state['actor'])
+        self.actor_bc_flow.load_state_dict(state['actor_bc_flow'])
+        self.actor_onestep_flow.load_state_dict(state['actor_onestep_flow'])
         self.critic.load_state_dict(state['critic'])
         self.critic_target.load_state_dict(state['critic_target'])

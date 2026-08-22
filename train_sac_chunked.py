@@ -11,9 +11,8 @@ import wandb
 import ogbench
 
 from sac_chunked.sac_chunk_agent import ChunkAgent
-from sac_chunked.flow_bc import FlowBC
 from helpers.sac_wm_utils import set_seed_everywhere
-from sac_chunked.chunk_utils import pool_chunk_np
+from sac_chunked.chunk_utils import pool_chunk_np, step_valid_np
 from sac_chunked.evaluation_chunk import eval_chunk_in_env, EvalCSV
 from helpers.interop import numeric_metrics
 from helpers.ogbench_methods import OGBenchMethods
@@ -44,10 +43,9 @@ def _prefixed(d, default_prefix):
 class ChunkTransitionReplay:
     """ Flat ring buffer that can also serve chunk-level transitions.
 
-        Alongside the usual (s, a, r, s', not_done) it stores an episode id per
-        slot. A chunk window starting at i is valid only if all chunk_len slots
-        share an episode id and the window does not straddle the write head --
-        otherwise the "chunk" would splice together unrelated timesteps.
+        Windows are sampled uniformly and masked, not rejected -- see
+        sample_chunks. This mirrors utils/datasets.py sample_sequence in the
+        reference implementation.
 
         This is where the world model's structural advantage shows up as
         absence: the only chunks available here are chunks that were actually
@@ -62,11 +60,10 @@ class ChunkTransitionReplay:
         self.action = np.zeros((self.capacity, action_dim), dtype=np.float32)
         self.reward = np.zeros((self.capacity, 1), dtype=np.float32)
         self.next_obs = np.zeros((self.capacity, obs_dim), dtype=np.float32)
-        self.not_done = np.zeros((self.capacity, 1), dtype=np.float32)
-        self.ep_id = np.full((self.capacity,), -1, dtype=np.int64)
+        self.mask = np.zeros((self.capacity, 1), dtype=np.float32)
+        self.terminal = np.zeros((self.capacity, 1), dtype=np.float32)
         self.idx = 0
         self.full = False
-        self.cur_ep = 0
         self.offline_episodes = 0
         self.offline_success = 0
         self.online_episodes = 0
@@ -82,8 +79,10 @@ class ChunkTransitionReplay:
         self.action[i] = action
         self.reward[i] = reward
         self.next_obs[i] = next_obs
-        self.not_done[i] = 0.0 if terminated else 1.0
-        self.ep_id[i] = self.cur_ep
+        self.mask[i] = 0.0 if terminated else 1.0
+        # A truncation ends the window for `valid` purposes even though it
+        # does not zero the bootstrap mask.
+        self.terminal[i] = 1.0 if (terminated or truncated) else 0.0
         self.idx = (self.idx + 1) % self.capacity
         if self.idx == 0:
             self.full = True
@@ -94,7 +93,6 @@ class ChunkTransitionReplay:
             self.online_episodes += 1
             self.online_success += int(self._ep_success)
             self._ep_success = False
-            self.cur_ep += 1
 
     def seed_from_offline(self, dataset):
         obs = np.asarray(dataset['observations'], dtype=np.float32)
@@ -103,9 +101,9 @@ class ChunkTransitionReplay:
         nobs = np.asarray(dataset['next_observations'], dtype=np.float32)
         term = np.asarray(dataset['terminals']).reshape(-1).astype(bool)
         if 'masks' in dataset:
-            nd = np.asarray(dataset['masks'], dtype=np.float32).reshape(-1, 1)
+            mk = np.asarray(dataset['masks'], dtype=np.float32).reshape(-1, 1)
         else:
-            nd = (~term).astype(np.float32).reshape(-1, 1)
+            mk = (~term).astype(np.float32).reshape(-1, 1)
 
         n = min(len(obs), self.capacity)
         sl = slice(0, n)
@@ -113,11 +111,8 @@ class ChunkTransitionReplay:
         self.action[sl] = act[:n]
         self.reward[sl] = rew[:n]
         self.next_obs[sl] = nobs[:n]
-        self.not_done[sl] = nd[:n]
-        # Episode ids come from the terminal flags, so chunk windows never
-        # cross a boundary in the offline data either.
-        self.ep_id[sl] = np.concatenate([[0], np.cumsum(term[:n - 1])]).astype(np.int64)
-        self.cur_ep = int(self.ep_id[n - 1]) + 1
+        self.mask[sl] = mk[:n]
+        self.terminal[sl] = term[:n].astype(np.float32).reshape(-1, 1)
         self.idx = n % self.capacity
         if n >= self.capacity:
             self.full = True
@@ -132,29 +127,28 @@ class ChunkTransitionReplay:
                 ep_ok = False
         return n
 
-    def sample_chunks(self, batch_size, device, rng, gamma, reward_shift):
+    def sample_chunks(self, batch_size, device, rng, gamma):
+        """ utils/datasets.py sample_sequence. Start indices are uniform over
+            the buffer with no episode-boundary rejection; windows that cross
+            a terminal are kept and masked. Returns the per-position validity
+            too, for the BC flow term. """
         h = self.chunk_len
         size = len(self)
-        starts = rng.integers(0, max(size - h, 1), size=batch_size * 4)
-        window = starts[:, None] + np.arange(h)[None, :]
-        same_ep = (self.ep_id[window] == self.ep_id[starts][:, None]).all(-1)
-        # Reject windows that contain the write head, whose slots belong to
-        # two different points in time.
-        if self.full:
-            same_ep &= ~((window == self.idx).any(-1))
-        starts = starts[same_ep][:batch_size]
-        if len(starts) == 0:
+        if size <= h:
             return None
+        starts = rng.integers(0, size - h + 1, size=batch_size)
         window = starts[:, None] + np.arange(h)[None, :]
 
-        rewards = self.reward[window, 0] + reward_shift
-        conts = self.not_done[window, 0]
-        chunk_reward, chunk_cont = pool_chunk_np(rewards, conts, gamma)
-        chunks = self.action[window].reshape(len(starts), h * self.action_dim)
+        rewards = self.reward[window, 0]
+        masks = self.mask[window, 0]
+        terminals = self.terminal[window, 0]
+        chunk_reward, chunk_mask, valid = pool_chunk_np(rewards, masks, terminals, gamma)
+        step_valid = step_valid_np(terminals)
+        chunks = self.action[window].reshape(batch_size, h * self.action_dim)
 
         to = lambda x: torch.as_tensor(x, device=device).float()
-        return (to(self.obs[starts]), to(chunks), to(chunk_reward),
-                to(chunk_cont), to(self.next_obs[window[:, -1]]))
+        return (to(self.obs[starts]), to(chunks), to(chunk_reward), to(chunk_mask),
+                to(valid), to(step_valid), to(self.next_obs[window[:, -1]]))
 
     @property
     def success_stats(self):
@@ -167,6 +161,37 @@ class ChunkTransitionReplay:
             'offline_success': off,
             'online_success': on,
         }
+
+def _agent_update(policy, replay, batch_size, device, rng, gamma, gamma_h):
+    batch = replay.sample_chunks(batch_size, device, rng, gamma)
+    if batch is None:
+        return None
+    b_obs, b_chunk, b_rew, b_mask, b_valid, b_step_valid, b_next = batch
+
+    # Chunk-level TD target. Unlike the world-model arm there is no imagined
+    # horizon to run lambda-returns over, so this is a single chunk_len-step
+    # backup -- which is exactly the unbiased n-step backup the QC paper is
+    # built around, because the critic scores the whole chunk that produced
+    # these rewards.
+    with torch.no_grad():
+        next_values = policy.chunk_target_values(b_next)
+        targets = b_rew + gamma_h * b_mask * next_values
+
+    metrics = {}
+    metrics.update(_prefixed(policy.update_critic(b_obs, b_chunk, targets, b_valid), 'sac'))
+    # Reference passes one batch to both terms; weight is ones because the
+    # actor loss in acfql.actor_loss is unweighted.
+    ones = torch.ones_like(b_valid)
+    metrics.update(_prefixed(policy.update_actor(
+        b_obs, ones, bc_feat=b_obs, bc_chunk=b_chunk, bc_valid=b_step_valid), 'sac'))
+    policy.update_target()
+
+    metrics['sac/mean_chunk_reward'] = b_rew.mean().item()
+    metrics['sac/mean_chunk_mask'] = b_mask.mean().item()
+    metrics['sac/valid_frac'] = b_valid.mean().item()
+    metrics['sac/chunk_diversity'] = policy.chunk_diversity(b_obs)
+    metrics['diagnosis/batch_reward_max'] = b_rew.max().item()
+    return metrics
 
 def train(config):
     general_config = config.train_sac_chunked.general
@@ -183,7 +208,7 @@ def train(config):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     rng = np.random.default_rng(config.seed)
     set_seed_everywhere(config.seed)
-    print(f'PyTorch device: {device} | chunk_len={chunk_len}')
+    print(f'PyTorch device: {device} | chunk_len={chunk_len} alpha={chunk_config.alpha}')
     wandb.init(project=general_config.wandb_project, mode=general_config.wandb_mode, config=config.flat)
 
     env, train_dataset, _ = build_real_env(general_config.env_name, general_config.seed_from_offline)
@@ -192,24 +217,26 @@ def train(config):
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
 
-    replay = ChunkTransitionReplay(obs_dim, action_dim, chunk_len,
-                                   capacity=chunk_config.replay_capacity)
+    # main.py sizes the online buffer as max(buffer_size, dataset.size + 1),
+    # so offline data is never evicted once online transitions start arriving.
+    # A fixed capacity is not safe here: cube-double's offline dataset is
+    # ~1M transitions, so a 1M-capacity ring buffer is already full the
+    # instant it is seeded, and the first online transition would silently
+    # start overwriting offline data.
+    dataset_size = len(train_dataset['observations']) if train_dataset is not None else 0
+    capacity = max(chunk_config.replay_capacity, dataset_size + general_config.num_online_steps + 1)
+    replay = ChunkTransitionReplay(obs_dim, action_dim, chunk_len, capacity=capacity)
     if train_dataset is not None:
         n = replay.seed_from_offline(train_dataset)
         print(f'Seeded replay buffer with {n} offline transitions '
-              f'({replay.offline_episodes} episodes)')
+              f'({replay.offline_episodes} episodes) | buffer capacity {capacity}')
 
     policy = ChunkAgent(
         repr_dim=obs_dim, action_dim=action_dim, chunk_len=chunk_len, device=device,
-        lr=chunk_config.lr, feature_dim=chunk_config.feature_dim,
-        hidden_dim=chunk_config.hidden_dim, critic_target_tau=chunk_config.critic_target_tau,
-        ensemble=chunk_config.ensemble, bc_alpha=chunk_config.bc_alpha,
-        normalize_q=chunk_config.normalize_q,
-    )
-    flow_bc = FlowBC(
-        repr_dim=obs_dim, chunk_dim=action_dim * chunk_len, device=device,
-        lr=chunk_config.lr, feature_dim=chunk_config.feature_dim,
-        hidden_dim=chunk_config.hidden_dim, flow_steps=chunk_config.flow_steps,
+        lr=chunk_config.lr, hidden_dim=chunk_config.hidden_dim,
+        num_layers=chunk_config.num_layers, critic_target_tau=chunk_config.critic_target_tau,
+        ensemble=chunk_config.ensemble, alpha=chunk_config.alpha,
+        flow_steps=chunk_config.flow_steps, q_agg=chunk_config.q_agg,
     )
 
     eval_csv = EvalCSV(out_dir / 'eval_log.csv', arm='no_world_model',
@@ -217,19 +244,58 @@ def train(config):
     eef_slice = tuple(chunk_config.eef_slice)
     start_time = time.time()
 
+    def run_eval(step, n_updates):
+        results = eval_chunk_in_env(
+            env, None, policy, action_dim, general_config.eval_episodes,
+            device, OBS_KEY, chunk_len, eef_slice=eef_slice, record_video=True)
+        print(f'step {step:7d} | return {results["mean_return"]:.2f} | '
+              f'success {results["success_rate"]:.2f} | coherence {results["coherence"]:.4f}')
+        eval_csv.append(step, n_updates, time.time() - start_time, results)
+        log_dict = {
+            'eval/mean_return': results['mean_return'],
+            'eval/success_rate': results['success_rate'],
+            'eval/coherence': results['coherence'],
+            'eval/mean_episode_len': results['mean_episode_len'],
+        }
+        if results['video'] is not None:
+            log_dict['eval/video'] = wandb.Video(results['video'], fps=20, format='mp4')
+        wandb.log(log_dict, step=step)
+
+    # Offline phase. main.py runs offline_steps gradient updates on the static
+    # dataset before any environment interaction, then online_steps of
+    # interaction. Every number in the paper's tables uses that protocol.
+    n_updates = 0
+    for i in range(1, general_config.num_offline_steps + 1):
+        metrics = _agent_update(policy, replay, batch_size, device, rng, gamma, gamma_h)
+        if metrics is None:
+            continue
+        n_updates += 1
+        if i % general_config.log_every == 0:
+            metrics['diagnosis/gradient_updates'] = n_updates
+            metrics['diagnosis/phase'] = 0
+            wandb.log(numeric_metrics(metrics), step=i)
+        if i % general_config.eval_every == 0:
+            run_eval(i, n_updates)
+            env.reset()
+    offline_steps = general_config.num_offline_steps
+    if offline_steps > 0:
+        torch.save(policy.state_dict_all(), out_dir / 'chunk_offline.pt')
+        print(f'Offline phase done: {n_updates} updates')
+
     obs, info = env.reset(seed=config.seed)
     chunk_buffer = None
     chunk_pos = chunk_len
     global_step = 0
-    n_updates = 0
-    print('Starting chunked-agent training loop (no world model)')
+    print('Starting online phase (no world model)')
 
-    while global_step < general_config.num_train_steps:
+    while global_step < general_config.num_online_steps:
         state = np.asarray(obs, dtype=np.float32).reshape(-1)
 
-        if global_step < general_config.num_seed_steps:
+        if global_step < general_config.num_seed_steps and offline_steps == 0:
             action = env.action_space.sample()
         else:
+            # The chunk is executed fully before the actor is queried again,
+            # matching main.py's action_queue.
             if chunk_pos >= chunk_len:
                 chunk_buffer = policy.act(state, eval_mode=False)
                 chunk_pos = 0
@@ -248,72 +314,41 @@ def train(config):
             chunk_pos = chunk_len
 
         global_step += 1
+        log_step = offline_steps + global_step
         metrics = {}
 
-        if len(replay) >= batch_size * 4 and global_step % chunk_config.train_every == 0:
-            batch = replay.sample_chunks(batch_size, device, rng, gamma, chunk_config.reward_shift)
-            if batch is not None:
-                b_obs, b_chunk, b_rew, b_cont, b_next = batch
-
-                # Chunk-level TD target. Unlike the world-model arm there is no
-                # imagined horizon to run lambda-returns over, so this is a
-                # single chunk_len-step backup -- which is exactly the unbiased
-                # n-step backup the QC paper is built around, because the
-                # critic scores the whole chunk that produced these rewards.
-                with torch.no_grad():
-                    next_values = policy.chunk_target_values(b_next)
-                    targets = b_rew + gamma_h * b_cont * next_values
-
-                weights = torch.ones_like(b_rew)
-                metrics.update(_prefixed(policy.update_critic(b_obs, b_chunk, targets, weights), 'sac'))
-                metrics.update(_prefixed(flow_bc.update(b_obs, b_chunk), 'sac'))
-                metrics.update(_prefixed(policy.update_actor(b_obs, weights, flow_bc), 'sac'))
-                policy.update_target()
+        # main.py: `if i >= FLAGS.start_training`. No gradient updates for
+        # the first start_training online steps -- just interaction, so the
+        # buffer accumulates fresh online transitions before training resumes
+        # on them. Applies to online-phase updates only; the offline loop
+        # above is unaffected.
+        for _ in range(chunk_config.utd_ratio if global_step >= general_config.start_training else 0):
+            m = _agent_update(policy, replay, batch_size, device, rng, gamma, gamma_h)
+            if m is not None:
+                metrics = m
                 n_updates += 1
-
-                metrics['sac/mean_chunk_reward'] = b_rew.mean().item()
-                metrics['sac/mean_chunk_cont'] = b_cont.mean().item()
-                metrics['sac/chunk_diversity'] = policy.chunk_diversity(b_obs)
-                metrics['diagnosis/batch_reward_max'] = b_rew.max().item()
 
         if global_step % general_config.log_every == 0:
             metrics['diagnosis/replay_transitions'] = len(replay)
             metrics['diagnosis/gradient_updates'] = n_updates
+            metrics['diagnosis/phase'] = 1
             _succ = replay.success_stats
             metrics['replay/success_frac_total'] = _succ['total_frac']
             metrics['replay/success_frac_online'] = _succ['online_frac']
             metrics['replay/success_frac_offline'] = _succ['offline_frac']
             metrics['replay/success_episodes_online'] = _succ['online_success']
             metrics['replay/success_episodes_total'] = _succ['offline_success'] + _succ['online_success']
+            wandb.log(numeric_metrics(metrics), step=log_step)
 
-        if metrics and global_step % general_config.log_every == 0:
-            wandb.log(numeric_metrics(metrics), step=global_step)
-
-        if global_step % general_config.eval_every == 0 and global_step > 0:
-            results = eval_chunk_in_env(
-                env, None, policy, action_dim, general_config.eval_episodes,
-                device, OBS_KEY, chunk_len, eef_slice=eef_slice, record_video=True)
-            print(f'step {global_step:7d} | return {results["mean_return"]:.2f} | '
-                  f'success {results["success_rate"]:.2f} | coherence {results["coherence"]:.4f}')
-            eval_csv.append(global_step, n_updates, time.time() - start_time, results)
-            log_dict = {
-                'eval/mean_return': results['mean_return'],
-                'eval/success_rate': results['success_rate'],
-                'eval/coherence': results['coherence'],
-                'eval/mean_episode_len': results['mean_episode_len'],
-            }
-            if results['video'] is not None:
-                log_dict['eval/video'] = wandb.Video(results['video'], fps=20, format='mp4')
-            wandb.log(log_dict, step=global_step)
+        if global_step % general_config.eval_every == 0:
+            run_eval(log_step, n_updates)
             obs, info = env.reset()
             chunk_pos = chunk_len
 
-        if global_step % general_config.save_every == 0 and global_step > 0:
+        if global_step % general_config.save_every == 0:
             torch.save(policy.state_dict_all(), out_dir / 'chunk_latest.pt')
-            torch.save(flow_bc.state_dict_all(), out_dir / 'flow_latest.pt')
 
     torch.save(policy.state_dict_all(), out_dir / 'chunk_final.pt')
-    torch.save(flow_bc.state_dict_all(), out_dir / 'flow_final.pt')
     env.close()
     wandb.finish()
     print('Finish training')

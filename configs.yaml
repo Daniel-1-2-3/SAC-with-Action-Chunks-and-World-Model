@@ -117,23 +117,36 @@ defaults:
       hidden_dim: 256
       critic_target_tau: 0.005
       init_ent_coef: 1.0
-
   # ---------------------------------------------------------------------
-  # Action-chunked arms. Same rule as above: every key that appears in BOTH
-  # train_sac_chunked_wm.chunk and train_sac_chunked.chunk must hold the same
-  # value. chunk_len, ensemble, bc_alpha, flow_steps and normalize_q define
-  # the policy, and the policy is the controlled variable -- the only thing
-  # that is allowed to differ between the two arms is whether a world model
-  # exists. train_every, batch_size and imagination_batch are the exceptions,
-  # since the two arms genuinely draw their training data differently.
+  # Action-chunked arms: QC-FQL, ported from github.com/ColinQiyangLi/qc
+  # (agents/acfql.py, actor_type=distill-ddpg). Every key that appears in
+  # BOTH train_sac_chunked_wm.chunk and train_sac_chunked.chunk must hold the
+  # same value -- the policy is the controlled variable and the only thing
+  # allowed to differ between arms is whether a world model exists.
+  # train_every, batch_size, imagination_batch and bc_batch are the
+  # exceptions, since the arms genuinely draw their training data differently.
   #
-  # SETTLED (Aug 2026) -- these were tuned the hard way, don't re-litigate:
-  #   normalize_q: False   pinning q_term at 1.0 killed the first cube-double
-  #                        run outright; see the note below
-  #   hidden_dim:  512     the QC paper's width; 256 was inherited by accident
-  #   bc_alpha:    300     swept {30,100,300,1000}; 0 breaks training entirely
-  #   eef_slice:   [12,15] measured on both cube-single and cube-double
-  # Only reward_shift needs changing when you change env_name.
+  # VALUES TAKEN FROM THE REFERENCE, don't re-litigate:
+  #   hidden_dim 512 / num_layers 4   actor_hidden_dims = value_hidden_dims
+  #                                   = (512, 512, 512, 512)
+  #   ensemble 2                      num_qs for FQL-based agents
+  #   q_agg mean                      never min, for any agent in the repo
+  #   alpha 300                       Table 4, cube-double (100 for triple
+  #                                   and quadruple, 10000 for robomimic)
+  #   flow_steps 10, lr 3e-4, tau 0.005, batch_size 256, utd_ratio 1
+  #   chunk_len 5                     h=10 scored higher on cube-triple in the
+  #                                   h ablation; 5 is the paper's default
+  #                                   because it is cheaper
+  #
+  # There is no gradient clipping and no (1 + alpha) divisor in the actor
+  # loss. Those two were cancelling each other; the reference has neither.
+  #
+  # reward_shift is 0.0 -- QC feeds raw {-n..0} rewards straight through. The
+  # shift was a local addition and is what made alpha untransferable between
+  # cube-single and cube-double, since it turns "one cube placed" into a
+  # sustained +1/step on multi-cube tasks and inflates Q by ~65x.
+  #
+  # eef_slice [12,15] measured on both cube-single and cube-double.
   # ---------------------------------------------------------------------
 
   train_sac_chunked_wm:
@@ -142,8 +155,10 @@ defaults:
       env_name: cube-double-play-singletask-v0
       wm_ckpt: ''
       seed_from_offline: True
+      num_offline_steps: 1000000
+      num_online_steps: 1000000
       num_seed_steps: 4000
-      num_train_steps: 500000
+      start_training: 5000
       log_every: 100
       save_every: 10000
       eval_every: 10000
@@ -153,6 +168,9 @@ defaults:
       wandb_mode: online
 
     dreamer:
+      # World model trains on EVERY gradient update, co-trained with the
+      # policy so it keeps tracking the state distribution the policy is
+      # currently visiting.
       train_every: 1
       max_episodes: 2000
 
@@ -162,43 +180,27 @@ defaults:
       # the depth the world model was verified at. Raising num_chunks deepens
       # the critic's lookahead but asks the model to hallucinate further.
       num_chunks: 3
-      # 4x the single-step imagination_batch, to partly offset getting 3
-      # critic examples per rollout instead of 15. Drop this first if the
-      # rollout becomes the bottleneck. Measured cheap: batch 4096 costs only
-      # ~5% more wall-clock than 256, because the rollout is launch-bound.
+      # THE sample-efficiency knob. imagination_batch * num_chunks /
+      # train_every = chunk-transitions per real env step: 4096*3/1 = 12288,
+      # against QC-FQL's 256. Nearly free in wall-clock -- batch 4096 costs
+      # only ~5% more than 256, because the rollout is launch-bound. Raise
+      # this to buy more sample efficiency; it is the whole bet.
       imagination_batch: 4096
-      train_every: 5
-      gamma: 0.99
-      lam: 0.95
-      # MUST equal the number of cubes in env_name -- single 1.0, double 2.0,
-      # triple 3.0, quadruple 4.0. Shifts reward from {-n..0} to {0..+n} so a
-      # zero-initialized critic starts at the right baseline. Getting this
-      # wrong does not error; it silently hands the agent free reward.
-      reward_shift: 2.0
-      lr: 3e-4
-      feature_dim: 512
-      hidden_dim: 512
-      critic_target_tau: 0.005
-      ensemble: 10
-      # Swept {30,100,300,1000} on cube-double, judged by
-      # diagnosis/actor_bc_share: 300 puts the constraint at ~0.74 of the
-      # actor loss at 10k, and is also the QC paper's value for the cube
-      # domains. bc_alpha: 0 breaks training outright -- the behavior
-      # constraint is load-bearing, matching the paper's RLPD-AC ablation.
-      bc_alpha: 0.0
+      # Real (latent, chunk) pairs per update for bc_flow_loss, the one term
+      # that cannot be imagined.
       bc_batch: 1024
+      # 1, not 5 -- matches QC's one policy update per env step.
+      train_every: 1
+      gamma: 0.99
+      reward_shift: 0.0
+      lr: 3e-4
+      hidden_dim: 512
+      num_layers: 4
+      critic_target_tau: 0.005
+      ensemble: 2
+      q_agg: mean
+      alpha: 300.0
       flow_steps: 10
-      # KEEP FALSE. Normalizing q_term to 1.0 is not in the QC paper and it
-      # sank the first cube-double run: it freezes the critic's magnitude
-      # while bc_term decays quadratically, so the behavior constraint loses
-      # influence on its own and the policy shrinks its motions -- coherence
-      # fell 0.35 -> 0.15 and there were zero successes in 500k. With it off,
-      # the same config reaches ~-680 return and produces completions.
-      normalize_q: False
-      # End-effector xyz, for the temporal-coherence metric. Measured with
-      # helpers/find_eef_slice.py: dims 12/13/14 on BOTH cube-single (28-dim)
-      # and cube-double (37-dim) -- arm state leads the observation and extra
-      # cubes are appended after it.
       eef_slice: [12, 15]
 
   train_sac_chunked:
@@ -206,8 +208,10 @@ defaults:
     general:
       env_name: cube-double-play-singletask-v0
       seed_from_offline: True
+      num_offline_steps: 1000000
+      num_online_steps: 1000000
       num_seed_steps: 4000
-      num_train_steps: 500000
+      start_training: 5000 # see the note under train_sac_chunked_wm.general
       log_every: 100
       save_every: 10000
       eval_every: 10000
@@ -219,17 +223,70 @@ defaults:
     chunk:
       chunk_len: 5
       train_every: 1
+      utd_ratio: 1
       batch_size: 256
+      # Floor only -- train_sac_chunked.py raises this at runtime to
+      # max(replay_capacity, offline_dataset_size + num_online_steps + 1),
+      # matching main.py's `max(buffer_size, train_dataset.size + 1)`. A
+      # fixed 1M would already be full from the offline seed alone on
+      # cube-double, so the first online transition would evict offline data.
       replay_capacity: 1000000
       gamma: 0.99
-      # Must match train_sac_chunked_wm.chunk.reward_shift and the cube count.
-      reward_shift: 2.0
+      reward_shift: 0.0
       lr: 3e-4
-      feature_dim: 512
       hidden_dim: 512
+      num_layers: 4
       critic_target_tau: 0.005
-      ensemble: 10
-      bc_alpha: 0.0
+      ensemble: 2
+      q_agg: mean
+      alpha: 300.0
       flow_steps: 10
-      normalize_q: False # see the note under train_sac_chunked_wm.chunk
+      eef_slice: [12, 15]
+
+  train_sac_chunked_wm_hybrid:
+    # QC-FQL's critic/actor Q-loss trained on REAL chunks AUGMENTED with
+    # imagined ones (MBPO-style: added, not swapped). real_batch matches
+    # plain QC-FQL's own batch_size exactly, so this arm always has at least
+    # as much real supervision as vanilla QC-FQL -- the imagined component is
+    # pure upside, not a replacement that could starve the critic of the
+    # sparse reward signal real replay/offline data already carries.
+
+    general:
+      env_name: cube-double-play-singletask-v0
+      wm_ckpt: ''
+      seed_from_offline: True
+      num_offline_steps: 1000000
+      num_online_steps: 1000000
+      num_seed_steps: 4000
+      start_training: 5000
+      log_every: 100
+      save_every: 10000
+      eval_every: 10000
+      eval_episodes: 20
+      out_dir: train_sac_chunked_wm_hybrid_out
+      wandb_project: world-model-chunk
+      wandb_mode: online
+
+    dreamer:
+      train_every: 1
+      max_episodes: 2000
+
+    chunk:
+      chunk_len: 5
+      num_chunks: 3
+      # Matches QC-FQL's batch_size exactly -- see the note above.
+      real_batch: 256
+      imagination_batch: 4096
+      bc_batch: 1024
+      train_every: 1
+      gamma: 0.99
+      reward_shift: 0.0
+      lr: 3e-4
+      hidden_dim: 512
+      num_layers: 4
+      critic_target_tau: 0.005
+      ensemble: 2
+      q_agg: mean
+      alpha: 300.0
+      flow_steps: 10
       eef_slice: [12, 15]

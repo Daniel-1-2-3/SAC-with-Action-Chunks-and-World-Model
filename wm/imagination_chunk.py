@@ -39,8 +39,7 @@ def imagine_chunk_rollout(bridge, agent, seed_carry, num_chunks, chunk_len,
 
     for _ in range(num_chunks):
         with torch.no_grad():
-            z = agent.noise(feat_t.shape[0])
-            chunk_t = agent.actor(feat_t, z)
+            chunk_t = agent.sample_chunk(feat_t)
         chunk_np = chunk_t.detach().cpu().numpy()
 
         rewards_k, conts_k = [], []
