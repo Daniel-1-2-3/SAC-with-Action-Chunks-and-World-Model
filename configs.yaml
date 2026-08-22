@@ -150,6 +150,12 @@ defaults:
   # ---------------------------------------------------------------------
 
   train_sac_chunked_wm:
+    # QC-FQL's critic/actor Q-loss trained on REAL chunks AUGMENTED with
+    # imagined ones (MBPO-style: added, not swapped). real_batch matches
+    # plain QC-FQL's own batch_size exactly, so this arm always has at least
+    # as much real supervision as vanilla QC-FQL -- the imagined component is
+    # pure upside, not a replacement that could starve the critic of the
+    # sparse reward signal real replay/offline data already carries.
 
     general:
       env_name: cube-double-play-singletask-v0
@@ -168,28 +174,16 @@ defaults:
       wandb_mode: online
 
     dreamer:
-      # World model trains on EVERY gradient update, co-trained with the
-      # policy so it keeps tracking the state distribution the policy is
-      # currently visiting.
       train_every: 1
       max_episodes: 2000
 
     chunk:
       chunk_len: 5
-      # chunk_len * num_chunks = imagined environment steps. 3 keeps it at 15,
-      # the depth the world model was verified at. Raising num_chunks deepens
-      # the critic's lookahead but asks the model to hallucinate further.
       num_chunks: 3
-      # THE sample-efficiency knob. imagination_batch * num_chunks /
-      # train_every = chunk-transitions per real env step: 4096*3/1 = 12288,
-      # against QC-FQL's 256. Nearly free in wall-clock -- batch 4096 costs
-      # only ~5% more than 256, because the rollout is launch-bound. Raise
-      # this to buy more sample efficiency; it is the whole bet.
+      # Matches QC-FQL's batch_size exactly -- see the note above.
+      real_batch: 256
       imagination_batch: 4096
-      # Real (latent, chunk) pairs per update for bc_flow_loss, the one term
-      # that cannot be imagined.
       bc_batch: 1024
-      # 1, not 5 -- matches QC's one policy update per env step.
       train_every: 1
       gamma: 0.99
       reward_shift: 0.0
@@ -231,54 +225,6 @@ defaults:
       # fixed 1M would already be full from the offline seed alone on
       # cube-double, so the first online transition would evict offline data.
       replay_capacity: 1000000
-      gamma: 0.99
-      reward_shift: 0.0
-      lr: 3e-4
-      hidden_dim: 512
-      num_layers: 4
-      critic_target_tau: 0.005
-      ensemble: 2
-      q_agg: mean
-      alpha: 300.0
-      flow_steps: 10
-      eef_slice: [12, 15]
-
-  train_sac_chunked_wm_hybrid:
-    # QC-FQL's critic/actor Q-loss trained on REAL chunks AUGMENTED with
-    # imagined ones (MBPO-style: added, not swapped). real_batch matches
-    # plain QC-FQL's own batch_size exactly, so this arm always has at least
-    # as much real supervision as vanilla QC-FQL -- the imagined component is
-    # pure upside, not a replacement that could starve the critic of the
-    # sparse reward signal real replay/offline data already carries.
-
-    general:
-      env_name: cube-double-play-singletask-v0
-      wm_ckpt: ''
-      seed_from_offline: True
-      num_offline_steps: 1000000
-      num_online_steps: 1000000
-      num_seed_steps: 4000
-      start_training: 5000
-      log_every: 100
-      save_every: 10000
-      eval_every: 10000
-      eval_episodes: 20
-      out_dir: train_sac_chunked_wm_hybrid_out
-      wandb_project: world-model-chunk
-      wandb_mode: online
-
-    dreamer:
-      train_every: 1
-      max_episodes: 2000
-
-    chunk:
-      chunk_len: 5
-      num_chunks: 3
-      # Matches QC-FQL's batch_size exactly -- see the note above.
-      real_batch: 256
-      imagination_batch: 4096
-      bc_batch: 1024
-      train_every: 1
       gamma: 0.99
       reward_shift: 0.0
       lr: 3e-4
