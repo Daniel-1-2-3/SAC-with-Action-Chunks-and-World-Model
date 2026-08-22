@@ -35,6 +35,14 @@ class WorldModelBridge:
             ar,
         )
 
+        self._imagine_chunk = transform.apply(
+            nj.pure(self.model.imagine_chunk), self.mesh,
+            (tp, tm, self.ts, self.ts),
+            (self.ts, self.ts, self.ts, self.ts),
+            ar,
+            static_argnums=(4,),
+        )
+
         self._init_encode = transform.apply(
             nj.pure(self.model.init_encode), self.mesh,
             (tp, tm),
@@ -75,6 +83,21 @@ class WorldModelBridge:
         action = jax.device_put(action, self.ts)
         return self._imagine_step(
             self.agent.params, self._next_seed(), dyn_carry, action)
+
+    def img_chunk(self, dyn_carry, chunk_np, chunk_len):
+        """ Rolls a whole chunk_len-step chunk in ONE dispatch.
+
+            chunk_np: (B, chunk_len * action_dim), the flat chunk vector the
+            actor produces. Reshaped here to (B, chunk_len, action_dim), which
+            is the time-axis layout RSSM.imagine's internal nj.scan expects.
+
+            Returns next_carry, feats (B, chunk_len, D), reward and cont
+            (B, chunk_len). Replaces chunk_len separate img_step calls. """
+        batch = chunk_np.shape[0]
+        actions = chunk_np.astype(np.float32).reshape(batch, chunk_len, -1)
+        action = jax.device_put({self.action_key: actions}, self.ts)
+        return self._imagine_chunk(
+            self.agent.params, self._next_seed(), dyn_carry, action, chunk_len)
 
     def init_encode(self, batch_size):
         return self._init_encode(self.agent.params, self._next_seed(), batch_size)

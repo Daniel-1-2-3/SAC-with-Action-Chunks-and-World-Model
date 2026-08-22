@@ -131,6 +131,30 @@ class WorldModelAgent(embodied.embodied.jax.Agent): # From Dreamer, policy code 
         cont = cont.astype(jnp.float32)
         return next_carry, inp, reward, cont
     
+    def imagine_chunk(self, dyn_carry, actions, length):
+        """ Imagines `length` steps in ONE dispatch, given all the actions up
+            front. RSSM.imagine already scans internally (nj.scan, axis=1)
+            when handed a non-callable policy with a time axis, so this is a
+            single fused kernel instead of `length` separate launches.
+
+            actions: {action_key: (B, length, action_dim)}
+            Returns next_carry, feats (B, length, D), reward/cont (B, length).
+
+            Only the WITHIN-chunk steps can be fused this way. The actor lives
+            in PyTorch, so control has to return to Python between chunks to
+            sample the next one -- the outer num_chunks loop stays a Python
+            loop by necessity. """
+        dyn_carry, actions = nn.cast((dyn_carry, actions))
+        next_carry, feat, _ = self.dyn.imagine(
+            dyn_carry, actions, length, training=False)
+        inp = self.feat2tensor(feat)
+        # bdims=2 because inp is (B, T, D) here, unlike imagine_step's (B, D).
+        reward = self.rew(inp, 2).pred()
+        cont = self.con(inp, 2).pred()
+
+        next_carry = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), next_carry)
+        return next_carry, inp.astype(jnp.float32), reward.astype(jnp.float32), cont.astype(jnp.float32)
+
     def init_encode(self, batch_size):
         return self.enc.initial(batch_size), self.dyn.initial(batch_size)
 

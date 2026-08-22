@@ -150,32 +150,65 @@ class ChunkAgent:
         next_chunk = self.sample_chunk(next_feats)
         return self._agg(self.critic_target(next_feats, next_chunk))
 
-    def update_critic(self, feat, chunk, target_Q, weight):
+    def update_critic(self, feat, chunk, target_Q, weight, n_real=None):
         """ acfql.critic_loss. weight is `valid` for the replay arm and the
             imagined survival weight for the world-model arm. The reference
             multiplies by the mask and takes a plain mean -- it does NOT
-            renormalize by the mask's sum. """
+            renormalize by the mask's sum.
+
+            n_real: number of leading rows that are REAL transitions. When the
+            caller concatenates [real, imagined], pass the real count so the
+            diagnostics below can be reported per source.
+
+            Why this matters: the blended metrics are NOT comparable between
+            the two arms. The baseline arm passes 256 real rows; the
+            world-model arm passes 256 real + ~12288 imagined, so a blended
+            mean is ~98% imagined and will look different for reasons that
+            have nothing to do with learning quality. The `_real` variants
+            below are computed on the same 256-row real population in BOTH
+            arms and are the only critic numbers safe to compare directly.
+
+            The training loss itself is unchanged -- this only splits how the
+            already-computed errors get reported. """
         metrics = {}
         target_Q = target_Q.detach()
 
         qs = self.critic(feat, chunk)
-        critic_loss = sum((weight * (q - target_Q) ** 2).mean() for q in qs)
+        sq = (qs - target_Q.unsqueeze(0)) ** 2 # (ensemble, batch, 1)
+        critic_loss = sum((weight * sq[i]).mean() for i in range(sq.shape[0]))
 
         self.critic_opt.zero_grad(set_to_none=True)
         critic_loss.backward()
         self.critic_opt.step()
 
         q_mean = qs.mean(0)
+        spread = qs.std(0)
         metrics['critic_loss'] = critic_loss.item()
         metrics['critic_target_q'] = target_Q.mean().item()
         metrics['critic_q'] = q_mean.mean().item()
         metrics['diagnosis/critic_q_max'] = q_mean.max().item()
         metrics['diagnosis/critic_q_min'] = q_mean.min().item()
-        metrics['diagnosis/critic_ensemble_spread'] = qs.std(0).mean().item()
+        metrics['diagnosis/critic_ensemble_spread'] = spread.mean().item()
         metrics['diagnosis/critic_target_q_range'] = (target_Q.max() - target_Q.min()).item()
+
+        # Per-source split. In the baseline arm n_real covers the whole batch,
+        # so the _real metrics equal the blended ones -- which is exactly what
+        # makes them comparable across arms.
+        n = feat.shape[0] if n_real is None else int(n_real)
+        sq_det = sq.detach()
+        metrics['diagnosis/critic_mse_real'] = sq_det[:, :n].mean().item()
+        metrics['diagnosis/critic_spread_real'] = spread[:n].mean().item()
+        metrics['diagnosis/critic_q_real'] = q_mean[:n].mean().item()
+        metrics['diagnosis/critic_target_q_real'] = target_Q[:n].mean().item()
+        if n < feat.shape[0]:
+            metrics['diagnosis/critic_mse_imagined'] = sq_det[:, n:].mean().item()
+            metrics['diagnosis/critic_spread_imagined'] = spread[n:].mean().item()
+            metrics['diagnosis/critic_q_imagined'] = q_mean[n:].mean().item()
+            metrics['diagnosis/critic_target_q_imagined'] = target_Q[n:].mean().item()
         return metrics
 
-    def update_actor(self, feat, weight, bc_feat, bc_chunk, bc_valid=None):
+    def update_actor(self, feat, weight, bc_feat, bc_chunk, bc_valid=None,
+                     actor_batch=None):
         """ acfql.actor_loss:
 
               actor_loss = bc_flow_loss + alpha * distill_loss + q_loss
@@ -188,7 +221,16 @@ class ChunkAgent:
             the flow-matching term. In the baseline arm they are the same
             batch, exactly as the reference. In the world-model arm feat is
             imagined and bc_feat is real latents, because imagined chunks are
-            not behavior data. """
+            not behavior data.
+
+            actor_batch: if set, randomly subsample `feat` to this many rows
+            before the distill/Q terms. compute_flow_actions runs flow_steps
+            SEQUENTIAL passes through a 4x512 MLP, so its cost is linear in
+            the row count and it dominates the actor update once the caller
+            concatenates a large imagined batch. The reference computes these
+            terms on batch_size (256) rows; the extra imagined coverage is
+            what the CRITIC needs, not what the actor's gradient estimate
+            needs. Leave as None to use every row. """
         metrics = {}
 
         # BC flow loss: interpolate noise -> real chunk at a random time and
@@ -204,6 +246,11 @@ class ChunkAgent:
             # elements including the masked ones -- not a masked mean.
             sq = sq.reshape(-1, self.chunk_len, self.action_dim) * bc_valid[..., None]
         bc_flow_loss = sq.mean()
+
+        if actor_batch is not None and actor_batch < feat.shape[0]:
+            sel = torch.randperm(feat.shape[0], device=feat.device)[:actor_batch]
+            feat = feat[sel]
+            weight = weight[sel]
 
         # Distillation: the same noise through the one-step policy and through
         # the integrated behavior flow. The flow target is detached.

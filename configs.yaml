@@ -150,15 +150,28 @@ defaults:
   # ---------------------------------------------------------------------
 
   train_sac_chunked_wm:
-    # QC-FQL's critic/actor Q-loss trained on REAL chunks AUGMENTED with
-    # imagined ones (MBPO-style: added, not swapped). real_batch matches
-    # plain QC-FQL's own batch_size exactly, so this arm always has at least
-    # as much real supervision as vanilla QC-FQL -- the imagined component is
-    # pure upside, not a replacement that could starve the critic of the
-    # sparse reward signal real replay/offline data already carries.
+    # QC-FQL with a model-based value expansion (MVE) target.
+    #
+    # The critic and actor train on REAL states and REAL chunks only -- the
+    # batch is identical to plain QC-FQL's and the actor loss is untouched.
+    # The world model changes exactly one thing: target_Q.
+    #
+    #   QC-FQL:  R_real + gamma^h * mask * Q(L_0)
+    #   MVE:     R_real + gamma^h * mask * [num_chunks imagined chunks, then Q]
+    #
+    # The imagined chunks start at L_0 (the latent at the state the real chunk
+    # ended at) and are sampled from the CURRENT actor, so they stay on-policy.
+    # Replay's own following actions cannot be used for this: they came from
+    # the policy that collected the data, so their rewards would estimate that
+    # old policy's return instead of the current one's.
+    #
+    # Execution stays at chunk_len. That is the point -- raising chunk_len also
+    # raises how long the policy commits open-loop, and the QC paper's own h
+    # ablation shows performance degrading past h=10. MVE extends the critic's
+    # horizon without touching the control horizon.
 
     general:
-      env_name: cube-double-play-singletask-v0
+      env_name: cube-triple-play-singletask-v0
       wm_ckpt: ''
       seed_from_offline: True
       num_offline_steps: 1000000
@@ -174,16 +187,26 @@ defaults:
       wandb_mode: online
 
     dreamer:
-      train_every: 1
+      # The world model has no counterpart in QC, so this cadence is a free
+      # choice. 10 is near standard Dreamer practice; 1 is ~5x slower for
+      # little gain (batch_size * batch_length = 2048 frames per update).
+      train_every: 10
       max_episodes: 2000
 
     chunk:
       chunk_len: 5
+      # Imagined chunks appended to the target. Bootstrap moves from
+      # chunk_len to chunk_len * (num_chunks + 1) env steps: 5 -> 20 at 3.
+      # Cost is num_chunks JAX dispatches per update, batch_size rows each.
       num_chunks: 3
-      # Matches QC-FQL's batch_size exactly -- see the note above.
-      real_batch: 256
-      imagination_batch: 4096
-      bc_batch: 1024
+      # 1.0 = pure MVE (bootstrap only at the deepest latent). Below 1.0
+      # blends the shallower bootstraps in, so a model that degrades with
+      # depth falls back toward QC-FQL's own 1-chunk target rather than
+      # poisoning it. Lower this first if the model turns out unreliable.
+      mve_lambda: 0.95
+      # Real chunk transitions per critic/actor update -- QC's batch_size.
+      batch_size: 256
+      bc_batch: 256
       train_every: 1
       gamma: 0.99
       reward_shift: 0.0

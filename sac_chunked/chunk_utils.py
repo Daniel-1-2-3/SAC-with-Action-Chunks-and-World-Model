@@ -91,6 +91,43 @@ def chunk_lambda_targets(chunk_rewards, chunk_conts, next_values, gamma_h, lam, 
         outs.append(ret)
     return torch.stack(outs[::-1], dim=0).reshape(num_chunks * batch, 1)
 
+def mve_target(real_reward, real_mask, img_rewards, img_conts, img_values,
+               gamma_h, lam, num_chunks):
+    """ Model-based value expansion target for one real chunk transition.
+
+        QC-FQL's target stops after the real chunk:
+
+            R_0 + gamma^h * m_0 * Q(L_0)
+
+        because extending it would need the actions that follow in replay, and
+        those came from the policy that collected the data rather than the
+        current one -- the sum would estimate the OLD policy's return.
+
+        Here the continuation is imagined under the current actor instead, so
+        it stays on-policy and the bootstrap moves from 1 chunk out to
+        num_chunks+1 chunks out:
+
+            R_0 + gamma^h * m_0 * [ R_1 + gamma^h*c_1 * [ ... + gamma^h*c_N * Q(L_N) ] ]
+
+        lam blends across horizons rather than committing to the deepest one:
+        lam=1.0 is pure MVE (bootstrap only at L_N), lam<1 mixes in the
+        shallower bootstraps, so a poor model at depth degrades gracefully
+        toward QC-FQL's own 1-chunk target instead of poisoning it.
+
+        real_reward, real_mask: (B, 1) from the REAL replayed chunk.
+        img_*: (num_chunks * B, 1), chunk-major, from imagine_chunk_rollout.
+        img_values: target-critic value at the latent AFTER each imagined chunk.
+        Returns (B, 1). """
+    batch = real_reward.shape[0]
+    r = img_rewards.reshape(num_chunks, batch, 1)
+    c = img_conts.reshape(num_chunks, batch, 1)
+    v = img_values.reshape(num_chunks, batch, 1)
+
+    ret = v[-1]
+    for t in reversed(range(num_chunks)):
+        ret = r[t] + gamma_h * c[t] * ((1 - lam) * v[t] + lam * ret)
+    return real_reward + gamma_h * real_mask * ret
+
 def chunk_pair_indices(batch_np, chunk_len, action_key='action'):
     """ Builds aligned (flat latent index, action chunk, per-step valid) triples
         from a Dreamer batch, for the BC flow term in the world-model arm.
