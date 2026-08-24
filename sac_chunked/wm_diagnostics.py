@@ -21,19 +21,17 @@ Groups, and what each decides:
                 appends num_chunks imagined chunks to the target. If accuracy
                 collapses by chunk 2, the deep part of the target is noise.
 
-  mve/*         The break-even. MVE trades reliance on the critic for reliance
-                on the model. At gamma=0.99 the bootstrap coefficient only
-                moves 0.951 -> 0.818 even at depth 3, so the purchase is small
-                while model error is paid at near-full weight. Working through
-                the variances, MVE helps when
+  mve/*         The break-even, on ABSOLUTE ERROR. MVE replaces Q(L_0) in
+                the target with [imagined rewards + Q(L_N)], so what matters
+                is absolute error, not correlation -- a constant predictor is
+                a GOOD predictor when reality is nearly constant, which it is
+                whenever most states sit at the reward floor.
 
-                    reward_std * sqrt(1 - corr^2)  <  0.309 * critic_err
-
-                The 0.309 is invariant to depth: deeper rollouts buy more
-                bootstrap reduction but accumulate proportionally more error,
-                and the two cancel. mve/required_corr inverts this against the
-                critic's measured TD error; mve/margin is depth-1 corr minus
-                that. Positive margin => MVE should help.
+                MVE wins when the model's per-chunk reward MAE is below
+                ~0.309x the critic's TD error (0.049x worst case, if the two
+                errors compound rather than being independent). Invariant to
+                rollout depth. mve/err_ratio is that quotient and mve/margin
+                is 0.309 minus it -- positive means MVE should help.
 
   cont/*        Continue-head accuracy. A wrong cont silently rescales every
                 pooled reward and every bootstrap.
@@ -186,7 +184,11 @@ def wm_report(env, bridge, policy, chunk_config, chunk_len, gamma, device, rng,
         for k in range(depth):
             ck = policy.act(np.asarray(jax.device_get(f2))[0].copy(), eval_mode=False)
             with torch.no_grad():
-                pk, _, _, lastk = roll(ch_carry, ck.reshape(1, -1), 1)
+                # model_samples, NOT 1. depth/mae_chunk1 is what mve/model_err
+                # uses, and a single prior draw carries the RSSM's full
+                # sampling noise -- that inflates the measured error and
+                # biases the MVE verdict toward "hurts".
+                pk, _, _, lastk = roll(ch_carry, ck.reshape(1, -1), model_samples)
             tot, disc, dead, o2 = 0.0, 1.0, False, None
             for j in range(chunk_len):
                 o2, rw, te, tr, _ = step_env(ck[j])
@@ -194,9 +196,14 @@ def wm_report(env, bridge, policy, chunk_config, chunk_len, gamma, device, rng,
                 pa = ck[j].reshape(1, -1).astype(np.float32)
                 if te or tr:
                     dead = True; break
-            d_pred[k].append(float(pk[0])); d_true[k].append(tot)
             if dead:
+                # Episode ended mid-chunk: `tot` covers only the steps that
+                # ran while the prediction covers all chunk_len. Recording
+                # that pair would charge the model for a truncation it was
+                # never told about, inflating depth/mae -- and mve/model_err
+                # reads depth/mae_chunk1. Drop the sample instead.
                 break
+            d_pred[k].append(float(pk[0])); d_true[k].append(tot)
             e2, d2, f2 = bridge.encode_step(
                 e2, d2, np.asarray(o2, dtype=np.float32).reshape(1, -1), pa, fi)
             fi = np.array([False])
@@ -260,19 +267,37 @@ def wm_report(env, bridge, policy, chunk_config, chunk_len, gamma, device, rng,
     out['uncert/spread_vs_error_corr'] = _corr(u_sp, u_err)
     out['uncert/se'] = _se(n)
 
-    # ---- MVE break-even
-    out['mve/K'] = 0.309
-    c1 = out.get('depth/corr_chunk1', float('nan'))
-    if critic_loss is not None and out['reward/true_std'] > 1e-8:
+    # ---- MVE break-even, on ABSOLUTE ERROR (not correlation)
+    # MVE replaces Q(L_0) in the target with [imagined rewards + Q(L_N)].
+    # Both quantities feed the same target, so what matters is absolute
+    # error, NOT correlation. Correlation is the right frame for ranking,
+    # where only ordering counts; here a constant predictor is a GOOD
+    # predictor whenever reality is nearly constant -- which is most of the
+    # time on cube-triple, where most states sit at the reward floor.
+    #
+    # Weighing the two error paths:
+    #   QC   error = E_Q
+    #   MVE  error = sum_k gamma^(h*k) * E_R  +  gamma^(h*N) * E_Q
+    # so MVE wins when E_R < threshold * E_Q, with threshold
+    #   0.309  if the errors are independent (add in quadrature)
+    #   0.049  worst case, if they compound
+    # Both are invariant to N: deeper rollouts buy more bootstrap reduction
+    # but accumulate proportionally more reward error, and the two cancel.
+    #
+    # E_R is the model's per-chunk pooled-reward MAE; E_Q is the critic's TD
+    # error. Both are in reward units, so they compare directly.
+    out['mve/threshold'] = 0.309
+    out['mve/threshold_worst_case'] = 0.049
+    model_err = out.get('depth/mae_chunk1', out.get('reward/mae', float('nan')))
+    out['mve/model_err'] = float(model_err)
+    if critic_loss is not None:
         # critic_loss sums `ensemble` weighted MSE terms -> RMSE per member
         ce = float(np.sqrt(max(critic_loss, 0.0) / max(chunk_config.ensemble, 1)))
-        ratio = ce / out['reward/true_std']
         out['mve/critic_err'] = ce
-        out['mve/critic_err_over_reward_std'] = ratio
-        x = min(0.309 * ratio, 1.0)
-        out['mve/required_corr'] = float(np.sqrt(max(1 - x * x, 0.0)))
-        if not np.isnan(c1):
-            out['mve/margin'] = c1 - out['mve/required_corr']
+        if ce > 1e-8 and not np.isnan(model_err):
+            out['mve/err_ratio'] = float(model_err / ce)
+            # positive => model error is below the threshold => MVE should help
+            out['mve/margin'] = float(0.309 - model_err / ce)
     return out
 
 def print_wm_report(m):
@@ -286,11 +311,15 @@ def print_wm_report(m):
           if f'depth/corr_chunk{k}' in m]
     if ds:
         print(f"  depth        {'   '.join(ds)}    decay {g('depth/decay'):+.3f}")
-    if 'mve/required_corr' in m:
+    if 'mve/err_ratio' in m:
         mg = g('mve/margin')
         verdict = 'MVE should help' if mg > 0 else 'MVE likely hurts'
-        print(f"  mve          corr {g('depth/corr_chunk1'):+.3f} vs required "
-              f"{g('mve/required_corr'):.3f}   margin {mg:+.3f}   -> {verdict}")
+        print(f"  mve          model_err {g('mve/model_err'):.3f} vs critic_err "
+              f"{g('mve/critic_err'):.3f}"
+              f"   ratio {g('mve/err_ratio'):.3f} (need <0.309)   -> {verdict}")
+    elif 'mve/critic_err' in m:
+        print(f"  mve          critic_err {g('mve/critic_err'):.3f}"
+              f"   model_err {g('mve/model_err'):.3f}  (ratio unavailable)")
     print(f"  cont         corr {g('cont/corr'):+.3f}"
           f"   pred {g('cont/pred_mean'):.3f}  true {g('cont/true_mean'):.3f}")
     print(f"  sensitivity  dir_corr {g('sensitivity/direction_corr'):+.3f}"
