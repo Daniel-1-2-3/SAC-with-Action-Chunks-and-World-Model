@@ -270,8 +270,6 @@ def train(config):
             'eval/coherence': results['coherence'],
             'eval/mean_episode_len': results['mean_episode_len'],
         }
-        if results['video'] is not None:
-            log_dict['eval/video'] = wandb.Video(results['video'], fps=20, format='mp4')
         if chunk_config.wm_diag_states > 0:
             wm_m = wm_report(
                 env, bridge, policy, chunk_config, chunk_len, gamma, device, rng,
@@ -279,11 +277,16 @@ def train(config):
                 depth=num_chunks, model_samples=chunk_config.wm_diag_samples,
                 critic_loss=last_critic_loss[0])
             print_wm_report(wm_m)
-            log_dict.update(wm_m)
+            # numeric_metrics ONLY on the diagnostics -- it does float(v) and
+            # silently drops anything non-numeric, which would throw away the
+            # wandb.Video object below. Filter here, never the whole log_dict.
+            log_dict.update(numeric_metrics(wm_m))
             # the diagnostic drives the env itself; reset so the collection
             # loop resumes from a clean episode
             env.reset()
-        wandb.log(numeric_metrics(log_dict), step=step)
+        if results['video'] is not None:
+            log_dict['eval/video'] = wandb.Video(results['video'], fps=20, format='mp4')
+        wandb.log(log_dict, step=step)
 
     n_updates = 0
     offline_steps = general_config.num_offline_steps
