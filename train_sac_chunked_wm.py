@@ -18,6 +18,7 @@ from sac_chunked.sac_chunk_agent import ChunkAgent
 from helpers.sac_wm_utils import set_seed_everywhere
 from sac_chunked.chunk_utils import chunk_pair_indices, real_chunk_transitions, mve_target
 from sac_chunked.evaluation_chunk import eval_chunk_in_env, EvalCSV
+from sac_chunked.wm_diagnostics import wm_report, print_wm_report
 from wm.imagination_chunk import imagine_chunk_rollout
 from helpers.interop import jax_to_torch, numeric_metrics, unwrap
 from helpers.ogbench_methods import OGBenchMethods
@@ -80,7 +81,8 @@ def _wm_update(wm_agent, replay, batch_size, seq_len, rng, global_step):
     return wm_mets
 
 def _agent_update(bridge, policy, replay, config_batch, seq_len, chunk_config,
-                  chunk_len, num_chunks, device, rng, gamma, gamma_h):
+                  chunk_len, num_chunks, device, rng, gamma, gamma_h,
+                  metrics_on=True):
     """ QC-FQL with a model-based value expansion (MVE) target.
 
         The critic and actor train on REAL states and REAL chunks only -- the
@@ -137,7 +139,8 @@ def _agent_update(bridge, policy, replay, config_batch, seq_len, chunk_config,
             both_feat[take:])
 
     metrics = {}
-    metrics.update(_prefixed(policy.update_critic(feat, chunk, target, valid), 'sac'))
+    metrics.update(_prefixed(policy.update_critic(
+        feat, chunk, target, valid, metrics_on=metrics_on), 'sac'))
     # Actor is plain QC-FQL: same batch drives distill/Q and the flow-matching
     # term, exactly as agents/acfql.py does.
     bc_idx, bc_chunks_np, bc_valid_np = chunk_pair_indices(
@@ -153,29 +156,34 @@ def _agent_update(bridge, policy, replay, config_batch, seq_len, chunk_config,
         bc_feat, bc_chunks, bc_valid = feat, chunk, None
     metrics.update(_prefixed(policy.update_actor(
         feat, torch.ones_like(valid), bc_feat=bc_feat,
-        bc_chunk=bc_chunks, bc_valid=bc_valid), 'sac'))
+        bc_chunk=bc_chunks, bc_valid=bc_valid, metrics_on=metrics_on), 'sac'))
     policy.update_target()
 
-    metrics['sac/mean_chunk_reward'] = real_reward.mean().item()
-    metrics['sac/mean_target'] = target.mean().item()
-    metrics['sac/chunk_diversity'] = policy.chunk_diversity(feat)
-    # THE metric for this method: how much the imagined continuation moved the
-    # target away from QC-FQL's 1-chunk version. Near zero means MVE is doing
-    # nothing and the run is just slower QC-FQL.
-    metrics['diagnosis/mve_target_delta'] = (target - qc_target).abs().mean().item()
-    metrics['diagnosis/qc_target_mean'] = qc_target.mean().item()
-    metrics['diagnosis/real_reward_mean'] = real_reward.mean().item()
-    metrics['diagnosis/real_valid_frac'] = valid.mean().item()
+    if not metrics_on:
+        # chunk_diversity runs extra forward passes and every .item() below is
+        # a blocking GPU sync -- both wasted on a step whose metrics are
+        # discarded. Training math is unchanged; only reporting is skipped.
+        return metrics
+        metrics['sac/mean_chunk_reward'] = real_reward.mean().item()
+        metrics['sac/mean_target'] = target.mean().item()
+        metrics['sac/chunk_diversity'] = policy.chunk_diversity(feat)
+        # THE metric for this method: how much the imagined continuation moved the
+        # target away from QC-FQL's 1-chunk version. Near zero means MVE is doing
+        # nothing and the run is just slower QC-FQL.
+        metrics['diagnosis/mve_target_delta'] = (target - qc_target).abs().mean().item()
+        metrics['diagnosis/qc_target_mean'] = qc_target.mean().item()
+        metrics['diagnosis/real_reward_mean'] = real_reward.mean().item()
+        metrics['diagnosis/real_valid_frac'] = valid.mean().item()
 
-    ir = img_rewards.reshape(num_chunks, -1)
-    ic = img_conts.reshape(num_chunks, -1)
-    metrics['diagnosis/imagined_reward_mean'] = img_rewards.mean().item()
-    metrics['diagnosis/imagined_reward_first_chunk'] = ir[0].mean().item()
-    metrics['diagnosis/imagined_reward_last_chunk'] = ir[-1].mean().item()
-    metrics['diagnosis/imagined_reward_max'] = img_rewards.max().item()
-    metrics['diagnosis/imagined_cont_last_chunk'] = ic[-1].mean().item()
-    metrics['diagnosis/intra_chunk_reward_first'] = step_rewards[0].mean().item()
-    metrics['diagnosis/intra_chunk_reward_last'] = step_rewards[-1].mean().item()
+        ir = img_rewards.reshape(num_chunks, -1)
+        ic = img_conts.reshape(num_chunks, -1)
+        metrics['diagnosis/imagined_reward_mean'] = img_rewards.mean().item()
+        metrics['diagnosis/imagined_reward_first_chunk'] = ir[0].mean().item()
+        metrics['diagnosis/imagined_reward_last_chunk'] = ir[-1].mean().item()
+        metrics['diagnosis/imagined_reward_max'] = img_rewards.max().item()
+        metrics['diagnosis/imagined_cont_last_chunk'] = ic[-1].mean().item()
+        metrics['diagnosis/intra_chunk_reward_first'] = step_rewards[0].mean().item()
+        metrics['diagnosis/intra_chunk_reward_last'] = step_rewards[-1].mean().item()
     return metrics
 
 def train(config):
@@ -194,6 +202,10 @@ def train(config):
     gamma_h = gamma ** chunk_len
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # TF32 tensor cores for fp32 matmuls; off by default in torch. Large free
+    # speedup on Ampere+, at a precision loss irrelevant beside the RSSM's own
+    # sampling noise.
+    torch.set_float32_matmul_precision('high')
     rng = np.random.default_rng(config.seed)
     set_seed_everywhere(config.seed)
     print(f'PyTorch device: {device} | JAX devices: {jax.devices()}')
@@ -233,12 +245,17 @@ def train(config):
         num_layers=chunk_config.num_layers, critic_target_tau=chunk_config.critic_target_tau,
         ensemble=chunk_config.ensemble, alpha=chunk_config.alpha,
         flow_steps=chunk_config.flow_steps, q_agg=chunk_config.q_agg,
+        compile_nets=chunk_config.compile_nets,
     )
 
     eval_csv = EvalCSV(out_dir / 'eval_log.csv', arm='world_model_mve',
                        env_name=general_config.env_name, seed=config.seed, chunk_len=chunk_len)
     eef_slice = tuple(chunk_config.eef_slice)
     start_time = time.time()
+    # One-element list so run_eval (a closure) can read the most recent value.
+    # Feeds the MVE break-even in the world-model report: required_corr is
+    # derived from the critic's current TD error, so the report needs it.
+    last_critic_loss = [None]
 
     def run_eval(step, n_updates):
         results = eval_chunk_in_env(
@@ -255,7 +272,18 @@ def train(config):
         }
         if results['video'] is not None:
             log_dict['eval/video'] = wandb.Video(results['video'], fps=20, format='mp4')
-        wandb.log(log_dict, step=step)
+        if chunk_config.wm_diag_states > 0:
+            wm_m = wm_report(
+                env, bridge, policy, chunk_config, chunk_len, gamma, device, rng,
+                action_dim, num_states=chunk_config.wm_diag_states,
+                depth=num_chunks, model_samples=chunk_config.wm_diag_samples,
+                critic_loss=last_critic_loss[0])
+            print_wm_report(wm_m)
+            log_dict.update(wm_m)
+            # the diagnostic drives the env itself; reset so the collection
+            # loop resumes from a clean episode
+            env.reset()
+        wandb.log(numeric_metrics(log_dict), step=step)
 
     n_updates = 0
     offline_steps = general_config.num_offline_steps
@@ -267,9 +295,12 @@ def train(config):
             metrics.update(_prefixed(_wm_update(wm_agent, replay, batch_size, seq_len, rng, i), 'wm'))
         if i % chunk_config.train_every == 0:
             m = _agent_update(bridge, policy, replay, batch_size, seq_len,
-                              chunk_config, chunk_len, num_chunks, device, rng, gamma, gamma_h)
+                              chunk_config, chunk_len, num_chunks, device, rng, gamma, gamma_h,
+                              metrics_on=(i % general_config.log_every == 0))
             if m is not None:
                 metrics.update(m)
+                if 'sac/critic_loss' in m:
+                    last_critic_loss[0] = m['sac/critic_loss']
                 n_updates += 1
         if metrics and i % general_config.log_every == 0:
             metrics['diagnosis/wm_param_norm'] = _param_norm(wm_agent.params)
@@ -335,9 +366,12 @@ def train(config):
         if (ready and global_step % chunk_config.train_every == 0
                 and global_step >= general_config.start_training):
             m = _agent_update(bridge, policy, replay, batch_size, seq_len,
-                              chunk_config, chunk_len, num_chunks, device, rng, gamma, gamma_h)
+                              chunk_config, chunk_len, num_chunks, device, rng, gamma, gamma_h,
+                              metrics_on=(global_step % general_config.log_every == 0))
             if m is not None:
                 metrics.update(m)
+                if 'sac/critic_loss' in m:
+                    last_critic_loss[0] = m['sac/critic_loss']
                 n_updates += 1
 
         if metrics and global_step % general_config.log_every == 0:

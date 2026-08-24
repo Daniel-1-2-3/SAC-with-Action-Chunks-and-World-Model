@@ -66,7 +66,7 @@ class ChunkAgent:
     def __init__(self, repr_dim, action_dim, chunk_len, device, lr, hidden_dim,
                  num_layers, critic_target_tau, ensemble=2, alpha=300.0,
                  flow_steps=10, q_agg='mean', actor_layer_norm=False,
-                 critic_layer_norm=True):
+                 critic_layer_norm=True, compile_nets=False):
         self.device = device
         self.action_dim = action_dim
         self.chunk_len = chunk_len
@@ -93,6 +93,27 @@ class ChunkAgent:
         self.actor_opt = torch.optim.Adam(
             list(self.actor_bc_flow.parameters()) + list(self.actor_onestep_flow.parameters()), lr=lr)
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr)
+
+        # A single actor update fires ~400 tiny CUDA kernels: flow_steps
+        # sequential passes through a 4-layer MLP, times three networks, plus
+        # backward. Each does microseconds of arithmetic, so wall-clock is
+        # dominated by launch cost, not FLOPs. torch.compile fuses them.
+        #
+        # mode='default', NOT 'reduce-overhead'. The latter enables CUDA
+        # graphs, which capture a fixed memory layout -- incompatible with two
+        # separate backward passes per step (critic, then actor) and with the
+        # critic being called under three different grad contexts. It fails at
+        # runtime, not compile time.
+        if compile_nets:
+            try:
+                opts = dict(mode='default', fullgraph=False)
+                self.actor_bc_flow = torch.compile(self.actor_bc_flow, **opts)
+                self.actor_onestep_flow = torch.compile(self.actor_onestep_flow, **opts)
+                self.critic = torch.compile(self.critic, **opts)
+                self.critic_target = torch.compile(self.critic_target, **opts)
+                print('[compile] torch.compile(default) enabled on actor/critic')
+            except Exception as e:
+                print(f'[compile] FAILED, running uncompiled: {e}')
 
         self.train()
         self.critic_target.train()
@@ -150,7 +171,8 @@ class ChunkAgent:
         next_chunk = self.sample_chunk(next_feats)
         return self._agg(self.critic_target(next_feats, next_chunk))
 
-    def update_critic(self, feat, chunk, target_Q, weight, n_real=None):
+    def update_critic(self, feat, chunk, target_Q, weight, n_real=None,
+                      metrics_on=True):
         """ acfql.critic_loss. weight is `valid` for the replay arm and the
             imagined survival weight for the world-model arm. The reference
             multiplies by the mask and takes a plain mean -- it does NOT
@@ -181,6 +203,12 @@ class ChunkAgent:
         critic_loss.backward()
         self.critic_opt.step()
 
+        if not metrics_on:
+            # Each .item() below is a blocking GPU->CPU sync. With
+            # log_every=100 these ran on all 100 steps and were used on one,
+            # stalling the pipeline ~24 times per step for nothing. Training
+            # math is untouched; only reporting is skipped.
+            return metrics
         q_mean = qs.mean(0)
         spread = qs.std(0)
         metrics['critic_loss'] = critic_loss.item()
@@ -208,7 +236,7 @@ class ChunkAgent:
         return metrics
 
     def update_actor(self, feat, weight, bc_feat, bc_chunk, bc_valid=None,
-                     actor_batch=None):
+                     actor_batch=None, metrics_on=True):
         """ acfql.actor_loss:
 
               actor_loss = bc_flow_loss + alpha * distill_loss + q_loss
@@ -271,6 +299,8 @@ class ChunkAgent:
         actor_loss.backward()
         self.actor_opt.step()
 
+        if not metrics_on:
+            return metrics
         metrics['actor_loss'] = actor_loss.item()
         metrics['bc_flow_loss'] = bc_flow_loss.item()
         metrics['distill_loss'] = distill_loss.item()

@@ -190,7 +190,10 @@ defaults:
       # The world model has no counterpart in QC, so this cadence is a free
       # choice. 10 is near standard Dreamer practice; 1 is ~5x slower for
       # little gain (batch_size * batch_length = 2048 frames per update).
-      train_every: 10
+      # 2, not 10 -- the world model gets 5x the updates per env step. It is
+      # the component every model-based variant depends on, and the offline
+      # phase costs no env steps, so this is cheap where it matters.
+      train_every: 2
       max_episodes: 2000
 
     chunk:
@@ -219,6 +222,19 @@ defaults:
       alpha: 300.0
       flow_steps: 10
       eef_slice: [12, 15]
+      # --- world-model accuracy checks, run at every eval (wm_diagnostics.py)
+      # States sampled per report. Correlations from ~13 states have SE ~0.105,
+      # where anything under 0.2 is indistinguishable from zero; 100 puts SE
+      # near 0.03. 0 disables.
+      wm_diag_states: 100
+      # Prior draws averaged per prediction. RSSM.imagine samples stoch every
+      # step, so one draw understates accuracy badly.
+      wm_diag_samples: 4
+      # torch.compile(mode='default') on the actor/critic. The per-step cost is
+      # ~400 tiny kernel launches rather than arithmetic, so fusing them is the
+      # lever. Costs a minute or two at startup; set False if it misbehaves --
+      # it is a pure speed change and alters no results.
+      compile_nets: True
 
   train_sac_chunked:
 
