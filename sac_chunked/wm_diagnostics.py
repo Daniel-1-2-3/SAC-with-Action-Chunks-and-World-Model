@@ -40,7 +40,7 @@ import torch
 from sac_chunked.chunk_utils import pool_chunk, pool_chunk_np
 from helpers.interop import jax_to_torch
 from helpers.ogbench_methods import OGBenchMethods
-from wm.imagination_chunk import decode_obs
+from wm.chunk_selector import decode_obs
 
 def _corr(a, b):
     a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)

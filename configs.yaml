@@ -150,30 +150,32 @@ defaults:
   # ---------------------------------------------------------------------
 
   train_sac_chunked_wm:
-    # QC-FQL with a model-based value expansion (MVE) target.
+    # QC-FQL training + model-scored chunk selection at act time.
     #
-    # The actor and critic run on RAW OBSERVATIONS, exactly like the
-    # no-world-model arm. The world model is used in ONE place: the bracketed
-    # continuation inside target_Q.
+    # TRAINING is plain QC-FQL on raw observations -- the target, critic,
+    # actor and batch are identical to the no-world-model arm, and
+    # _agent_update takes no world-model argument at all.
     #
-    #   QC-FQL:  R_real + gamma^h * mask * Q(s_next)
-    #   MVE:     R_real + gamma^h * mask * [R_1 + g*c_1*[ ... + g*c_N*Q(s_N)]]
+    # The world model is used in ONE place: at every chunk boundary the
+    # ChunkSelector samples select_n candidate chunks from the one-step
+    # policy, imagines each through the model from the current posterior
+    # latent, scores it as
     #
-    # The imagined chunks start at the latent encoding s_next and are sampled
-    # from the CURRENT actor, so they stay on-policy. Replay's own following
-    # actions cannot be used for this: they came from the policy that collected
-    # the data, so their rewards would estimate that old policy's return
-    # instead of the current one's. s_N is the DECODED observation at the
-    # deepest imagined latent, so a single observation-space critic serves both
-    # the real and the imagined bootstrap.
+    #   pooled imagined reward + gamma^h * cont * Q(decoded end state)
     #
-    # num_chunks: 0 makes the agent update never touch the world model, so the
-    # run reduces to QC-FQL exactly. That is the control.
+    # and executes the argmax. This targets the observed bottleneck directly:
+    # the previous runs never found a single online success, and selection
+    # changes WHICH chunks get executed, i.e. whether success data ever
+    # appears. It also degrades gracefully -- if the scores are uninformative
+    # noise, the argmax over i.i.d. policy samples is distributed like a
+    # single policy sample, so the worst case is QC-FQL, not below it.
     #
-    # Execution stays at chunk_len. That is the point -- raising chunk_len also
-    # raises how long the policy commits open-loop, and the QC paper's own h
-    # ablation shows performance degrading past h=10. MVE extends the critic's
-    # horizon without touching the control horizon.
+    # select_n: 1 disables the selector entirely (select() is policy.act and
+    # observe/record_action are no-ops), so the run reduces to QC-FQL
+    # exactly. That is the control.
+    #
+    # Execution stays at chunk_len. The selector chooses which chunk runs;
+    # the open-loop commitment length is unchanged.
 
     general:
       env_name: cube-triple-play-singletask-v0
@@ -203,16 +205,13 @@ defaults:
 
     chunk:
       chunk_len: 5
-      # Imagined chunks appended to the target. Bootstrap moves from
-      # chunk_len to chunk_len * (num_chunks + 1) env steps: 5 -> 20 at 3.
-      # Cost is num_chunks JAX dispatches per update, batch_size rows each.
-      num_chunks: 3
-      # 1.0 = the nested target written above: the ONLY bootstrap is Q at the
-      # deepest imagined state. Below 1.0 blends the shallower imagined
-      # bootstraps Q(s_1..s_N-1) in, which caps how far a model that degrades
-      # with depth can drag the target. Lower this first if wm/decode_mae or
-      # wm/reward_mae grows with depth.
-      mve_lambda: 1.0
+      # Candidate chunks sampled and model-scored per decision. This is the
+      # exploitation knob: QC's best-of-N analysis bounds the KL from the
+      # sampling policy by log N - (N-1)/N, and the paper used N=32 on
+      # cube-*. 16 halves the per-decision model cost; raise it if
+      # select/score_std says the scores separate candidates cleanly.
+      # 1 disables the selector -> exact QC-FQL (the control run).
+      select_n: 16
       # Real chunk transitions per critic/actor update -- QC's batch_size.
       batch_size: 256
       bc_batch: 256
@@ -237,8 +236,12 @@ defaults:
       wm_diag_states: 256
       # Prior draws averaged per prediction. RSSM.imagine samples stoch every
       # step, so one draw understates accuracy. The single-draw error is
-      # reported separately, since that is what the TARGET actually consumes.
+      # reported separately, since that is what the SELECTOR actually
+      # consumes (one draw per candidate).
       wm_diag_samples: 4
+      # Rollout depth of the accuracy report. The selector only ever looks 1
+      # chunk ahead, so 1 measures exactly what it consumes.
+      wm_diag_depth: 1
       # torch.compile(mode='default') on the actor/critic. The per-step cost is
       # ~400 tiny kernel launches rather than arithmetic, so fusing them is the
       # lever. Costs a minute or two at startup; set False if it misbehaves --
