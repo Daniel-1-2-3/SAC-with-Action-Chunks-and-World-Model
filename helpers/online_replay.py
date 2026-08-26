@@ -98,13 +98,18 @@ class OnlineReplay:
         return len(usable) >= min_episodes
 
     def sample_batch(self, batch_size, seq_len, rng=None,
-                     bias_start_to_reward=False):
-        """ bias_start_to_reward is for DIAGNOSTICS ONLY. Training batches must
-            stay uniform over start states; biasing them would change the data
-            distribution both the world model and the critic are fit on. The
-            world-model accuracy report uses it so its windows are guaranteed
-            to contain reward variation -- without that, every ground-truth
-            reward is identical and every correlation is undefined. """
+                     bias_start_to_reward=False, bias_reward_thresh=None):
+        """ bias_start_to_reward is for DIAGNOSTICS and Dyna SEED SELECTION
+            only. Training batches for the critic/actor and the world model
+            must stay uniform over start states; biasing them would change the
+            data distribution they are fit on.
+
+            bias_reward_thresh: reward level that counts as a "hit" when
+            biasing. Defaults to success_reward_thresh (-1.0, full success
+            only), which on cube-triple's play data almost never fires and
+            silently degrades the bias to uniform sampling. Pass the partial-
+            progress level (e.g. -2.5: anything above the -3 floor) when the
+            consumer needs reward VARIATION rather than full successes. """
         if rng is None:
             rng = np.random.default_rng()
 
@@ -114,8 +119,10 @@ class OnlineReplay:
                 f'No episodes long enough (need >= {seq_len} steps) to sample yet. '
                 f'Check replay.ready(seq_len) before calling sample_batch.')
 
+        thresh = self.success_reward_thresh if bias_reward_thresh is None \
+            else bias_reward_thresh
         return OGBenchMethods.sample_dreamer_batch(
             usable, batch_size, seq_len,
             obs_key=self.obs_key, action_key=self.action_key, rng=rng,
             bias_start_to_reward=bias_start_to_reward,
-            reward_thresh=self.success_reward_thresh)
+            reward_thresh=thresh)

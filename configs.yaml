@@ -150,32 +150,32 @@ defaults:
   # ---------------------------------------------------------------------
 
   train_sac_chunked_wm:
-    # QC-FQL training + model-scored chunk selection at act time.
+    # QC-FQL training + Dyna critic-batch augmentation.
     #
-    # TRAINING is plain QC-FQL on raw observations -- the target, critic,
-    # actor and batch are identical to the no-world-model arm, and
-    # _agent_update takes no world-model argument at all.
+    # The ACTOR update, the BC flow term, acting and eval are plain QC-FQL on
+    # raw observations -- identical to the no-world-model arm. The world
+    # model changes exactly one thing: the CRITIC also trains on dyna_batch
+    # imagined chunk transitions per update, down-weighted by dyna_weight.
     #
-    # The world model is used in ONE place: at every chunk boundary the
-    # ChunkSelector samples select_n candidate chunks from the one-step
-    # policy, imagines each through the model from the current posterior
-    # latent, scores it as
+    # Each imagined transition starts from a REAL replay observation (the
+    # critic's input distribution stays anchored), takes a chunk from the
+    # CURRENT policy, and reads reward/cont/next-state from the model:
     #
-    #   pooled imagined reward + gamma^h * cont * Q(decoded end state)
+    #   (s_real, a ~ pi(s), r_model, cont_model, decoded s'_model)
+    #   target = r_model + gamma^h * cont_model * Q(s'_model)
     #
-    # and executes the argmax. This targets the observed bottleneck directly:
-    # the previous runs never found a single online success, and selection
-    # changes WHICH chunks get executed, i.e. whether success data ever
-    # appears. It also degrades gracefully -- if the scores are uninformative
-    # noise, the argmax over i.i.d. policy samples is distributed like a
-    # single policy sample, so the worst case is QC-FQL, not below it.
+    # Replay can only ever say what the EXECUTED chunk did from a state; this
+    # asks what a current-policy chunk would do from the same state. A
+    # dyna_success_frac share of seeds is placed 1..chunk_len steps before an
+    # above-dyna_seed_thresh reward in replay, so imagined chunks overlap the
+    # rare signal moments -- the one resource this task is starved of.
     #
-    # select_n: 1 disables the selector entirely (select() is policy.act and
-    # observe/record_action are no-ops), so the run reduces to QC-FQL
-    # exactly. That is the control.
+    # Containment: imagined rows are down-weighted, real rows anchor every
+    # update, and update_critic's n_real split reports critic_mse_imagined
+    # vs critic_mse_real so model poisoning is visible immediately.
     #
-    # Execution stays at chunk_len. The selector chooses which chunk runs;
-    # the open-loop commitment length is unchanged.
+    # dyna_batch: 0 skips the world model entirely, so the run reduces to
+    # QC-FQL exactly. That is the control.
 
     general:
       env_name: cube-triple-play-singletask-v0
@@ -205,13 +205,22 @@ defaults:
 
     chunk:
       chunk_len: 5
-      # Candidate chunks sampled and model-scored per decision. This is the
-      # exploitation knob: QC's best-of-N analysis bounds the KL from the
-      # sampling policy by log N - (N-1)/N, and the paper used N=32 on
-      # cube-*. 16 halves the per-decision model cost; raise it if
-      # select/score_std says the scores separate candidates cleanly.
-      # 1 disables the selector -> exact QC-FQL (the control run).
-      select_n: 16
+      # Imagined chunk transitions added to every critic update, alongside
+      # batch_size real ones. 0 disables Dyna -> exact QC-FQL (the control).
+      dyna_batch: 256
+      # Loss weight on imagined rows (real rows use their `valid` mask, ~1).
+      # Raise toward 1.0 only if diagnosis/critic_mse_imagined tracks
+      # critic_mse_real; drop it first if eval regresses under Dyna.
+      dyna_weight: 0.5
+      # Share of imagined seeds drawn from replay windows containing reward
+      # above dyna_seed_thresh, placed 1..chunk_len steps before the reward
+      # moment. The rest are uniform replay states. Falls back to uniform
+      # (logged as dyna/success_seed_frac) when no such windows exist yet.
+      dyna_success_frac: 0.5
+      # Reward level that counts as signal for seeding. cube-triple's floor
+      # is -3 (all cubes wrong); -2.5 catches any partial progress. The
+      # replay's own -1.0 (full success) almost never fires on play data.
+      dyna_seed_thresh: -2.5
       # Real chunk transitions per critic/actor update -- QC's batch_size.
       batch_size: 256
       bc_batch: 256
@@ -236,12 +245,17 @@ defaults:
       wm_diag_states: 256
       # Prior draws averaged per prediction. RSSM.imagine samples stoch every
       # step, so one draw understates accuracy. The single-draw error is
-      # reported separately, since that is what the SELECTOR actually
-      # consumes (one draw per candidate).
+      # reported separately, since that is what Dyna actually consumes (one
+      # draw per imagined transition).
       wm_diag_samples: 4
-      # Rollout depth of the accuracy report. The selector only ever looks 1
-      # chunk ahead, so 1 measures exactly what it consumes.
+      # Rollout depth of the accuracy report. Dyna imagines exactly 1 chunk
+      # per transition, so 1 measures exactly what it consumes.
       wm_diag_depth: 1
+      # Reward level that counts as a hit for the report's biased sampling.
+      # Matches dyna_seed_thresh: partial progress, not full success --
+      # full-success windows barely exist in play data and the bias would
+      # silently degrade to uniform (constant-reward, NaN correlations).
+      wm_diag_reward_thresh: -2.5
       # torch.compile(mode='default') on the actor/critic. The per-step cost is
       # ~400 tiny kernel launches rather than arithmetic, so fusing them is the
       # lever. Costs a minute or two at startup; set False if it misbehaves --
