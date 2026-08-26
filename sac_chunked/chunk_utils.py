@@ -71,153 +71,104 @@ def step_valid_np(terminals):
         run_term = np.maximum(run_term, terminals[:, k])
     return valid
 
-def chunk_lambda_targets(chunk_rewards, chunk_conts, next_values, gamma_h, lam, num_chunks):
-    """ Identical recursion to the single-step lambda_targets in
-        sac_wm_agent.py, run over chunks instead of steps. The only change is
-        that gamma has become gamma ** chunk_len, because chunk_len real
-        environment steps elapse between consecutive entries.
+def mve_continuation(img_rewards, img_conts, final_value, gamma_h, lam=1.0,
+                     inter_values=None):
+    """ The imagined continuation that replaces QC-FQL's Q(s_next) inside the
+        target. The caller multiplies this by gamma^h * mask and adds the real
+        chunk reward, so this function returns ONLY the bracketed term:
 
-        All inputs are the flattened (num_chunks * batch, 1) tensors that
-        imagine_chunk_rollout returns, chunk-major. """
-    batch = chunk_rewards.shape[0] // num_chunks
-    r = chunk_rewards.reshape(num_chunks, batch, 1)
-    c = chunk_conts.reshape(num_chunks, batch, 1)
-    v = next_values.reshape(num_chunks, batch, 1)
+            [ R_1 + g*c_1 * [ R_2 + g*c_2 * [ ... + g*c_N * Q(s_N) ] ] ]
 
-    ret = v[-1]
-    outs = []
+        with g = gamma^chunk_len. lam=1.0 is exactly that nesting: the only
+        bootstrap is Q at the deepest imagined state, and inter_values is not
+        needed (the caller should not spend the forward passes computing it).
+        lam<1 blends the shallower imagined bootstraps Q(s_1..s_N) in, which
+        caps how far a model that degrades with depth can drag the target; it
+        requires inter_values.
+
+        img_rewards, img_conts: (num_chunks, batch, 1), chunk-major.
+        final_value:  (batch, 1), target-critic value at the deepest state.
+        inter_values: (num_chunks, batch, 1) or None; inter_values[-1] must
+                      equal final_value when supplied.
+
+        Returns (batch, 1). """
+    num_chunks = img_rewards.shape[0]
+    if lam < 1.0 and inter_values is None:
+        raise ValueError('mve_continuation needs inter_values when lam < 1.0')
+    ret = final_value
     for t in reversed(range(num_chunks)):
-        ret = r[t] + gamma_h * c[t] * ((1 - lam) * v[t] + lam * ret)
-        outs.append(ret)
-    return torch.stack(outs[::-1], dim=0).reshape(num_chunks * batch, 1)
+        blended = ret if lam >= 1.0 else (1.0 - lam) * inter_values[t] + lam * ret
+        ret = img_rewards[t] + gamma_h * img_conts[t] * blended
+    return ret
 
-def mve_target(real_reward, real_mask, img_rewards, img_conts, img_values,
-               gamma_h, lam, num_chunks):
-    """ Model-based value expansion target for one real chunk transition.
+def real_chunk_transitions(batch_np, chunk_len, gamma, obs_key='state',
+                           action_key='action'):
+    """ Real chunk transitions from a Dreamer batch: everything the critic and
+        actor need, in the same form the no-world-model arm builds them.
 
-        QC-FQL's target stops after the real chunk:
-
-            R_0 + gamma^h * m_0 * Q(L_0)
-
-        because extending it would need the actions that follow in replay, and
-        those came from the policy that collected the data rather than the
-        current one -- the sum would estimate the OLD policy's return.
-
-        Here the continuation is imagined under the current actor instead, so
-        it stays on-policy and the bootstrap moves from 1 chunk out to
-        num_chunks+1 chunks out:
-
-            R_0 + gamma^h * m_0 * [ R_1 + gamma^h*c_1 * [ ... + gamma^h*c_N * Q(L_N) ] ]
-
-        lam blends across horizons rather than committing to the deepest one:
-        lam=1.0 is pure MVE (bootstrap only at L_N), lam<1 mixes in the
-        shallower bootstraps, so a poor model at depth degrades gracefully
-        toward QC-FQL's own 1-chunk target instead of poisoning it.
-
-        real_reward, real_mask: (B, 1) from the REAL replayed chunk.
-        img_*: (num_chunks * B, 1), chunk-major, from imagine_chunk_rollout.
-        img_values: target-critic value at the latent AFTER each imagined chunk.
-        Returns (B, 1). """
-    batch = real_reward.shape[0]
-    r = img_rewards.reshape(num_chunks, batch, 1)
-    c = img_conts.reshape(num_chunks, batch, 1)
-    v = img_values.reshape(num_chunks, batch, 1)
-
-    ret = v[-1]
-    for t in reversed(range(num_chunks)):
-        ret = r[t] + gamma_h * c[t] * ((1 - lam) * v[t] + lam * ret)
-    return real_reward + gamma_h * real_mask * ret
-
-def chunk_pair_indices(batch_np, chunk_len, action_key='action'):
-    """ Builds aligned (flat latent index, action chunk, per-step valid) triples
-        from a Dreamer batch, for the BC flow term in the world-model arm.
-
-        seed_pool flattens the (batch, seq_len) leading dims, so flat index i
-        corresponds to sequence i // seq_len at timestep i % seq_len.
-
-        Dreamer's convention (see OGBenchMethods.ogbench_to_dreamer_episode)
-        is that action[t] is the action taken FROM state[t], so the chunk
-        launched at latent t is action[t : t + chunk_len].
-
-        Windows are NOT rejected for crossing an episode boundary, matching
-        QC's sample_sequence -- they are kept and masked per position, so the
-        seed distribution stays uniform. Only windows running past the end of
-        the sampled sequence are dropped, since those actions do not exist. """
-    actions = np.asarray(batch_np[action_key])
-    is_last = np.asarray(batch_np['is_last']).astype(np.float32)
-    n_seq, seq_len, action_dim = actions.shape
-
-    if seq_len < chunk_len:
-        return (np.zeros((0,), dtype=np.int64),
-                np.zeros((0, chunk_len * action_dim), dtype=np.float32),
-                np.zeros((0, chunk_len), dtype=np.float32))
-
-    starts = np.arange(seq_len - chunk_len + 1)
-    window = starts[:, None] + np.arange(chunk_len)[None, :]
-
-    seq_ok, start_ok = np.nonzero(np.ones((n_seq, len(starts)), dtype=bool))
-    flat_idx = seq_ok * seq_len + starts[start_ok]
-    chunks = actions[seq_ok[:, None], window[start_ok]]
-    terms = is_last[seq_ok[:, None], window[start_ok]]
-    valid = step_valid_np(terms)
-    return (flat_idx.astype(np.int64),
-            chunks.reshape(len(seq_ok), chunk_len * action_dim).astype(np.float32),
-            valid)
-
-def real_chunk_transitions(batch_np, chunk_len, gamma, action_key='action'):
-    """ Real (not imagined) chunk transitions from a Dreamer batch, for
-        MIXING into the critic/actor update alongside imagined ones.
-
-        Same window convention as chunk_pair_indices: action[t] is taken FROM
-        state[t], so the chunk launched at latent index t is
+        action[t] is taken FROM state[t], so the chunk launched at index t is
         action[t : t+chunk_len]. Reward and discount do NOT share that
-        indexing -- OGBenchMethods.ogbench_to_dreamer_episode assigns
-        Dreamer reward[t] to ARRIVING at state[t] ("reward[t+1] = OGBench
-        reward[t]"), and discount/is_terminal are built the same way. So the
-        reward and discount attributable to the chunk launched at t are at
+        indexing -- OGBenchMethods.ogbench_to_dreamer_episode assigns Dreamer
+        reward[t] to ARRIVING at state[t] ("reward[t+1] = OGBench reward[t]"),
+        and discount/is_terminal are built the same way. So the reward and
+        discount attributable to the chunk launched at t are at
         [t+1 : t+chunk_len+1], one index ahead of the actions. Getting this
         wrong silently misattributes every reward by one step.
 
-        Also requires room for a NEXT latent (index t+chunk_len) inside the
-        same sampled sequence, since the critic target needs
-        Q(next_feat, ...) -- chunk_pair_indices doesn't need this because BC
-        pairs have no bootstrap target. This makes the valid start range one
-        shorter than chunk_pair_indices': starts <= seq_len - chunk_len - 1.
+        Requires room for the NEXT state (index t+chunk_len) inside the same
+        sampled sequence, since the target needs Q(s_{t+h}, .).
 
-        `valid` marks windows that had not already ended before their FIRST
-        real reward position (t+1), matching pool_chunk_np's semantics.
+        Windows are NOT rejected for crossing an episode boundary, matching
+        QC's sample_sequence -- they are kept and masked, so the start-state
+        distribution stays uniform.
 
-        Returns (flat_idx, next_flat_idx, chunks, chunk_reward, chunk_mask,
-        valid), each length-matched: flat_idx/next_flat_idx are int64 pool
-        indices, chunks is (N, chunk_len*action_dim), the rest are (N, 1). """
-    actions = np.asarray(batch_np[action_key])
+        Returns a dict of numpy arrays, all length-matched on the first axis:
+          idx, next_idx   int64 flat indices into the (batch*seq_len) axis
+          obs, next_obs   (N, obs_dim)
+          chunk           (N, chunk_len * action_dim)
+          reward, mask    (N, 1) pooled over the chunk
+          valid           (N, 1) window had not already ended
+          step_valid      (N, chunk_len) per-position, for the BC flow loss """
+    obs = np.asarray(batch_np[obs_key], dtype=np.float32)
+    actions = np.asarray(batch_np[action_key], dtype=np.float32)
     reward = np.asarray(batch_np['reward'], dtype=np.float32)
     discount = np.asarray(batch_np['discount'], dtype=np.float32)
     is_last = np.asarray(batch_np['is_last']).astype(np.float32)
     n_seq, seq_len, action_dim = actions.shape
+    obs_dim = obs.shape[-1]
 
     if seq_len < chunk_len + 1:
-        z = lambda n: np.zeros((0, n), dtype=np.float32)
-        return (np.zeros((0,), dtype=np.int64), np.zeros((0,), dtype=np.int64),
-                np.zeros((0, chunk_len * action_dim), dtype=np.float32),
-                z(1), z(1), z(1))
+        return None
 
-    starts = np.arange(seq_len - chunk_len) # one shorter than chunk_pair_indices
+    obs_flat = obs.reshape(-1, obs_dim)
+    starts = np.arange(seq_len - chunk_len)
     action_window = starts[:, None] + np.arange(chunk_len)[None, :]
     reward_window = action_window + 1 # shifted: reward/discount lag actions by 1
 
     seq_ok, start_ok = np.nonzero(np.ones((n_seq, len(starts)), dtype=bool))
     s = starts[start_ok]
-    flat_idx = (seq_ok * seq_len + s).astype(np.int64)
-    next_flat_idx = (seq_ok * seq_len + s + chunk_len).astype(np.int64)
-    chunks = actions[seq_ok[:, None], action_window[start_ok]]
-    chunks = chunks.reshape(len(seq_ok), chunk_len * action_dim).astype(np.float32)
+    idx = (seq_ok * seq_len + s).astype(np.int64)
+    next_idx = (seq_ok * seq_len + s + chunk_len).astype(np.int64)
+
+    chunk = actions[seq_ok[:, None], action_window[start_ok]]
+    chunk = chunk.reshape(len(seq_ok), chunk_len * action_dim).astype(np.float32)
 
     r = reward[seq_ok[:, None], reward_window[start_ok]]
     m = discount[seq_ok[:, None], reward_window[start_ok]]
     t = is_last[seq_ok[:, None], reward_window[start_ok]]
     chunk_reward, chunk_mask, valid = pool_chunk_np(r, m, t, gamma)
-    return flat_idx, next_flat_idx, chunks, chunk_reward, chunk_mask, valid
+
+    return {
+        'idx': idx,
+        'next_idx': next_idx,
+        'obs': obs_flat[idx],
+        'next_obs': obs_flat[next_idx],
+        'chunk': chunk,
+        'reward': chunk_reward,
+        'mask': chunk_mask,
+        'valid': valid,
+        'step_valid': step_valid_np(t),
+    }
 
 def temporal_coherence(positions, stride=5):
     """ QC's action-coherency proxy (their Figure 4, right): mean L2 distance

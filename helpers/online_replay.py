@@ -97,7 +97,14 @@ class OnlineReplay:
         usable = [e for e in self.dreamer_episodes if len(e[self.obs_key]) >= seq_len]
         return len(usable) >= min_episodes
 
-    def sample_batch(self, batch_size, seq_len, rng=None):
+    def sample_batch(self, batch_size, seq_len, rng=None,
+                     bias_start_to_reward=False):
+        """ bias_start_to_reward is for DIAGNOSTICS ONLY. Training batches must
+            stay uniform over start states; biasing them would change the data
+            distribution both the world model and the critic are fit on. The
+            world-model accuracy report uses it so its windows are guaranteed
+            to contain reward variation -- without that, every ground-truth
+            reward is identical and every correlation is undefined. """
         if rng is None:
             rng = np.random.default_rng()
 
@@ -109,4 +116,6 @@ class OnlineReplay:
 
         return OGBenchMethods.sample_dreamer_batch(
             usable, batch_size, seq_len,
-            obs_key=self.obs_key, action_key=self.action_key, rng=rng)
+            obs_key=self.obs_key, action_key=self.action_key, rng=rng,
+            bias_start_to_reward=bias_start_to_reward,
+            reward_thresh=self.success_reward_thresh)

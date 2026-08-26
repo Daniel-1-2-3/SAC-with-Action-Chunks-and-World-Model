@@ -16,11 +16,11 @@ from dreamer.wm_agent import WorldModelAgent
 from dreamer.wm_bridge import WorldModelBridge
 from sac_chunked.sac_chunk_agent import ChunkAgent
 from helpers.sac_wm_utils import set_seed_everywhere
-from sac_chunked.chunk_utils import chunk_pair_indices, real_chunk_transitions, mve_target
+from sac_chunked.chunk_utils import real_chunk_transitions, mve_continuation
 from sac_chunked.evaluation_chunk import eval_chunk_in_env, EvalCSV
 from sac_chunked.wm_diagnostics import wm_report, print_wm_report
 from wm.imagination_chunk import imagine_chunk_rollout
-from helpers.interop import jax_to_torch, numeric_metrics, unwrap
+from helpers.interop import numeric_metrics, unwrap
 from helpers.ogbench_methods import OGBenchMethods
 from helpers.online_replay import OnlineReplay
 
@@ -60,7 +60,14 @@ def build_real_env(env_name, load_offline_dataset):
     return env, None, None
 
 def _param_norm(params):
-    leaves = jax.tree_util.tree_leaves(params)
+    """ Norm over FLOATING-POINT leaves only. tree_leaves(params) also returns
+        integer counters, and squaring those made the reported norm move for
+        reasons unrelated to the weights. """
+    leaves = [x for x in jax.tree_util.tree_leaves(params)
+              if hasattr(x, 'dtype')
+              and jax.numpy.issubdtype(x.dtype, jax.numpy.floating)]
+    if not leaves:
+        return float('nan')
     squares = [jax.numpy.sum(jax.numpy.square(x)) for x in leaves]
     total = jax.numpy.sum(jax.numpy.stack(squares))
     return float(jax.device_get(total)) ** 0.5
@@ -80,83 +87,89 @@ def _wm_update(wm_agent, replay, batch_size, seq_len, rng, global_step):
     wm_carry, outs, wm_mets = wm_agent.train(wm_carry, batch)
     return wm_mets
 
-def _agent_update(bridge, policy, replay, config_batch, seq_len, chunk_config,
+def _agent_update(bridge, policy, replay, wm_batch, seq_len, chunk_config,
                   chunk_len, num_chunks, device, rng, gamma, gamma_h,
                   metrics_on=True):
     """ QC-FQL with a model-based value expansion (MVE) target.
 
-        The critic and actor train on REAL states and REAL chunks only -- the
-        batch is exactly what plain QC-FQL would use, and the actor loss is
-        untouched. The world model changes one thing: how target_Q is computed.
+        The world model is used in EXACTLY one place: the bracketed
+        continuation inside target_Q. The actor, the critic, the batch, the BC
+        flow term and the action selection are all plain QC-FQL on raw
+        observations.
 
-        QC-FQL:  target = R_real + gamma^h * mask * Q(L_0)
-        Here:    target = R_real + gamma^h * mask * [imagined continuation]
+            QC-FQL:  target = R_real + gamma^h * mask * Q(s_next)
+            MVE:     target = R_real + gamma^h * mask *
+                              [ R_1 + g*c_1 * [ ... + g*c_N * Q(s_N) ] ]
 
-        where the continuation is num_chunks chunks sampled from the CURRENT
-        actor and rolled through the model, starting from L_0 -- the latent at
-        the state the real chunk ended at. Replay's own following actions
-        cannot be used for this because they came from the policy that
-        collected the data, so their rewards would estimate that old policy's
-        return rather than the current one's. """
-    seed_batch_np = replay.sample_batch(config_batch, seq_len, rng=rng)
-    seed_batch = OGBenchMethods.to_jax(seed_batch_np)
-    pool = bridge.seed_pool(seed_batch, config_batch)
+        The imagined chunks start at the latent encoding s_next and are
+        sampled from the CURRENT actor, so the continuation stays on-policy.
+        Replay's own following actions cannot be used for this: they came from
+        the policy that collected the data, so their rewards would estimate
+        that old policy's return instead of the current one's.
 
-    flat_idx, next_flat_idx, chunks_np, chunk_r_np, chunk_m_np, valid_np = \
-        real_chunk_transitions(seed_batch_np, chunk_len, gamma, action_key=ACTION_KEY)
-    if len(flat_idx) == 0:
+        num_chunks=0 short-circuits the model entirely -- the bridge is never
+        touched and this reduces to QC-FQL exactly. That is the control run. """
+    batch_np = replay.sample_batch(wm_batch, seq_len, rng=rng)
+    data = real_chunk_transitions(batch_np, chunk_len, gamma,
+                                  obs_key=OBS_KEY, action_key=ACTION_KEY)
+    if data is None or len(data['idx']) == 0:
         return None
-    take = min(chunk_config.batch_size, len(flat_idx))
-    sel = rng.choice(len(flat_idx), size=take, replace=False)
 
-    # One place_seed for both the chunk-start latents (critic/actor input) and
-    # the chunk-end latents (imagination seeds), so the model is touched once.
-    both_idx = np.concatenate([flat_idx[sel], next_flat_idx[sel]])
-    both_pool = {k: v[both_idx] for k, v in pool.items()}
-    both_carry = bridge.place_seed(both_pool)
-    both_feat = jax_to_torch(bridge.get_feat(both_carry), device)
-    feat = both_feat[:take]
+    take = min(chunk_config.batch_size, len(data['idx']))
+    sel = rng.choice(len(data['idx']), size=take, replace=False)
 
     to = lambda x: torch.as_tensor(x, device=device).float()
-    chunk = to(chunks_np[sel])
-    real_reward = to(chunk_r_np[sel])
-    real_mask = to(chunk_m_np[sel])
-    valid = to(valid_np[sel])
+    obs = to(data['obs'][sel])
+    next_obs = to(data['next_obs'][sel])
+    chunk = to(data['chunk'][sel])
+    real_reward = to(data['reward'][sel])
+    real_mask = to(data['mask'][sel])
+    valid = to(data['valid'][sel])
+    step_valid = to(data['step_valid'][sel])
 
-    # Imagination seeds: the chunk-END latents only.
-    seed_carry = bridge.place_seed({k: v[next_flat_idx[sel]] for k, v in pool.items()})
-    img_rewards, img_conts, img_next_feats, step_rewards = imagine_chunk_rollout(
-        bridge, policy, seed_carry, num_chunks, chunk_len,
-        device, gamma, reward_shift=chunk_config.reward_shift)
-
+    # Q(s_next) is QC-FQL's whole target. With MVE it is not part of the
+    # target at all -- it is only needed to LOG how far MVE moved things -- so
+    # on a step whose metrics are discarded it is not computed.
+    lam = chunk_config.mve_lambda
+    need_qc = (num_chunks == 0) or metrics_on
+    img_rewards = img_conts = final_value = None
     with torch.no_grad():
-        img_values = policy.chunk_target_values(img_next_feats)
-        target = mve_target(real_reward, real_mask, img_rewards, img_conts,
-                            img_values, gamma_h, chunk_config.mve_lambda, num_chunks)
-        # QC-FQL's own 1-chunk target, logged for comparison only -- the
-        # critic is never trained on it.
-        qc_target = real_reward + gamma_h * real_mask * policy.chunk_target_values(
-            both_feat[take:])
+        qc_value = policy.chunk_target_values(next_obs) if need_qc else None
+        if num_chunks > 0:
+            pool = bridge.seed_pool(OGBenchMethods.to_jax(batch_np), wm_batch)
+            seed_carry = bridge.place_seed(
+                {k: v[data['next_idx'][sel]] for k, v in pool.items()})
+            img_rewards, img_conts, img_obs = imagine_chunk_rollout(
+                bridge, policy, seed_carry, num_chunks, chunk_len, device,
+                gamma, obs_key=OBS_KEY, reward_shift=chunk_config.reward_shift)
+            if lam >= 1.0:
+                # Pure nesting: only the deepest bootstrap appears in the
+                # target, so the shallower ones are not worth their forward
+                # passes.
+                inter_values = None
+                final_value = policy.chunk_target_values(img_obs[-1])
+            else:
+                inter_values = torch.stack(
+                    [policy.chunk_target_values(o) for o in img_obs])
+                final_value = inter_values[-1]
+            cont_value = mve_continuation(img_rewards, img_conts, final_value,
+                                          gamma_h, lam, inter_values)
+        else:
+            cont_value = qc_value
+        target = real_reward + gamma_h * real_mask * cont_value
+        # QC-FQL's own 1-chunk target, for comparison only. The critic is
+        # never trained on it.
+        qc_target = (real_reward + gamma_h * real_mask * qc_value
+                     if need_qc else None)
 
     metrics = {}
     metrics.update(_prefixed(policy.update_critic(
-        feat, chunk, target, valid, metrics_on=metrics_on), 'sac'))
-    # Actor is plain QC-FQL: same batch drives distill/Q and the flow-matching
+        obs, chunk, target, valid, metrics_on=metrics_on), 'sac'))
+    # Actor is plain QC-FQL: one batch drives distill/Q and the flow-matching
     # term, exactly as agents/acfql.py does.
-    bc_idx, bc_chunks_np, bc_valid_np = chunk_pair_indices(
-        seed_batch_np, chunk_len, action_key=ACTION_KEY)
-    if len(bc_idx) > 0:
-        take_bc = min(chunk_config.bc_batch, len(bc_idx))
-        sel_bc = rng.choice(len(bc_idx), size=take_bc, replace=False)
-        bc_feat = jax_to_torch(bridge.get_feat(bridge.place_seed(
-            {k: v[bc_idx[sel_bc]] for k, v in pool.items()})), device)
-        bc_chunks = to(bc_chunks_np[sel_bc])
-        bc_valid = to(bc_valid_np[sel_bc])
-    else:
-        bc_feat, bc_chunks, bc_valid = feat, chunk, None
     metrics.update(_prefixed(policy.update_actor(
-        feat, torch.ones_like(valid), bc_feat=bc_feat,
-        bc_chunk=bc_chunks, bc_valid=bc_valid, metrics_on=metrics_on), 'sac'))
+        obs, torch.ones_like(valid), bc_feat=obs, bc_chunk=chunk,
+        bc_valid=step_valid, metrics_on=metrics_on), 'sac'))
     policy.update_target()
 
     if not metrics_on:
@@ -164,26 +177,28 @@ def _agent_update(bridge, policy, replay, config_batch, seq_len, chunk_config,
         # a blocking GPU sync -- both wasted on a step whose metrics are
         # discarded. Training math is unchanged; only reporting is skipped.
         return metrics
-        metrics['sac/mean_chunk_reward'] = real_reward.mean().item()
-        metrics['sac/mean_target'] = target.mean().item()
-        metrics['sac/chunk_diversity'] = policy.chunk_diversity(feat)
-        # THE metric for this method: how much the imagined continuation moved the
-        # target away from QC-FQL's 1-chunk version. Near zero means MVE is doing
-        # nothing and the run is just slower QC-FQL.
-        metrics['diagnosis/mve_target_delta'] = (target - qc_target).abs().mean().item()
-        metrics['diagnosis/qc_target_mean'] = qc_target.mean().item()
-        metrics['diagnosis/real_reward_mean'] = real_reward.mean().item()
-        metrics['diagnosis/real_valid_frac'] = valid.mean().item()
 
-        ir = img_rewards.reshape(num_chunks, -1)
-        ic = img_conts.reshape(num_chunks, -1)
-        metrics['diagnosis/imagined_reward_mean'] = img_rewards.mean().item()
-        metrics['diagnosis/imagined_reward_first_chunk'] = ir[0].mean().item()
-        metrics['diagnosis/imagined_reward_last_chunk'] = ir[-1].mean().item()
-        metrics['diagnosis/imagined_reward_max'] = img_rewards.max().item()
-        metrics['diagnosis/imagined_cont_last_chunk'] = ic[-1].mean().item()
-        metrics['diagnosis/intra_chunk_reward_first'] = step_rewards[0].mean().item()
-        metrics['diagnosis/intra_chunk_reward_last'] = step_rewards[-1].mean().item()
+    metrics['sac/mean_chunk_reward'] = real_reward.mean().item()
+    metrics['sac/mean_chunk_mask'] = real_mask.mean().item()
+    metrics['sac/valid_frac'] = valid.mean().item()
+    metrics['sac/chunk_diversity'] = policy.chunk_diversity(obs)
+    metrics['diagnosis/batch_reward_max'] = real_reward.max().item()
+
+    # THE metric for this method: how far the imagined continuation moved the
+    # target away from QC-FQL's. Zero means the model changed nothing and the
+    # run is QC-FQL with extra steps.
+    metrics['mve/target_delta'] = (target - qc_target).abs().mean().item()
+    metrics['mve/target_mean'] = target.mean().item()
+    metrics['mve/qc_target_mean'] = qc_target.mean().item()
+    if num_chunks > 0:
+        for k in range(num_chunks):
+            metrics[f'mve/img_reward_chunk{k+1}'] = img_rewards[k].mean().item()
+            metrics[f'mve/img_cont_chunk{k+1}'] = img_conts[k].mean().item()
+        # Share of the target's magnitude that is the deepest bootstrap rather
+        # than imagined reward. Near 1.0 means the imagined rewards are
+        # decoration and only Q(s_N) matters.
+        deep = (gamma_h ** (num_chunks + 1)) * final_value.abs().mean()
+        metrics['mve/bootstrap_share'] = (deep / target.abs().mean().clamp_min(1e-8)).item()
     return metrics
 
 def train(config):
@@ -194,7 +209,7 @@ def train(config):
     out_dir = pathlib.Path(general_config.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    batch_size = config.batch_size
+    wm_batch = config.batch_size
     seq_len = config.batch_length
     chunk_len = chunk_config.chunk_len
     num_chunks = chunk_config.num_chunks
@@ -209,9 +224,16 @@ def train(config):
     rng = np.random.default_rng(config.seed)
     set_seed_everywhere(config.seed)
     print(f'PyTorch device: {device} | JAX devices: {jax.devices()}')
-    print(f'MVE: real chunk + {num_chunks} imagined chunks -> bootstrap at '
-          f'{chunk_len * (num_chunks + 1)} env steps (QC-FQL: {chunk_len}) | '
-          f'lambda={chunk_config.mve_lambda} alpha={chunk_config.alpha}')
+    if num_chunks > 0:
+        print(f'MVE: real chunk + {num_chunks} imagined chunks -> bootstrap at '
+              f'{chunk_len * (num_chunks + 1)} env steps (QC-FQL: {chunk_len}) | '
+              f'lambda={chunk_config.mve_lambda} alpha={chunk_config.alpha}')
+    else:
+        print('num_chunks=0: world model NOT used in the target. This run is '
+              'plain QC-FQL and should track the no-world-model arm.')
+    print(f'wm report: {chunk_config.wm_diag_states} windows x '
+          f'{chunk_config.wm_diag_samples} prior draws, offline against replay, '
+          f'0 env steps')
     wandb.init(project=general_config.wandb_project, mode=general_config.wandb_mode, config=config.flat)
 
     env, train_dataset, _ = build_real_env(general_config.env_name, general_config.seed_from_offline)
@@ -221,16 +243,13 @@ def train(config):
     action_dim = env.action_space.shape[0]
     obs_space, act_space = OGBenchMethods.make_spaces(obs_dim, action_dim, OBS_KEY, ACTION_KEY)
 
-    agent_config = build_agent_config(config, batch_size, seq_len, out_dir / 'wm_ckpts')
+    agent_config = build_agent_config(config, wm_batch, seq_len, out_dir / 'wm_ckpts')
     wm_agent = WorldModelAgent(obs_space, act_space, agent_config)
     if general_config.wm_ckpt:
         print(f'Loading world model checkpoint: {general_config.wm_ckpt}')
         raw = np.load(general_config.wm_ckpt, allow_pickle=True)
         wm_agent.load({k: unwrap(raw[k]) for k in raw.files})
     bridge = WorldModelBridge(wm_agent, ACTION_KEY, obs_key=OBS_KEY)
-    rssm_cfg = agent_config.dyn.rssm
-    feat_dim = int(rssm_cfg.deter + rssm_cfg.stoch * rssm_cfg.classes)
-    print(f'World model feature dim: {feat_dim}')
 
     replay = OnlineReplay(obs_key=OBS_KEY, action_key=ACTION_KEY, max_episodes=dreamer_config.max_episodes)
     if train_dataset is not None:
@@ -239,8 +258,10 @@ def train(config):
         replay.seed_from_offline(offline_episodes, rng=rng)
         print(f'Seeded replay buffer with {len(replay.offline_episodes)} offline episodes')
 
+    # repr_dim is the RAW observation dim. The world model does not sit
+    # between the environment and the policy anywhere in this file.
     policy = ChunkAgent(
-        repr_dim=feat_dim, action_dim=action_dim, chunk_len=chunk_len, device=device,
+        repr_dim=obs_dim, action_dim=action_dim, chunk_len=chunk_len, device=device,
         lr=chunk_config.lr, hidden_dim=chunk_config.hidden_dim,
         num_layers=chunk_config.num_layers, critic_target_tau=chunk_config.critic_target_tau,
         ensemble=chunk_config.ensemble, alpha=chunk_config.alpha,
@@ -252,14 +273,10 @@ def train(config):
                        env_name=general_config.env_name, seed=config.seed, chunk_len=chunk_len)
     eef_slice = tuple(chunk_config.eef_slice)
     start_time = time.time()
-    # One-element list so run_eval (a closure) can read the most recent value.
-    # Feeds the MVE break-even in the world-model report: required_corr is
-    # derived from the critic's current TD error, so the report needs it.
-    last_critic_loss = [None]
 
     def run_eval(step, n_updates):
         results = eval_chunk_in_env(
-            env, bridge, policy, action_dim, general_config.eval_episodes,
+            env, None, policy, action_dim, general_config.eval_episodes,
             device, OBS_KEY, chunk_len, eef_slice=eef_slice, record_video=True)
         print(f'step {step:7d} | return {results["mean_return"]:.2f} | '
               f'success {results["success_rate"]:.2f} | coherence {results["coherence"]:.4f}')
@@ -270,20 +287,17 @@ def train(config):
             'eval/coherence': results['coherence'],
             'eval/mean_episode_len': results['mean_episode_len'],
         }
-        if chunk_config.wm_diag_states > 0:
+        if chunk_config.wm_diag_states > 0 and num_chunks > 0:
             wm_m = wm_report(
-                env, bridge, policy, chunk_config, chunk_len, gamma, device, rng,
-                action_dim, num_states=chunk_config.wm_diag_states,
-                depth=num_chunks, model_samples=chunk_config.wm_diag_samples,
-                critic_loss=last_critic_loss[0])
-            print_wm_report(wm_m)
+                bridge, replay, chunk_config, chunk_len, num_chunks, gamma,
+                device, rng, wm_batch, seq_len, obs_key=OBS_KEY,
+                action_key=ACTION_KEY, num_states=chunk_config.wm_diag_states,
+                model_samples=chunk_config.wm_diag_samples)
+            print_wm_report(wm_m, num_chunks)
             # numeric_metrics ONLY on the diagnostics -- it does float(v) and
             # silently drops anything non-numeric, which would throw away the
             # wandb.Video object below. Filter here, never the whole log_dict.
             log_dict.update(numeric_metrics(wm_m))
-            # the diagnostic drives the env itself; reset so the collection
-            # loop resumes from a clean episode
-            env.reset()
         if results['video'] is not None:
             log_dict['eval/video'] = wandb.Video(results['video'], fps=20, format='mp4')
         wandb.log(log_dict, step=step)
@@ -295,15 +309,13 @@ def train(config):
             continue
         metrics = {}
         if i % dreamer_config.train_every == 0:
-            metrics.update(_prefixed(_wm_update(wm_agent, replay, batch_size, seq_len, rng, i), 'wm'))
+            metrics.update(_prefixed(_wm_update(wm_agent, replay, wm_batch, seq_len, rng, i), 'wm'))
         if i % chunk_config.train_every == 0:
-            m = _agent_update(bridge, policy, replay, batch_size, seq_len,
+            m = _agent_update(bridge, policy, replay, wm_batch, seq_len,
                               chunk_config, chunk_len, num_chunks, device, rng, gamma, gamma_h,
                               metrics_on=(i % general_config.log_every == 0))
             if m is not None:
                 metrics.update(m)
-                if 'sac/critic_loss' in m:
-                    last_critic_loss[0] = m['sac/critic_loss']
                 n_updates += 1
         if metrics and i % general_config.log_every == 0:
             metrics['diagnosis/wm_param_norm'] = _param_norm(wm_agent.params)
@@ -318,17 +330,13 @@ def train(config):
         print(f'Offline phase done: {n_updates} policy updates')
 
     obs, info = env.reset(seed=config.seed)
-    enc_carry, dyn_carry = bridge.init_encode(1)
-    prevact = np.zeros((1, action_dim), dtype=np.float32)
-    is_first = np.array([True])
     chunk_buffer = None
     chunk_pos = chunk_len
     global_step = 0
-    print('Starting online phase (QC-FQL + MVE target)')
+    print('Starting online phase (QC-FQL policy, MVE target)')
 
     while global_step < general_config.num_online_steps:
-        state = np.asarray(obs, dtype=np.float32).reshape(1, -1)
-        enc_carry, dyn_carry, feat_jax = bridge.encode_step(enc_carry, dyn_carry, state, prevact, is_first)
+        state = np.asarray(obs, dtype=np.float32).reshape(-1)
 
         if global_step < general_config.num_seed_steps and offline_steps == 0:
             action = env.action_space.sample()
@@ -336,25 +344,19 @@ def train(config):
             # Execution stays at chunk_len -- the MVE target extends the
             # critic's horizon without extending the open-loop commitment.
             if chunk_pos >= chunk_len:
-                feat_np = np.asarray(jax.device_get(feat_jax))[0].copy()
-                chunk_buffer = policy.act(feat_np, eval_mode=False)
+                chunk_buffer = policy.act(state, eval_mode=False)
                 chunk_pos = 0
             action = chunk_buffer[chunk_pos]
             chunk_pos += 1
 
         env_action = ENV_ACTION_LOW + (action + 1.0) * 0.5 * (ENV_ACTION_HIGH - ENV_ACTION_LOW)
         next_obs, reward, terminated, truncated, info = env.step(env_action)
-        replay.add_step(state[0], action, reward, np.asarray(next_obs, dtype=np.float32), terminated, truncated)
+        replay.add_step(state, action, reward, np.asarray(next_obs, dtype=np.float32), terminated, truncated)
 
         done = bool(terminated or truncated)
-        prevact = action.reshape(1, -1).astype(np.float32)
-        is_first = np.array([False])
         obs = next_obs
         if done:
             obs, info = env.reset()
-            enc_carry, dyn_carry = bridge.init_encode(1)
-            prevact = np.zeros((1, action_dim), dtype=np.float32)
-            is_first = np.array([True])
             chunk_pos = chunk_len
 
         global_step += 1
@@ -364,17 +366,15 @@ def train(config):
 
         if ready and global_step % dreamer_config.train_every == 0:
             metrics.update(_prefixed(
-                _wm_update(wm_agent, replay, batch_size, seq_len, rng, log_step), 'wm'))
+                _wm_update(wm_agent, replay, wm_batch, seq_len, rng, log_step), 'wm'))
 
         if (ready and global_step % chunk_config.train_every == 0
                 and global_step >= general_config.start_training):
-            m = _agent_update(bridge, policy, replay, batch_size, seq_len,
+            m = _agent_update(bridge, policy, replay, wm_batch, seq_len,
                               chunk_config, chunk_len, num_chunks, device, rng, gamma, gamma_h,
                               metrics_on=(global_step % general_config.log_every == 0))
             if m is not None:
                 metrics.update(m)
-                if 'sac/critic_loss' in m:
-                    last_critic_loss[0] = m['sac/critic_loss']
                 n_updates += 1
 
         if metrics and global_step % general_config.log_every == 0:
@@ -385,14 +385,12 @@ def train(config):
             _succ = replay.success_stats
             metrics['replay/success_frac_total'] = _succ['total_frac']
             metrics['replay/success_frac_online'] = _succ['online_frac']
+            metrics['replay/success_episodes_online'] = _succ['online_success']
             wandb.log(numeric_metrics(metrics), step=log_step)
 
         if global_step % general_config.eval_every == 0:
             run_eval(log_step, n_updates)
             obs, info = env.reset()
-            enc_carry, dyn_carry = bridge.init_encode(1)
-            prevact = np.zeros((1, action_dim), dtype=np.float32)
-            is_first = np.array([True])
             chunk_pos = chunk_len
 
         if global_step % general_config.save_every == 0:
@@ -412,3 +410,5 @@ if __name__ == '__main__':
     train(_config)
 
 # python train_sac_chunked_wm.py --train_sac_chunked_wm.general.env_name=cube-triple-play-singletask-v0
+# control run (world model unused in the target):
+# python train_sac_chunked_wm.py --train_sac_chunked_wm.chunk.num_chunks=0

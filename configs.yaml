@@ -152,18 +152,23 @@ defaults:
   train_sac_chunked_wm:
     # QC-FQL with a model-based value expansion (MVE) target.
     #
-    # The critic and actor train on REAL states and REAL chunks only -- the
-    # batch is identical to plain QC-FQL's and the actor loss is untouched.
-    # The world model changes exactly one thing: target_Q.
+    # The actor and critic run on RAW OBSERVATIONS, exactly like the
+    # no-world-model arm. The world model is used in ONE place: the bracketed
+    # continuation inside target_Q.
     #
-    #   QC-FQL:  R_real + gamma^h * mask * Q(L_0)
-    #   MVE:     R_real + gamma^h * mask * [num_chunks imagined chunks, then Q]
+    #   QC-FQL:  R_real + gamma^h * mask * Q(s_next)
+    #   MVE:     R_real + gamma^h * mask * [R_1 + g*c_1*[ ... + g*c_N*Q(s_N)]]
     #
-    # The imagined chunks start at L_0 (the latent at the state the real chunk
-    # ended at) and are sampled from the CURRENT actor, so they stay on-policy.
-    # Replay's own following actions cannot be used for this: they came from
-    # the policy that collected the data, so their rewards would estimate that
-    # old policy's return instead of the current one's.
+    # The imagined chunks start at the latent encoding s_next and are sampled
+    # from the CURRENT actor, so they stay on-policy. Replay's own following
+    # actions cannot be used for this: they came from the policy that collected
+    # the data, so their rewards would estimate that old policy's return
+    # instead of the current one's. s_N is the DECODED observation at the
+    # deepest imagined latent, so a single observation-space critic serves both
+    # the real and the imagined bootstrap.
+    #
+    # num_chunks: 0 makes the agent update never touch the world model, so the
+    # run reduces to QC-FQL exactly. That is the control.
     #
     # Execution stays at chunk_len. That is the point -- raising chunk_len also
     # raises how long the policy commits open-loop, and the QC paper's own h
@@ -202,11 +207,12 @@ defaults:
       # chunk_len to chunk_len * (num_chunks + 1) env steps: 5 -> 20 at 3.
       # Cost is num_chunks JAX dispatches per update, batch_size rows each.
       num_chunks: 3
-      # 1.0 = pure MVE (bootstrap only at the deepest latent). Below 1.0
-      # blends the shallower bootstraps in, so a model that degrades with
-      # depth falls back toward QC-FQL's own 1-chunk target rather than
-      # poisoning it. Lower this first if the model turns out unreliable.
-      mve_lambda: 0.95
+      # 1.0 = the nested target written above: the ONLY bootstrap is Q at the
+      # deepest imagined state. Below 1.0 blends the shallower imagined
+      # bootstraps Q(s_1..s_N-1) in, which caps how far a model that degrades
+      # with depth can drag the target. Lower this first if wm/decode_mae or
+      # wm/reward_mae grows with depth.
+      mve_lambda: 1.0
       # Real chunk transitions per critic/actor update -- QC's batch_size.
       batch_size: 256
       bc_batch: 256
@@ -223,12 +229,15 @@ defaults:
       flow_steps: 10
       eef_slice: [12, 15]
       # --- world-model accuracy checks, run at every eval (wm_diagnostics.py)
-      # States sampled per report. Correlations from ~13 states have SE ~0.105,
-      # where anything under 0.2 is indistinguishable from zero; 100 puts SE
-      # near 0.03. 0 disables.
-      wm_diag_states: 100
+      # These run OFFLINE against replay windows and spend ZERO env steps. The
+      # windows are sampled with bias_start_to_reward so they are guaranteed to
+      # contain reward variation -- without that every ground-truth reward is
+      # identical and every correlation is undefined.
+      # Replay windows measured per report. 0 disables.
+      wm_diag_states: 256
       # Prior draws averaged per prediction. RSSM.imagine samples stoch every
-      # step, so one draw understates accuracy badly.
+      # step, so one draw understates accuracy. The single-draw error is
+      # reported separately, since that is what the TARGET actually consumes.
       wm_diag_samples: 4
       # torch.compile(mode='default') on the actor/critic. The per-step cost is
       # ~400 tiny kernel launches rather than arithmetic, so fusing them is the
