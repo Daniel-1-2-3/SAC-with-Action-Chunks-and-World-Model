@@ -75,7 +75,8 @@ def main():
     action_dim = env.action_space.shape[0]
     obs_space, act_space = OGBenchMethods.make_spaces(obs_dim, action_dim, OBS_KEY, ACTION_KEY)
     agent_config = elements.Config(
-        **config.agent, logdir='/tmp/verify_wm', seed=config.seed, jax=config.jax,
+        **config.agent, logdir='/tmp/verify_wm', seed=config.seed, 
+        jax=config.jax.update({'precompile': False}),
         batch_size=wm_batch, batch_length=seq_len, replay_context=0,
         report_length=seq_len, replica=0, replicas=1)
     wm_agent = WorldModelAgent(obs_space, act_space, agent_config)
