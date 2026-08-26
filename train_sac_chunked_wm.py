@@ -364,5 +364,5 @@ if __name__ == '__main__':
     train(_config)
 
 # python train_sac_chunked_wm.py --train_sac_chunked_wm.general.env_name=cube-triple-play-singletask-v0
-# control run (world model unused for selection):
+# control run (world model unused for selection)
 # python train_sac_chunked_wm.py --train_sac_chunked_wm.chunk.select_n=1
