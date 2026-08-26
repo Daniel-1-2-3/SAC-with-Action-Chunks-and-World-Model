@@ -12,6 +12,7 @@ defaults:
     mock_devices: 0
     prealloc: True
     jit: True
+    precompile: False
     debug: False
     expect_devices: 0
     enable_policy: True
