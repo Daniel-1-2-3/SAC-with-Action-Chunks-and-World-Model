@@ -160,17 +160,27 @@ class WorldModelAgent(embodied.embodied.jax.Agent): # From Dreamer, policy code 
 
     def decode_feat(self, dyn_carry):
         """Decode a dyn_carry latent back to the observation space.
-        Returns a dict {obs_key: array} with the mean prediction from the
-        decoder, so callers can watch whether the latent changes meaningfully
-        as imagination steps forward."""
-        dec_carry = self.dec.initial(1)
-        reset = jnp.zeros((1, 1), dtype=bool)  # (B=1, T=1), no reset
+        Returns a dict {obs_key: (batch, ...) array} with the mean prediction
+        from the decoder, so callers can watch whether the latent changes
+        meaningfully as imagination steps forward.
+
+        BATCHED: rssm.Decoder.__call__ reads its batch dims off `reset`
+        (bshape = reset.shape, then reshape(prod(bshape), -1)), so dec_carry
+        and reset must be built with the carry's own batch size. Hard-coding
+        1 collapses a (B, 1, D) feature into (1, B*D) and the decoder MLP's
+        kernel contraction fails for any B > 1."""
+        batch_size = next(iter(dyn_carry.values())).shape[0]
+        dec_carry = self.dec.initial(batch_size)
+        reset = jnp.zeros((batch_size, 1), dtype=bool)  # (B, T=1), no reset
         # repfeat must be (B, T, ...) for the decoder scan
         repfeat = jax.tree_util.tree_map(
             lambda x: x[:, None].astype(nn.COMPUTE_DTYPE), dyn_carry)
         _, _, recons = self.dec(dec_carry, repfeat, reset, training=False)
-        # Each value in recons is a distribution object; .pred() gives the mean
-        out = {k: jnp.asarray(v.pred()[0, 0]).astype(jnp.float32)
+        # Each value in recons is a distribution object; .pred() gives the
+        # mean. [:, 0] drops the T=1 axis and keeps the batch axis, so batch-1
+        # callers (check_rollout_animation) see (1, obs_dim) and their
+        # .flatten() behaves exactly as before.
+        out = {k: jnp.asarray(v.pred()[:, 0]).astype(jnp.float32)
                for k, v in recons.items()}
         return out
 
