@@ -11,15 +11,21 @@ EVAL_CSV_FIELDS = [
 ]
 
 def eval_chunk_in_env(env, bridge, policy, action_dim, num_episodes, device,
-                      obs_key, chunk_len, eef_slice=(0, 3), record_video=False):
+                      obs_key, chunk_len, eef_slice=(0, 3), record_video=False,
+                      selector=None):
     """ Chunked evaluation.
 
         The actor is queried once every chunk_len steps and the chunk is
         executed open loop, matching how the policy is used during training.
 
-        bridge=None: raw observations straight into the actor. Both arms use
-        this path now -- in the Dyna arm the world model only ever generates
-        critic training data, so deployment is the bare policy.
+        bridge=None, selector=None: raw observations straight into the actor
+        (the MVE and Dyna trainers, and the no-world-model arm).
+
+        selector: a ChunkSelector (selection trainer). Evaluation then
+        measures the DEPLOYED behavior -- model-scored chunk selection -- not
+        the bare policy. The selector's own observe/record_action calls keep
+        its posterior latent filtered on every step; with select_n<=1 they are
+        no-ops and this is identical to the bare-policy path.
 
         bridge non-None (legacy latent-policy path): the observation is
         encoded on EVERY step so the RSSM posterior stays correct for the
@@ -40,6 +46,8 @@ def eval_chunk_in_env(env, bridge, policy, action_dim, num_episodes, device,
 
     for ep in range(num_episodes):
         obs, info = env.reset()
+        if selector is not None:
+            selector.reset()
         if bridge is not None:
             enc_carry, dyn_carry = bridge.init_encode(1)
             prevact = np.zeros((1, action_dim), dtype=np.float32)
@@ -67,8 +75,14 @@ def eval_chunk_in_env(env, bridge, policy, action_dim, num_episodes, device,
             else:
                 feat_np = state[0]
 
+            if selector is not None:
+                selector.observe(state[0])
+
             if chunk_pos >= chunk_len:
-                chunk = policy.act(feat_np, eval_mode=True)
+                if selector is not None:
+                    chunk = selector.select(state[0])
+                else:
+                    chunk = policy.act(feat_np, eval_mode=True)
                 chunk_pos = 0
             action = chunk[chunk_pos]
             chunk_pos += 1
@@ -82,6 +96,8 @@ def eval_chunk_in_env(env, bridge, policy, action_dim, num_episodes, device,
             if ep == 0:
                 safe_render()
 
+            if selector is not None:
+                selector.record_action(action)
             if bridge is not None:
                 prevact = action.reshape(1, -1).astype(np.float32)
                 is_first = np.array([False])

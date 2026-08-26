@@ -3,17 +3,7 @@ import torch
 
 from sac_chunked.chunk_utils import pool_chunk
 from helpers.interop import jax_to_torch
-
-def decode_obs(bridge, carry, obs_key, device):
-    """ Latent -> predicted observation, as a torch tensor.
-
-        The actor and critic live in observation space, so every point where
-        an imagined latent has to talk to them goes through here. The result
-        is a PREDICTION, not a real state: it carries decoder error on top of
-        whatever dynamics error accumulated to reach this latent. wm_report
-        measures both against real replay states. """
-    decoded = bridge.decode_state(carry)[obs_key]
-    return torch.as_tensor(np.asarray(decoded, dtype=np.float32), device=device)
+from wm.model_ops import decode_obs
 
 def success_seed_indices(batch_np, n, chunk_len, rng, reward_thresh,
                          obs_key='state'):

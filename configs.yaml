@@ -150,38 +150,37 @@ defaults:
   # ---------------------------------------------------------------------
 
   train_sac_chunked_wm:
-    # QC-FQL training + Dyna critic-batch augmentation.
+    # ONE config for THREE isolated method trainers sharing this repo. Each
+    # trainer reads only its own knobs; training is plain QC-FQL on raw
+    # observations in all of them, and each has a knob value that disables
+    # the world model entirely (the exact-QC-FQL control run):
     #
-    # The ACTOR update, the BC flow term, acting and eval are plain QC-FQL on
-    # raw observations -- identical to the no-world-model arm. The world
-    # model changes exactly one thing: the CRITIC also trains on dyna_batch
-    # imagined chunk transitions per update, down-weighted by dyna_weight.
+    #   train_wm_mve.py     MVE target: Q(s_next) is replaced by
+    #                       [R_1 + g*c_1*[... + g*c_N*Q(s_N)]] imagined from
+    #                       the chunk-end latent. Knobs: num_chunks (0 =
+    #                       control), mve_lambda.
+    #   train_wm_select.py  Model-scored best-of-N chunk selection at act
+    #                       time; training untouched. Knobs: select_n (1 =
+    #                       control).
+    #   train_wm_dyna.py    Critic also trains on imagined chunk transitions
+    #                       (real seed obs, policy chunk, model reward/cont,
+    #                       decoded next obs), success-seeded near reward
+    #                       moments. Knobs: dyna_batch (0 = control),
+    #                       dyna_weight, dyna_success_frac, dyna_seed_thresh.
     #
-    # Each imagined transition starts from a REAL replay observation (the
-    # critic's input distribution stays anchored), takes a chunk from the
-    # CURRENT policy, and reads reward/cont/next-state from the model:
+    # Each trainer writes to out_dir/<method>/ so simultaneous runs on one
+    # pod cannot clobber each other's checkpoints or eval CSVs.
     #
-    #   (s_real, a ~ pi(s), r_model, cont_model, decoded s'_model)
-    #   target = r_model + gamma^h * cont_model * Q(s'_model)
-    #
-    # Replay can only ever say what the EXECUTED chunk did from a state; this
-    # asks what a current-policy chunk would do from the same state. A
-    # dyna_success_frac share of seeds is placed 1..chunk_len steps before an
-    # above-dyna_seed_thresh reward in replay, so imagined chunks overlap the
-    # rare signal moments -- the one resource this task is starved of.
-    #
-    # Containment: imagined rows are down-weighted, real rows anchor every
-    # update, and update_critic's n_real split reports critic_mse_imagined
-    # vs critic_mse_real so model poisoning is visible immediately.
-    #
-    # dyna_batch: 0 skips the world model entirely, so the run reduces to
-    # QC-FQL exactly. That is the control.
+    # All three consume the SAME decoder via wm/model_ops.decode_obs -- known
+    # measured ceiling: decode_mae_seed ~0.27 vs obs |mean| 0.72, not yet
+    # debugged (see verify_decoder.py). MVE and Dyna put decoded states
+    # inside a training loss; selection only ranks with them.
 
     general:
       env_name: cube-triple-play-singletask-v0
       wm_ckpt: ''
       seed_from_offline: True
-      num_offline_steps: 1000000
+      num_offline_steps: 250000
       num_online_steps: 1000000
       num_seed_steps: 4000
       start_training: 5000
@@ -205,6 +204,23 @@ defaults:
 
     chunk:
       chunk_len: 5
+      # --- train_wm_mve.py ---
+      # Imagined chunks appended to the target. Bootstrap moves from
+      # chunk_len to chunk_len * (num_chunks + 1) env steps: 5 -> 20 at 3.
+      # 0 disables MVE -> exact QC-FQL (the control).
+      num_chunks: 3
+      # 1.0 = the nested target above: the ONLY bootstrap is Q at the deepest
+      # imagined state. Below 1.0 blends the shallower imagined bootstraps
+      # in, capping how far a model that degrades with depth can drag the
+      # target.
+      mve_lambda: 1.0
+      # --- train_wm_select.py ---
+      # Candidate chunks sampled and model-scored per decision. QC's
+      # best-of-N analysis bounds the KL from the sampling policy by
+      # log N - (N-1)/N; the paper used N=32 on cube-*. 1 disables the
+      # selector -> exact QC-FQL (the control).
+      select_n: 16
+      # --- train_wm_dyna.py ---
       # Imagined chunk transitions added to every critic update, alongside
       # batch_size real ones. 0 disables Dyna -> exact QC-FQL (the control).
       dyna_batch: 256
@@ -267,7 +283,7 @@ defaults:
     general:
       env_name: cube-double-play-singletask-v0
       seed_from_offline: True
-      num_offline_steps: 1000000
+      num_offline_steps: 250000
       num_online_steps: 1000000
       num_seed_steps: 4000
       start_training: 5000 # see the note under train_sac_chunked_wm.general

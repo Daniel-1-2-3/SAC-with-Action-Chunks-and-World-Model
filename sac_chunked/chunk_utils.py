@@ -71,6 +71,36 @@ def step_valid_np(terminals):
         run_term = np.maximum(run_term, terminals[:, k])
     return valid
 
+def mve_continuation(img_rewards, img_conts, final_value, gamma_h, lam=1.0,
+                     inter_values=None):
+    """ The imagined continuation that replaces QC-FQL's Q(s_next) inside the
+        MVE target. The caller multiplies this by gamma^h * mask and adds the
+        real chunk reward, so this function returns ONLY the bracketed term:
+
+            [ R_1 + g*c_1 * [ R_2 + g*c_2 * [ ... + g*c_N * Q(s_N) ] ] ]
+
+        with g = gamma^chunk_len. lam=1.0 is exactly that nesting: the only
+        bootstrap is Q at the deepest imagined state, and inter_values is not
+        needed (the caller should not spend the forward passes computing it).
+        lam<1 blends the shallower imagined bootstraps Q(s_1..s_N) in, which
+        caps how far a model that degrades with depth can drag the target; it
+        requires inter_values.
+
+        img_rewards, img_conts: (num_chunks, batch, 1), chunk-major.
+        final_value:  (batch, 1), target-critic value at the deepest state.
+        inter_values: (num_chunks, batch, 1) or None; inter_values[-1] must
+                      equal final_value when supplied.
+
+        Returns (batch, 1). """
+    num_chunks = img_rewards.shape[0]
+    if lam < 1.0 and inter_values is None:
+        raise ValueError('mve_continuation needs inter_values when lam < 1.0')
+    ret = final_value
+    for t in reversed(range(num_chunks)):
+        blended = ret if lam >= 1.0 else (1.0 - lam) * inter_values[t] + lam * ret
+        ret = img_rewards[t] + gamma_h * img_conts[t] * blended
+    return ret
+
 def real_chunk_transitions(batch_np, chunk_len, gamma, obs_key='state',
                            action_key='action'):
     """ Real chunk transitions from a Dreamer batch: everything the critic and

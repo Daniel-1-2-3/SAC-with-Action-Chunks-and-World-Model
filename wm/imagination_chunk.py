@@ -1,23 +1,13 @@
-import numpy as np
 import torch
 from sac_chunked.chunk_utils import pool_chunk
 from helpers.interop import jax_to_torch
-
-def decode_obs(bridge, carry, obs_key, device):
-    """ Latent -> predicted observation, as a torch tensor.
-
-        The actor and critic live in observation space, so every point where
-        the imagined rollout has to talk to them goes through here. The result
-        is a PREDICTION, not a real state: it carries decoder error on top of
-        whatever dynamics error accumulated to reach this latent. wm_report
-        measures both against real replay states. """
-    decoded = bridge.decode_state(carry)[obs_key]
-    return torch.as_tensor(np.asarray(decoded, dtype=np.float32), device=device)
+from wm.model_ops import decode_obs
 
 def imagine_chunk_rollout(bridge, agent, seed_carry, num_chunks, chunk_len,
                           device, gamma, obs_key='state', reward_shift=0.0):
     """ Imagines num_chunks consecutive chunks forward from seed_carry under
-        the CURRENT actor, and returns them as chunk-level quantities.
+        the CURRENT actor, and returns them as chunk-level quantities. Used by
+        the MVE trainer only.
 
         The seed is the latent at the state the real replayed chunk ended at,
         so chunk i here is the (i+1)-th chunk after the real one. Each chunk is
