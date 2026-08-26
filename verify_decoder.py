@@ -32,6 +32,7 @@ import elements
 import numpy as np
 import ruamel.yaml as yaml
 import torch
+import jax
 
 from dreamer.wm_agent import WorldModelAgent
 from dreamer.wm_bridge import WorldModelBridge
