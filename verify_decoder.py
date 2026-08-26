@@ -188,7 +188,8 @@ def main():
         for name, chunks in (('replay', replay_chunks), ('policy', policy_chunks)):
             cseed = bridge.place_seed({k: v[idx] for k, v in pool.items()})
             _, _, rj, cj = bridge.img_chunk(cseed, chunks.astype(np.float32), chunk_len)
-            pr, pc = pooled(np.asarray(rj, np.float64), np.asarray(cj, np.float64), gamma)
+            pr, pc = pooled(np.asarray(jax.device_get(rj), np.float64),
+                            np.asarray(jax.device_get(cj), np.float64), gamma)
             out[name] = pr
             print(f'    {name} chunks: model pooled reward mean {pr.mean():+.3f} '
                   f'(cont mean {pc.mean():.3f})')
