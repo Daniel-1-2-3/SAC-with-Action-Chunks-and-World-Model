@@ -156,7 +156,12 @@ def main():
             num_layers=c.num_layers, critic_target_tau=c.critic_target_tau,
             ensemble=c.ensemble, alpha=c.alpha, flow_steps=c.flow_steps,
             q_agg=c.q_agg, compile_nets=False)
-        policy.load_state_dict_all(torch.load(args.chunk_ckpt, map_location=device))
+                _raw = torch.load(args.chunk_ckpt, map_location=device)
+        # Checkpoints saved with compile_nets=True carry torch.compile's
+        # "_orig_mod." prefix; this script builds uncompiled modules.
+        _raw = {k: {kk.replace('_orig_mod.', ''): vv for kk, vv in v.items()}
+                for k, v in _raw.items()}
+        policy.load_state_dict_all(_raw)
         rt = torch.as_tensor(real, device=device)
         dt = torch.as_tensor(dec, device=device)
         with torch.no_grad():
