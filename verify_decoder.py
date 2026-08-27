@@ -29,10 +29,10 @@ os.environ.setdefault('MUJOCO_GL', 'egl')
 import argparse
 import pathlib
 import elements
+import jax
 import numpy as np
 import ruamel.yaml as yaml
 import torch
-import jax
 
 from dreamer.wm_agent import WorldModelAgent
 from dreamer.wm_bridge import WorldModelBridge
@@ -75,8 +75,18 @@ def main():
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     obs_space, act_space = OGBenchMethods.make_spaces(obs_dim, action_dim, OBS_KEY, ACTION_KEY)
+    # The verification never trains or reports, so embodied's eager
+    # precompilation of those functions is pure startup cost -- and on some
+    # pods that compile crashes inside XLA. elements.Config.update only
+    # overwrites EXISTING keys, so this works when configs.yaml's jax block
+    # declares `precompile`; add `precompile: False` there if the fallback
+    # branch below still crashes at agent construction.
+    try:
+        jaxcfg = config.jax.update({'precompile': False})
+    except KeyError:
+        jaxcfg = config.jax
     agent_config = elements.Config(
-        **config.agent, logdir='/tmp/verify_wm', seed=config.seed, jax=config.jax,
+        **config.agent, logdir='/tmp/verify_wm', seed=config.seed, jax=jaxcfg,
         batch_size=wm_batch, batch_length=seq_len, replay_context=0,
         report_length=seq_len, replica=0, replicas=1)
     wm_agent = WorldModelAgent(obs_space, act_space, agent_config)

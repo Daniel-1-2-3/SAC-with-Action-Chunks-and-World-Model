@@ -12,6 +12,10 @@ defaults:
     mock_devices: 0
     prealloc: True
     jit: True
+    # Skip embodied's eager compile of train/report at agent construction.
+    # Needed on pods whose XLA can't fresh-compile the train fn (RTX PRO
+    # 4500: 'Too small divisible part of the contracting dimension');
+    # functions then compile lazily on first use instead.
     precompile: False
     debug: False
     expect_devices: 0
@@ -152,30 +156,34 @@ defaults:
 
   train_sac_chunked_wm:
     # ONE config for THREE isolated method trainers sharing this repo. Each
-    # trainer reads only its own knobs; training is plain QC-FQL on raw
-    # observations in all of them, and each has a knob value that disables
-    # the world model entirely (the exact-QC-FQL control run):
+    # trainer reads only its own knobs, and each has a knob value that
+    # reduces it to a control run:
     #
-    #   train_wm_mve.py     MVE target: Q(s_next) is replaced by
-    #                       [R_1 + g*c_1*[... + g*c_N*Q(s_N)]] imagined from
-    #                       the chunk-end latent. Knobs: num_chunks (0 =
-    #                       control), mve_lambda.
+    #   train_wm_mve.py     LATENT MVE: critic/actor/acting on RSSM features
+    #                       (the original architecture, isolated -- no
+    #                       decoder anywhere). Target replaces Q(L_next) with
+    #                       [R_1 + g*c_1*[... + g*c_N*Q(L_N)]] imagined in
+    #                       latent space. Knobs: num_chunks (0 = QC-FQL on
+    #                       latents, the REPRESENTATION control), mve_lambda,
+    #                       and dreamer.online_train_every (WM freeze).
     #   train_wm_select.py  Model-scored best-of-N chunk selection at act
-    #                       time; training untouched. Knobs: select_n (1 =
-    #                       control).
-    #   train_wm_dyna.py    Critic also trains on imagined chunk transitions
-    #                       (real seed obs, policy chunk, model reward/cont,
-    #                       decoded next obs), success-seeded near reward
-    #                       moments. Knobs: dyna_batch (0 = control),
-    #                       dyna_weight, dyna_success_frac, dyna_seed_thresh.
+    #                       time; training untouched, raw observations.
+    #                       Knobs: select_n (1 = exact QC-FQL control).
+    #   train_wm_explore.py Disagreement exploration bonus: collection-time
+    #                       chunk choice by Q + beta * z(model disagreement);
+    #                       training untouched, raw observations; eval is the
+    #                       bare policy. Knobs: explore_n (1 = exact QC-FQL),
+    #                       explore_beta (0 = critic best-of-N, QC's own
+    #                       method), explore_draws.
     #
     # Each trainer writes to out_dir/<method>/ so simultaneous runs on one
     # pod cannot clobber each other's checkpoints or eval CSVs.
     #
-    # All three consume the SAME decoder via wm/model_ops.decode_obs -- known
-    # measured ceiling: decode_mae_seed ~0.27 vs obs |mean| 0.72, not yet
-    # debugged (see verify_decoder.py). MVE and Dyna put decoded states
-    # inside a training loss; selection only ranks with them.
+    # Measured context these designs answer to (Aug 26): decoded-state
+    # bootstraps flatlined while the latent bootstrap learned; 5-step
+    # imagined reward carries no signal at typical states (pick-place >> 5
+    # steps); the reward head is accurate wherever reward varies; online
+    # successes, not value accuracy, are the binding bottleneck.
 
     general:
       env_name: cube-triple-play-singletask-v0
@@ -201,15 +209,36 @@ defaults:
       # the component every model-based variant depends on, and the offline
       # phase costs no env steps, so this is cheap where it matters.
       train_every: 2
+      # LATENT-MVE ONLY: WM update period during the ONLINE phase. 0 =
+      # frozen for the whole online phase.
+      online_train_every: 2
+      # LATENT-MVE ONLY: absolute TOTAL step (offline + online) after which
+      # the WM stops training entirely; 0 = never freeze. 500k = 250k offline
+      # + 250k online experience, then frozen: representation drift is
+      # confined to the early online phase (weakest policy, least-converged
+      # critic) and the 500k+ window -- where qc-fql's success climb happens
+      # -- runs on a stationary representation. The original run trained the
+      # WM forever; its 3-8x critic loss was the suspected cost. Watch
+      # wm/reward_corr after the freeze: decay there means the frozen model
+      # is falling behind the policy's new states -- push this later.
+      wm_freeze_after: 500000
       max_episodes: 2000
 
     chunk:
       chunk_len: 5
-      # --- train_wm_mve.py ---
-      # Imagined chunks appended to the target. Bootstrap moves from
-      # chunk_len to chunk_len * (num_chunks + 1) env steps: 5 -> 20 at 3.
-      # 0 disables MVE -> exact QC-FQL (the control).
-      num_chunks: 3
+      # --- train_wm_mve.py (latent) ---
+      # Imagined chunks appended to the target, in latent space. Bootstrap
+      # moves from chunk_len to chunk_len * (num_chunks + 1) env steps:
+      # 10 -> 55, long enough to span a grasp-move-place, which the Aug 26
+      # autopsy showed is the only horizon where imagined reward carries
+      # signal the 1-chunk target lacks (5-step futures are all floor).
+      # Costs: num_chunks sequential dispatches per update, and dynamics
+      # error compounding over 50 imagined steps -- wm_report runs at this
+      # depth, so wm/reward_corr_chunk10 gauges the latter every eval; drop
+      # mve_lambda below 1.0 if it degrades with depth.
+      # 0 disables imagination -> QC-FQL on latent features: the
+      # REPRESENTATION control (not the no-world-model arm).
+      num_chunks: 10
       # 1.0 = the nested target above: the ONLY bootstrap is Q at the deepest
       # imagined state. Below 1.0 blends the shallower imagined bootstraps
       # in, capping how far a model that degrades with depth can drag the
@@ -221,23 +250,16 @@ defaults:
       # log N - (N-1)/N; the paper used N=32 on cube-*. 1 disables the
       # selector -> exact QC-FQL (the control).
       select_n: 16
-      # --- train_wm_dyna.py ---
-      # Imagined chunk transitions added to every critic update, alongside
-      # batch_size real ones. 0 disables Dyna -> exact QC-FQL (the control).
-      dyna_batch: 256
-      # Loss weight on imagined rows (real rows use their `valid` mask, ~1).
-      # Raise toward 1.0 only if diagnosis/critic_mse_imagined tracks
-      # critic_mse_real; drop it first if eval regresses under Dyna.
-      dyna_weight: 0.5
-      # Share of imagined seeds drawn from replay windows containing reward
-      # above dyna_seed_thresh, placed 1..chunk_len steps before the reward
-      # moment. The rest are uniform replay states. Falls back to uniform
-      # (logged as dyna/success_seed_frac) when no such windows exist yet.
-      dyna_success_frac: 0.5
-      # Reward level that counts as signal for seeding. cube-triple's floor
-      # is -3 (all cubes wrong); -2.5 catches any partial progress. The
-      # replay's own -1.0 (full success) almost never fires on play data.
-      dyna_seed_thresh: -2.5
+      # --- train_wm_explore.py ---
+      # Candidate chunks sampled per COLLECTION decision. 1 -> exact QC-FQL.
+      explore_n: 16
+      # Bonus weight in Q-units on the z-normalized disagreement. 0 -> pure
+      # critic best-of-N (the QC paper's own method; the bonus's control).
+      # explore/pick_changed and explore/q_paid show what beta is buying.
+      explore_beta: 3.0
+      # Stochastic rollouts per candidate for the disagreement estimate.
+      # Cost scales linearly; 2 is the minimum for a std.
+      explore_draws: 4
       # Real chunk transitions per critic/actor update -- QC's batch_size.
       batch_size: 256
       bc_batch: 256
