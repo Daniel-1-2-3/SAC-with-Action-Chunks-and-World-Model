@@ -245,6 +245,13 @@ defaults:
       # target. At depth 10 this is the first knob to reach for (try 0.95)
       # if wm/reward_corr_chunk10 sags or single-draw error grows.
       mve_lambda: 1.0
+      # 'q' = latent MVE as above (bootstrap = Q at the deepest imagined
+      # latent). 'none' = PURE-WM ablation: the critic appears nowhere in
+      # the target, which becomes a truncated 55-step imagined return.
+      # Attribution run for whether the bootstrap is load-bearing; expected
+      # to underperform (the horizon truncation biases targets toward ~-130
+      # vs Q's ~-280 scale). Requires num_chunks > 0. Ignores mve_lambda.
+      mve_bootstrap: q
       # --- train_wm_select.py ---
       # Candidate chunks sampled and model-scored per decision. QC's
       # best-of-N analysis bounds the KL from the sampling policy by
@@ -261,6 +268,16 @@ defaults:
       # Stochastic rollouts per candidate for the disagreement estimate.
       # Cost scales linearly; 2 is the minimum for a std.
       explore_draws: 4
+      # Linear decay of the bonus: full beta until decay_start (TOTAL steps,
+      # offline included), 0 at decay_end, exploration hands collection back
+      # to exploitation in between. decay_end 0 = constant beta forever (the
+      # first run's behavior). Needed because the z-normalized bonus can't
+      # anneal itself: something is always relatively most novel, so
+      # pick_changed stays pinned high no matter how mature the model is.
+      # 500k start = after the success-finding phase demonstrably began
+      # (~350k in run 1); 900k end = before the reference's steep phase.
+      explore_beta_decay_start: 500000
+      explore_beta_decay_end: 900000
       # Real chunk transitions per critic/actor update -- QC's batch_size.
       batch_size: 256
       bc_batch: 256

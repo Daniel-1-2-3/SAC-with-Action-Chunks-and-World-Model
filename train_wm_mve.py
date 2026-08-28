@@ -28,7 +28,7 @@ ARM = 'mve'
 
 def _agent_update(bridge, policy, replay, wm_batch, seq_len, chunk_config,
                   chunk_len, num_chunks, device, rng, gamma, gamma_h,
-                  metrics_on=True):
+                  mve_bootstrap='q', metrics_on=True):
     """ QC-FQL on LATENT FEATURES with a latent MVE target -- the original
         codebase's architecture, isolated. The evidence for this combination:
         the original run (latent bootstrap) climbed to ~-1700 return while the
@@ -96,7 +96,18 @@ def _agent_update(bridge, policy, replay, wm_batch, seq_len, chunk_config,
             img_rewards, img_conts, img_feats = imagine_chunk_rollout_latent(
                 bridge, policy, seed_carry, num_chunks, chunk_len, device,
                 gamma, reward_shift=chunk_config.reward_shift)
-            if lam >= 1.0:
+            if mve_bootstrap == 'none':
+                # PURE-WM ablation: the critic appears NOWHERE in the target.
+                # target = R_real + gamma^h*mask*[imagined rewards only], a
+                # 55-step truncated return at num_chunks=10. Everything past
+                # the horizon contributes zero, so targets live on a ~-130
+                # scale instead of Q's ~-280 and the induced policy is
+                # short-horizon by construction. This is an ATTRIBUTION run
+                # (is the bootstrap load-bearing?), not a candidate method;
+                # read the gap to the 'q' run, not the absolute curve.
+                inter_values = None
+                final_value = torch.zeros_like(img_rewards[-1])
+            elif lam >= 1.0:
                 # Pure nesting: only the deepest bootstrap appears in the
                 # target, so the shallower ones are not worth their passes.
                 inter_values = None
@@ -105,8 +116,9 @@ def _agent_update(bridge, policy, replay, wm_batch, seq_len, chunk_config,
                 inter_values = torch.stack(
                     [policy.chunk_target_values(f) for f in img_feats])
                 final_value = inter_values[-1]
+            eff_lam = 1.0 if mve_bootstrap == 'none' else lam
             cont_value = mve_continuation(img_rewards, img_conts, final_value,
-                                          gamma_h, lam, inter_values)
+                                          gamma_h, eff_lam, inter_values)
         else:
             cont_value = qc_value
         target = real_reward + gamma_h * real_mask * cont_value
@@ -168,6 +180,13 @@ def train(config):
     num_chunks = chunk_config.num_chunks
     gamma = chunk_config.gamma
     gamma_h = gamma ** chunk_len
+    mve_bootstrap = chunk_config.mve_bootstrap
+    if mve_bootstrap not in ('q', 'none'):
+        raise ValueError(f'mve_bootstrap must be q or none, got {mve_bootstrap}')
+    if mve_bootstrap == 'none' and num_chunks <= 0:
+        raise ValueError('mve_bootstrap=none needs num_chunks>0: with no '
+                         'imagination AND no bootstrap the target is just the '
+                         'real chunk reward, which trains nothing useful')
     wm_online_every = dreamer_config.online_train_every
     wm_freeze_after = dreamer_config.wm_freeze_after
 
@@ -179,7 +198,12 @@ def train(config):
     rng = np.random.default_rng(config.seed)
     set_seed_everywhere(config.seed)
     print(f'PyTorch device: {device} | JAX devices: {jax.devices()}')
-    if num_chunks > 0:
+    if num_chunks > 0 and mve_bootstrap == 'none':
+        print(f'PURE-WM TARGET (ablation): real chunk + {num_chunks} imagined '
+              f'chunks, NO critic bootstrap -- a {chunk_len * (num_chunks + 1)}'
+              f'-step truncated return. Attribution run: read the gap to the '
+              f'bootstrapped arm, not the absolute curve.')
+    elif num_chunks > 0:
         print(f'Latent MVE: critic/actor on RSSM features, real chunk + '
               f'{num_chunks} imagined chunks -> latent bootstrap at '
               f'{chunk_len * (num_chunks + 1)} env steps | '
@@ -244,7 +268,9 @@ def train(config):
         compile_nets=chunk_config.compile_nets,
     )
 
-    eval_csv = EvalCSV(out_dir / 'eval_log.csv', arm=f'world_model_{ARM}_latent',
+    arm_name = (f'world_model_{ARM}_latent_nobootstrap'
+                if mve_bootstrap == 'none' else f'world_model_{ARM}_latent')
+    eval_csv = EvalCSV(out_dir / 'eval_log.csv', arm=arm_name,
                        env_name=general_config.env_name, seed=config.seed, chunk_len=chunk_len)
     eef_slice = tuple(chunk_config.eef_slice)
     start_time = time.time()
@@ -294,7 +320,7 @@ def train(config):
         if i % chunk_config.train_every == 0:
             m = _agent_update(bridge, policy, replay, wm_batch, seq_len,
                               chunk_config, chunk_len, num_chunks, device, rng,
-                              gamma, gamma_h,
+                              gamma, gamma_h, mve_bootstrap=mve_bootstrap,
                               metrics_on=(i % general_config.log_every == 0))
             if m is not None:
                 metrics.update(m)
@@ -377,7 +403,7 @@ def train(config):
                 and global_step >= general_config.start_training):
             m = _agent_update(bridge, policy, replay, wm_batch, seq_len,
                               chunk_config, chunk_len, num_chunks, device, rng,
-                              gamma, gamma_h,
+                              gamma, gamma_h, mve_bootstrap=mve_bootstrap,
                               metrics_on=(global_step % general_config.log_every == 0))
             if m is not None:
                 metrics.update(m)
@@ -421,3 +447,5 @@ if __name__ == '__main__':
 # python train_wm_mve.py --train_sac_chunked_wm.general.env_name=cube-triple-play-singletask-v0
 # representation control (QC-FQL on latent features, no imagination):
 # python train_wm_mve.py --train_sac_chunked_wm.chunk.num_chunks=0
+# training without critic in the target computation
+# python train_wm_mve.py --train_sac_chunked_wm.general.env_name=cube-triple-play-singletask-v0 --train_sac_chunked_wm.chunk.mve_bootstrap=none
