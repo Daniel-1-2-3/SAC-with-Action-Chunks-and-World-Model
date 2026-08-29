@@ -1,9 +1,0 @@
-*.egg-info
-*.py[cod]
-.pytest_cache
-MUJOCO_LOG.TXT
-[';:]
-\[
-\]
-__pycache__/
-dist
