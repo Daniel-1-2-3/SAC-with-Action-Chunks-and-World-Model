@@ -328,11 +328,14 @@ defaults:
       # anneals by itself, so pair staged with explore_beta_fade: none.
       explore_stage_blend_steps: 30000
       # v2 self-imitation BC: this fraction of the actor's flow-matching
-      # batch comes from the top pooled-reward chunk windows of reward-
-      # bearing episodes (see sample_reward_batch). Keeps the behavior flow
-      # -- and with it the 16 candidates -- tracking the policy's best
-      # behavior instead of the buffer average. 0 = v1 behavior. Critic and
-      # world-model batches stay uniform regardless.
+      # batch comes from chunk windows of reward-bearing episodes (see
+      # sample_reward_batch) -- approach and payoff both, sampled uniformly
+      # over reward-adjacent sequences. (v5 used top-k by window reward
+      # here; that copies only the at-goal moments and never the path to
+      # them, which is why its discoveries never densified.) Keeps the
+      # behavior flow -- and with it the 16 candidates -- tracking the
+      # policy's best behavior instead of the buffer average. 0 = v1
+      # behavior. Critic and world-model batches stay uniform regardless.
       sil_frac: 0.5
       # Reward level that counts as reward-bearing for the SIL batch. On
       # cube-double the floor step reward is -2 and one placed cube is -1,

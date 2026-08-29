@@ -77,9 +77,17 @@ def _agent_update(policy, replay, wm_batch, seq_len, chunk_config,
                 action_key=ACTION_KEY)
             if sil_data is not None and len(sil_data['idx']) > 0:
                 n_sil = min(int(round(take * sil_frac)), len(sil_data['idx']))
-                # Top-k by pooled chunk reward: the best windows of the best
-                # episodes. Degrades toward uniform when rewards are equal.
-                top = np.argsort(sil_data['reward'][:, 0])[-n_sil:]
+                # Random subsample over ALL windows of the reward-adjacent
+                # sequences -- approach AND payoff. The earlier top-k by
+                # pooled window reward was a bug (payoff-only SIL): it kept
+                # only the at-reward windows and discarded the lead-up, so
+                # the policy learned to sit at the goal but never how to
+                # get there -- 900k steps of sporadic spikes that never
+                # densified. The sampler already guarantees every sequence
+                # contains a reward hit with varied lead-up context, so
+                # uniform over its windows copies the whole path.
+                top = rng.choice(len(sil_data['idx']), size=n_sil,
+                                 replace=len(sil_data['idx']) < n_sil)
                 n_uni = take - n_sil
                 bc_feat = torch.cat([obs[:n_uni], to(sil_data['obs'][top])])
                 bc_chunk = torch.cat([chunk[:n_uni], to(sil_data['chunk'][top])])
