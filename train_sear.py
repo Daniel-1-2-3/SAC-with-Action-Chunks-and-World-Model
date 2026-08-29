@@ -17,6 +17,10 @@
       python train_sear.py --train_sear.env_name=cube-double-play-singletask-v0
 """
 import os
+# Headless rendering: MuJoCo defaults to GLFW, which needs X11 and core-dumps
+# on display-less pods. EGL renders on the GPU without a display. Set before
+# anything imports mujoco. Override with MUJOCO_GL=osmesa for CPU-only pods.
+os.environ.setdefault('MUJOCO_GL', 'egl')
 import pathlib
 import sys
 import time
