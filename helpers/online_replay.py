@@ -28,6 +28,10 @@ class OnlineReplay:
         # reward arrays.
         self.offline_max_rewards = []
         self.online_max_rewards = []
+        # Running max over ONLINE episodes only -- the beta-fade trigger.
+        # Offline data is excluded on purpose: the fade should react to what
+        # the policy itself achieved, not to seeded demonstrations.
+        self.best_online_reward = -np.inf
         self._raw = collections.defaultdict(list)
         self.total_transitions = 0
 
@@ -60,6 +64,8 @@ class OnlineReplay:
         self.online_episodes.append(dreamer_ep)
         self.online_success_flags.append(self._is_success(dreamer_ep))
         self.online_max_rewards.append(self._max_reward(dreamer_ep))
+        self.best_online_reward = max(self.best_online_reward,
+                                      self.online_max_rewards[-1])
         if len(self.online_episodes) > self.max_episodes:
             self.online_episodes.pop(0) # Drop the oldest episode, FIFO
             self.online_success_flags.pop(0) # kept in lockstep

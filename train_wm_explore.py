@@ -189,7 +189,7 @@ def train(config):
         compile_nets=chunk_config.compile_nets,
     )
     rnd = None
-    if getattr(chunk_config, 'explore_novelty', 'draws') == 'rnd' \
+    if getattr(chunk_config, 'explore_novelty', 'draws') in ('rnd', 'staged') \
             and chunk_config.explore_beta != 0.0 and explore_n > 1:
         rnd = RNDNovelty(
             device, hidden=chunk_config.rnd_hidden, out=chunk_config.rnd_out,
@@ -201,7 +201,8 @@ def train(config):
         chunk_config.explore_beta, chunk_config.explore_draws, device,
         novelty_mode=getattr(chunk_config, 'explore_novelty', 'draws'),
         norm_freeze=getattr(chunk_config, 'explore_norm_freeze', 0),
-        rnd=rnd)
+        rnd=rnd, rnd_space=getattr(chunk_config, 'rnd_space', 'feat'),
+        rnd_obs_slice=getattr(chunk_config, 'rnd_obs_slice', None))
 
     eval_csv = EvalCSV(out_dir / 'eval_log.csv', arm=f'world_model_{ARM}',
                        env_name=general_config.env_name, seed=config.seed, chunk_len=chunk_len)
@@ -273,6 +274,17 @@ def train(config):
     chunk_buffer = None
     chunk_pos = chunk_len
     global_step = 0
+    # Event-triggered beta fade: full-strength exploration until the FIRST
+    # online episode clears sil_reward_thresh (a partial success), then a
+    # linear fade of the bonus weight over explore_beta_fade_steps down to
+    # explore_beta_floor. Anneals on the event that matters instead of a
+    # per-task clock; the floor keeps a little wandering alive. 'none'
+    # disables (constant beta, v1 behavior).
+    base_beta = float(chunk_config.explore_beta)
+    fade_mode = getattr(chunk_config, 'explore_beta_fade', 'none')
+    fade_steps = int(getattr(chunk_config, 'explore_beta_fade_steps', 50000))
+    beta_floor = float(getattr(chunk_config, 'explore_beta_floor', 0.5))
+    fade_trigger_step = None
     print('Starting online phase (QC-FQL training, disagreement-bonus collection)')
 
     while global_step < general_config.num_online_steps:
@@ -308,6 +320,32 @@ def train(config):
         metrics = {}
         ready = replay.ready(seq_len)
 
+        if fade_mode == 'event' and base_beta != 0.0:
+            if fade_trigger_step is None and \
+                    replay.best_online_reward > chunk_config.sil_reward_thresh:
+                fade_trigger_step = global_step
+                print(f'beta fade triggered at step {global_step} '
+                      f'(best online reward {replay.best_online_reward:.2f})')
+            if fade_trigger_step is not None:
+                frac = min(1.0, (global_step - fade_trigger_step) / max(fade_steps, 1))
+                selector.beta = beta_floor + (base_beta - beta_floor) * (1.0 - frac)
+
+        # Staged judge handoff: same trigger as the fade (first online
+        # partial), then ramp stage_w 0 -> 1 over explore_stage_blend_steps.
+        # The trigger is also exactly when the rnd judge first becomes
+        # answerable -- a partial means contact happened, so the model has
+        # its first data showing cubes can move.
+        if getattr(chunk_config, 'explore_novelty', 'draws') == 'staged' \
+                and base_beta != 0.0:
+            if fade_trigger_step is None and fade_mode != 'event' and \
+                    replay.best_online_reward > chunk_config.sil_reward_thresh:
+                fade_trigger_step = global_step
+                print(f'stage handoff triggered at step {global_step} '
+                      f'(best online reward {replay.best_online_reward:.2f})')
+            if fade_trigger_step is not None:
+                blend = int(getattr(chunk_config, 'explore_stage_blend_steps', 30000))
+                selector.stage_w = min(1.0, (global_step - fade_trigger_step) / max(blend, 1))
+
         if ready and global_step % dreamer_config.train_every == 0:
             metrics.update(prefixed(
                 wm_update(wm_agent, replay, wm_batch, seq_len, rng, log_step), 'wm'))
@@ -328,6 +366,8 @@ def train(config):
             metrics['diagnosis/phase'] = 1
             metrics.update(selector.pop_stats())
             _succ = replay.success_stats
+            metrics['diagnosis/explore_beta'] = selector.beta
+            metrics['diagnosis/fade_triggered'] = float(fade_trigger_step is not None)
             metrics['replay/success_frac_total'] = _succ['total_frac']
             metrics['replay/success_frac_online'] = _succ['online_frac']
             metrics['replay/success_episodes_online'] = _succ['online_success']

@@ -52,7 +52,7 @@ class ExploreSelector:
 
     def __init__(self, bridge, policy, action_dim, chunk_len, n, beta, draws,
                  device, warmup=100, novelty_mode='draws', norm_freeze=0,
-                 rnd=None):
+                 rnd=None, rnd_space='feat', rnd_obs_slice=None):
         self.bridge = bridge
         self.policy = policy
         self.action_dim = action_dim
@@ -66,6 +66,26 @@ class ExploreSelector:
         self.novelty_mode = str(novelty_mode)
         self.norm_freeze = int(norm_freeze)
         self.rnd = rnd
+        # rnd_space='obs': train and score the RND pair on (decoded)
+        # observations instead of world-model features. Feature-space
+        # novelty is dominated by arm-pose dims (the arm varies endlessly,
+        # the cubes barely move in the data), so its residual error steers
+        # collection toward weird poses in free space. In observation space
+        # the near-constant object dims make ANY object change maximally
+        # unfamiliar, so the same machinery steers toward the table.
+        # rnd_obs_slice=[a, b]: restrict to obs[a:b] (object dims only).
+        self.rnd_space = str(rnd_space)
+        self.rnd_obs_slice = None if rnd_obs_slice is None \
+            else slice(int(rnd_obs_slice[0]), int(rnd_obs_slice[1]))
+        # 'staged' mode: draws-judge until the trigger, then blend to the
+        # rnd-judge. stage_w is set by the trainer (0 = all draws, 1 = all
+        # rnd). The two signals live on different scales, so the rnd judge
+        # gets its OWN Welford stats (below) and the blend happens in
+        # z-space: z = (1-w)*z_draws + w*z_rnd.
+        self.stage_w = 0.0
+        self._r_count = 0
+        self._r_mean = 0.0
+        self._r_m2 = 0.0
         # Welford running stats over raw novelty values
         self._count = 0
         self._mean = 0.0
@@ -91,9 +111,15 @@ class ExploreSelector:
             self.enc, self.dyn, s, self.prevact, self.is_first)
         self.is_first = np.array([False])
         if self.rnd is not None and self.beta != 0.0:
-            # Visited-state feature -> RND training data. Same feature space
-            # the imagined end states are scored in.
-            self.rnd.add(jax.device_get(inp))
+            if self.rnd_space == 'obs' or self.novelty_mode == 'staged':
+                # Visited raw observation -> RND training data; imagined
+                # ends are decoded into the same space before scoring.
+                o = s if self.rnd_obs_slice is None else s[:, self.rnd_obs_slice]
+                self.rnd.add(o)
+            else:
+                # Visited-state feature -> RND training data. Same feature
+                # space the imagined end states are scored in.
+                self.rnd.add(jax.device_get(inp))
 
     def record_action(self, action_1d):
         """ Call after env.step with the action that was EXECUTED. """
@@ -107,6 +133,18 @@ class ExploreSelector:
             d = v - self._mean
             self._mean += d / self._count
             self._m2 += d * (v - self._mean)
+
+    def _r_norm_update(self, values):
+        for v in values:
+            self._r_count += 1
+            d = v - self._r_mean
+            self._r_mean += d / self._r_count
+            self._r_m2 += d * (v - self._r_mean)
+
+    def _r_norm_std(self):
+        if self._r_count < 2:
+            return 1.0
+        return max((self._r_m2 / self._r_count) ** 0.5, 1e-6)
 
     def _norm_std(self):
         if self._count < 2:
@@ -137,7 +175,68 @@ class ExploreSelector:
         q = self.policy._agg(self.policy.critic(feat_n, cands)).squeeze(-1) # (n,)
 
         novelty = torch.zeros(self.n, device=self.device)
-        if self.beta != 0.0 and self.novelty_mode == 'rnd':
+        if self.beta != 0.0 and self.novelty_mode == 'staged':
+            # Stage 1 (w=0): draws-judge only. Stage 2 ramp: also score the
+            # decoded imagined ends with the rnd judge and blend in z-space.
+            # The single img_chunk rollout for the rnd judge reuses the LAST
+            # draws rollout's carry, so the extra cost during the blend is
+            # one decode, not one more rollout.
+            carry_h = {k: np.repeat(np.asarray(jax.device_get(v)), self.n, axis=0)
+                       for k, v in self.dyn.items()}
+            cands_np = cands.detach().cpu().numpy()
+            end_feats = []
+            carry = None
+            for _ in range(max(self.draws, 2)):
+                carry, _, _, _ = self.bridge.img_chunk(
+                    self.bridge.place_seed(carry_h), cands_np, self.chunk_len)
+                end_feats.append(jax_to_torch(self.bridge.get_feat(carry),
+                                              self.device))
+            nov_draws = torch.stack(end_feats).std(dim=0, correction=0).mean(-1)
+            d_np = nov_draws.detach().cpu().numpy()
+            if self.norm_freeze <= 0 or self._count < self.norm_freeze:
+                self._norm_update(d_np.tolist())
+            z = (nov_draws - self._mean) / self._norm_std()
+            if self.stage_w > 0.0:
+                dec = self.bridge.decode_state(carry)[self.bridge.obs_key]
+                dec = np.asarray(dec, dtype=np.float32).reshape(self.n, -1)
+                if self.rnd_obs_slice is not None:
+                    dec = dec[:, self.rnd_obs_slice]
+                nov_rnd = self.rnd.score(
+                    torch.as_tensor(dec, device=self.device))
+                r_np = nov_rnd.detach().cpu().numpy()
+                self._r_norm_update(r_np.tolist())
+                z_r = (nov_rnd - self._r_mean) / self._r_norm_std()
+                z = (1.0 - self.stage_w) * z + self.stage_w * z_r
+                self._acc('rnd_judge_mean', float(r_np.mean()))
+            self._acc('stage_w', self.stage_w)
+            # Hand the blended z straight to scoring: novelty here is already
+            # z-scale, so bypass the shared normalizer below by mimicking its
+            # output. _norm_update above kept the draws stats current.
+            nov_np = d_np
+            prev_count = self._count
+            if prev_count >= self.warmup and self.beta != 0.0:
+                score = q + self.beta * z
+            else:
+                score = q
+            idx = int(torch.argmax(score).item())
+            idx_q = int(torch.argmax(q).item())
+            self._acc('novelty_mean', float(d_np.mean()))
+            self._acc('novelty_picked_z', float(z[idx].item()))
+            self._acc('pick_changed', float(idx != idx_q))
+            self._acc('q_paid', float((q[idx_q] - q[idx]).item()))
+            self._acc('q_std', q.std().item())
+            if self.rnd is not None:
+                self._acc('rnd_loss', self.rnd.last_loss)
+            return cands[idx].detach().cpu().numpy().reshape(
+                self.chunk_len, self.action_dim)
+        if self.beta != 0.0 and self.novelty_mode == 'random':
+            # Dice control: a fresh uniform score per candidate per decision.
+            # No model, no meaning -- isolates the value of RE-ROLLED varied
+            # selection itself. If this arm matches the draws arm, the model
+            # contributed nothing to discovery; if it lags, the model's
+            # disagreement signal carries real aim.
+            novelty = torch.rand(self.n, device=self.device)
+        elif self.beta != 0.0 and self.novelty_mode == 'rnd':
             carry_h = {k: np.repeat(np.asarray(jax.device_get(v)), self.n, axis=0)
                        for k, v in self.dyn.items()}
             cands_np = cands.detach().cpu().numpy()
@@ -145,8 +244,16 @@ class ExploreSelector:
             # deterministically, so no draws and no std are needed.
             carry, _, _, _ = self.bridge.img_chunk(
                 self.bridge.place_seed(carry_h), cands_np, self.chunk_len)
-            novelty = self.rnd.score(
-                jax_to_torch(self.bridge.get_feat(carry), self.device))
+            if self.rnd_space == 'obs':
+                dec = self.bridge.decode_state(carry)[self.bridge.obs_key]
+                dec = np.asarray(dec, dtype=np.float32).reshape(self.n, -1)
+                if self.rnd_obs_slice is not None:
+                    dec = dec[:, self.rnd_obs_slice]
+                novelty = self.rnd.score(
+                    torch.as_tensor(dec, device=self.device))
+            else:
+                novelty = self.rnd.score(
+                    jax_to_torch(self.bridge.get_feat(carry), self.device))
         elif self.beta != 0.0 and self.draws >= 2:
             carry_h = {k: np.repeat(np.asarray(jax.device_get(v)), self.n, axis=0)
                        for k, v in self.dyn.items()}

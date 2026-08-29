@@ -300,6 +300,33 @@ defaults:
       # Train the predictor every this many env steps (one minibatch from
       # the visited-feature ring buffer).
       rnd_train_every: 4
+      # v3: what the RND pair looks at. 'feat' scores world-model features
+      # (v2 behavior; empirically steers toward arm-pose novelty and away
+      # from the objects -- both alpha arms stayed floor-pinned past 120k).
+      # 'obs' trains on raw visited observations and scores the DECODED
+      # imagined end state: object dims are near-constant in the data, so
+      # any object change is maximally unfamiliar and the bonus steers
+      # toward the table. Same anneal, same normalizer, same machinery.
+      rnd_space: obs
+      # [start, end) slice of the observation the RND pair sees. Object dims
+      # only = object-centric novelty: a candidate is novel ONLY if it is
+      # predicted to change the objects, never for a weird arm pose. Full
+      # obs (null) is NOT a safe default -- a far-enough-out arm pose can
+      # still out-score a moved cube. Cube env layout: 19 proprio dims,
+      # then 9 dims per cube (pos 3, quat 4, yaw cos/sin 2). So:
+      # single [19, 28], double [19, 37], triple [19, 46].
+      rnd_obs_slice: [19, 37]
+      # Event-triggered fade of the bonus weight: 'event' = full beta until
+      # the first ONLINE episode clears sil_reward_thresh, then linear fade
+      # over explore_beta_fade_steps down to explore_beta_floor. 'none' =
+      # constant beta (v1). Works with any novelty mode.
+      explore_beta_fade: event
+      explore_beta_fade_steps: 50000
+      explore_beta_floor: 0.5
+      # 'staged' novelty: draws-judge until the first online partial, then
+      # blend to the rnd cube-judge over this many steps. The rnd judge
+      # anneals by itself, so pair staged with explore_beta_fade: none.
+      explore_stage_blend_steps: 30000
       # v2 self-imitation BC: this fraction of the actor's flow-matching
       # batch comes from the top pooled-reward chunk windows of reward-
       # bearing episodes (see sample_reward_batch). Keeps the behavior flow
