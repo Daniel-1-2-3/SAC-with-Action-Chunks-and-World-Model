@@ -431,8 +431,8 @@ defaults:
       alpha: 30.0
       flow_steps: 10
       eef_slice: [12, 15]
-train_v8:
-  train_v8:
+train_sear:
+  train_sear:
     env_name: cube-double-play-singletask-v0
     out_dir: v8_runs
     wandb_project: sear-p2e
