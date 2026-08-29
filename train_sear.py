@@ -1,4 +1,4 @@
-""" v8 trainer: SEAR + Plan2Explore, from scratch, single budget.
+""" SEAR + Plan2Explore trainer: from scratch, single budget.
 
     Two SEAR learners share one architecture:
       task agent   -- trained on real replay with environment reward;
@@ -14,7 +14,7 @@
     random replanning. Eval runs the task policy with a receding horizon.
 
     Run:
-      python train_v8.py --train_v8.env_name=cube-double-play-singletask-v0
+      python train_sear.py --train_sear.env_name=cube-double-play-singletask-v0
 """
 import os
 import pathlib
@@ -30,7 +30,7 @@ import wandb
 from explore.imagination import imagine_episodes
 from helpers.common import (load_config, prefixed, sample_sequences,
                             set_seed_everywhere, temporal_coherence)
-from helpers.replay_v8 import EpisodeReplay
+from helpers.sear_replay import EpisodeReplay
 from sear.agent import SEARAgent
 from sear.windows import build_windows
 from torch_wm.ensemble import DisagreementEnsemble
@@ -69,7 +69,7 @@ def run_eval(env, agent, cfg, eef_slice):
 
 
 def train(config):
-    cfg = config.train_v8
+    cfg = config.train_sear
     set_seed_everywhere(config.seed)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     rng = np.random.default_rng(config.seed)
@@ -96,7 +96,7 @@ def train(config):
                          device=device) if cfg.use_world_model else None
     imagined = deque(maxlen=cfg.imagined_capacity)
 
-    print(f'v8 | task=SEAR(chunk {N}) | '
+    print(f'sear-p2e | task=SEAR(chunk {N}) | '
           f'{"explorer=SEAR-on-imagined-disagreement (P2E)" if explorer else "NO explorer (SEAR-only baseline)"} | '
           f'eval=task policy, receding horizon {cfg.eval_receding}')
 
@@ -192,9 +192,9 @@ def train(config):
                         else None,
                         'wm': wm.state_dict() if wm else None,
                         'step': step},
-                       out_dir / 'v8_latest.pt')
+                       out_dir / 'sear_latest.pt')
     wandb.finish()
 
 
 if __name__ == '__main__':
-    train(load_config('train_v8', argv=sys.argv[1:]))
+    train(load_config('train_sear', argv=sys.argv[1:]))

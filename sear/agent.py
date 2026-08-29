@@ -66,7 +66,7 @@ class ChunkGaussianPolicy(nn.Module):
 
 
 class SEARAgent:
-    """ One instance = one learner. The v8 trainer builds two: a task agent
+    """ One instance = one learner. The trainer builds two: a task agent
         (real replay, env reward) and an explorer (imagined transitions,
         disagreement reward). Identical code, different diet. """
 

@@ -9,7 +9,7 @@
       loss scales: rec 1.0, rew 1.0, con 1.0, dyn 1.0, rep 0.1.
 
     Labeled deviations from the JAX original (each pragmatic, none load-
-    bearing for the disagreement/imagination roles this model plays in v8):
+    bearing for the disagreement/imagination roles this model plays here):
       - Standard GRUCell instead of the 8-block block-diagonal GRU.
       - Reward head is symlog-MSE instead of two-hot discretized regression.
       - AdamW(lr=1e-4, clip=100) instead of LaProp with AGC and warmup.

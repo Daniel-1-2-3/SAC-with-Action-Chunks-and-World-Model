@@ -1,4 +1,4 @@
-""" Minimal episode replay for the v8 stack (jax-free; the legacy
+""" Minimal episode replay for the SEAR/P2E stack (jax-free; the legacy
     OnlineReplay stays untouched for the QC baseline). Stores dreamer-format
     episodes; also serves flat (obs, act, next_obs) pairs for the ensemble.
 """

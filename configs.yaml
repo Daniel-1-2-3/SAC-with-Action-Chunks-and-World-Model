@@ -434,7 +434,7 @@ defaults:
 train_sear:
   train_sear:
     env_name: cube-double-play-singletask-v0
-    out_dir: v8_runs
+    out_dir: sear_runs
     wandb_project: sear-p2e
     wandb_mode: online
     chunk_len: 5

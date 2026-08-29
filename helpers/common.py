@@ -1,9 +1,9 @@
-""" Shared utilities for the v8 (SEAR + Plan2Explore) stack.
+""" Shared utilities for the SEAR + Plan2Explore stack.
 
     Jax-free on purpose: the legacy QC baseline keeps its own helpers
     (trainer_common / ogbench_methods / interop, which import jax); nothing
-    in the v8 stack imports those. The functions here are ports of the
-    pieces v8 needs, taken from the legacy helpers with jax removed.
+    in this stack imports those. The functions here are ports of the
+    pieces this stack needs, taken from the legacy helpers with jax removed.
 """
 import os
 import random
