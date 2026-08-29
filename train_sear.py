@@ -41,7 +41,8 @@ OBS_KEY, ACTION_KEY = 'state', 'action'
 
 def run_eval(env, agent, cfg, eef_slice):
     returns, lens, succ, coh = [], [], [], []
-    for _ in range(cfg.eval_episodes):
+    frames = []
+    for ep_i in range(cfg.eval_episodes):
         obs, _ = env.reset()
         done, ep_ret, steps = False, 0.0, 0
         chunk, pos = None, cfg.chunk_len
@@ -54,6 +55,13 @@ def run_eval(env, agent, cfg, eef_slice):
             a = chunk[pos]
             pos += 1
             obs, r, term, trunc, info = env.step(a)
+            if ep_i == 0 and steps % 2 == 0:
+                try:
+                    f = env.render()
+                    if f is not None:
+                        frames.append(f)
+                except Exception:
+                    pass
             eefs.append(obs[eef_slice[0]:eef_slice[1]])
             ep_ret += r
             steps += 1
@@ -62,10 +70,11 @@ def run_eval(env, agent, cfg, eef_slice):
         lens.append(steps)
         succ.append(float(info.get('success', 0.0)))
         coh.append(temporal_coherence(np.asarray(eefs)))
-    return {'mean_return': float(np.mean(returns)),
-            'success_rate': float(np.mean(succ)),
-            'mean_episode_len': float(np.mean(lens)),
-            'coherence': float(np.mean(coh))}
+    metrics = {'mean_return': float(np.mean(returns)),
+               'success_rate': float(np.mean(succ)),
+               'mean_episode_len': float(np.mean(lens)),
+               'coherence': float(np.mean(coh))}
+    return metrics, frames
 
 
 def train(config):
@@ -78,7 +87,12 @@ def train(config):
     wandb.init(project=cfg.wandb_project, mode=cfg.wandb_mode,
                config=dict(config))
 
-    env = ogbench.make_env_and_datasets(cfg.env_name, env_only=True)
+    try:
+        env = ogbench.make_env_and_datasets(
+            cfg.env_name, env_only=True, render_mode='rgb_array')
+    except TypeError:
+        # older ogbench without env kwargs passthrough: no video, run on
+        env = ogbench.make_env_and_datasets(cfg.env_name, env_only=True)
     obs, _ = env.reset(seed=config.seed)
     obs_dim = int(np.prod(env.observation_space.shape))
     act_dim = int(np.prod(env.action_space.shape))
@@ -181,8 +195,12 @@ def train(config):
             wandb.log(metrics_acc, step=step)
             metrics_acc = {}
         if step % cfg.eval_every == 0:
-            em = run_eval(env, task, cfg, cfg.eef_slice)
-            wandb.log(prefixed(em, 'eval'), step=step)
+            em, frames = run_eval(env, task, cfg, cfg.eef_slice)
+            log = prefixed(em, 'eval')
+            if frames:
+                arr = np.stack(frames).transpose(0, 3, 1, 2)
+                log['eval/video'] = wandb.Video(arr, fps=15, format='mp4')
+            wandb.log(log, step=step)
             obs, _ = env.reset()
             ep_steps, pos = 0, N
             replay.end_episode()
