@@ -431,3 +431,44 @@ defaults:
       alpha: 30.0
       flow_steps: 10
       eef_slice: [12, 15]
+train_v8:
+  train_v8:
+    env_name: cube-double-play-singletask-v0
+    out_dir: v8_runs
+    wandb_project: sear-p2e
+    wandb_mode: online
+    chunk_len: 5
+    gamma: 0.99
+    num_online_steps: 1000000
+    num_seed_steps: 4000
+    start_training: 5000
+    max_episode_steps: 500
+    max_episodes: 2000
+    seq_len: 48
+    batch_size: 256
+    wm_batch: 16
+    wm_every: 2
+    wm_lr: 1e-4
+    use_world_model: True
+    ensemble_k: 5
+    # cube-double object dims; [19, 28] single, [19, 46] triple; null = full
+    ensemble_obs_slice: [19, 37]
+    imagine_every: 50
+    imagine_batch: 16
+    imagine_horizon_chunks: 4
+    imagined_capacity: 400
+    explorer_updates: 4
+    # SEAR random replanning probability during collection (paper gives the
+    # mechanism; the value is our assumption -- expected chunk length ~N)
+    replan_prob: 0.05
+    eval_receding: 5
+    eval_episodes: 20
+    eval_max_steps: 500
+    eef_slice: [12, 15]
+    # scheduler: explorer episode fraction before/after first partial
+    explore_frac_pre: 0.8
+    explore_frac_post: 0.3
+    success_reward_thresh: -1.5
+    log_every: 500
+    eval_every: 10000
+    save_every: 50000
