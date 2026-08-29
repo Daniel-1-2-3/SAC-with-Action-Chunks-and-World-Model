@@ -39,10 +39,20 @@ class ExploreSelector:
             explore_beta > 0 -> ours
 
         The posterior latent is maintained by one encode_step per env step
-        (observe); that is scorer plumbing, not a policy input. """
+        (observe); that is scorer plumbing, not a policy input.
+
+        v2 (novelty_mode='rnd'): novelty comes from an RNDNovelty module
+        scoring the imagined END feature of each candidate (one rollout per
+        candidate, no draws) instead of the std over stochastic draws. RND
+        error decays wherever the policy has actually been, so the bonus
+        self-anneals per state. Pair it with norm_freeze > 0: a tracking
+        normalizer would re-inflate the decaying signal and cancel the
+        anneal, so the Welford stats are frozen after that many scored
+        values and beta keeps an early-training scale. """
 
     def __init__(self, bridge, policy, action_dim, chunk_len, n, beta, draws,
-                 device, warmup=100):
+                 device, warmup=100, novelty_mode='draws', norm_freeze=0,
+                 rnd=None):
         self.bridge = bridge
         self.policy = policy
         self.action_dim = action_dim
@@ -53,6 +63,9 @@ class ExploreSelector:
         self.draws = int(draws)
         self.device = device
         self.warmup = int(warmup)
+        self.novelty_mode = str(novelty_mode)
+        self.norm_freeze = int(norm_freeze)
+        self.rnd = rnd
         # Welford running stats over raw novelty values
         self._count = 0
         self._mean = 0.0
@@ -74,9 +87,13 @@ class ExploreSelector:
         if not self.enabled:
             return
         s = np.asarray(state_1d, dtype=np.float32).reshape(1, -1)
-        self.enc, self.dyn, _ = self.bridge.encode_step(
+        self.enc, self.dyn, inp = self.bridge.encode_step(
             self.enc, self.dyn, s, self.prevact, self.is_first)
         self.is_first = np.array([False])
+        if self.rnd is not None and self.beta != 0.0:
+            # Visited-state feature -> RND training data. Same feature space
+            # the imagined end states are scored in.
+            self.rnd.add(jax.device_get(inp))
 
     def record_action(self, action_1d):
         """ Call after env.step with the action that was EXECUTED. """
@@ -120,7 +137,17 @@ class ExploreSelector:
         q = self.policy._agg(self.policy.critic(feat_n, cands)).squeeze(-1) # (n,)
 
         novelty = torch.zeros(self.n, device=self.device)
-        if self.beta != 0.0 and self.draws >= 2:
+        if self.beta != 0.0 and self.novelty_mode == 'rnd':
+            carry_h = {k: np.repeat(np.asarray(jax.device_get(v)), self.n, axis=0)
+                       for k, v in self.dyn.items()}
+            cands_np = cands.detach().cpu().numpy()
+            # One rollout per candidate: RND scores the end feature
+            # deterministically, so no draws and no std are needed.
+            carry, _, _, _ = self.bridge.img_chunk(
+                self.bridge.place_seed(carry_h), cands_np, self.chunk_len)
+            novelty = self.rnd.score(
+                jax_to_torch(self.bridge.get_feat(carry), self.device))
+        elif self.beta != 0.0 and self.draws >= 2:
             carry_h = {k: np.repeat(np.asarray(jax.device_get(v)), self.n, axis=0)
                        for k, v in self.dyn.items()}
             cands_np = cands.detach().cpu().numpy()
@@ -135,7 +162,12 @@ class ExploreSelector:
 
         nov_np = novelty.detach().cpu().numpy()
         prev_count = self._count
-        self._norm_update(nov_np.tolist())
+        # norm_freeze > 0: stop updating the Welford stats after that many
+        # scored values. The frozen scale is what lets a decaying RND signal
+        # actually shrink the bonus instead of being re-normalized to unit
+        # size every step.
+        if self.norm_freeze <= 0 or self._count < self.norm_freeze:
+            self._norm_update(nov_np.tolist())
         if prev_count >= self.warmup and self.beta != 0.0:
             z = (novelty - self._mean) / self._norm_std()
             score = q + self.beta * z
@@ -154,6 +186,8 @@ class ExploreSelector:
         self._acc('pick_changed', float(idx != idx_q))
         self._acc('q_paid', float((q[idx_q] - q[idx]).item()))
         self._acc('q_std', q.std().item())
+        if self.rnd is not None:
+            self._acc('rnd_loss', self.rnd.last_loss)
 
         return cands[idx].detach().cpu().numpy().reshape(
             self.chunk_len, self.action_dim)

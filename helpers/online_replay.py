@@ -22,6 +22,12 @@ class OnlineReplay:
         # kept parallel to online_episodes and popped in lockstep.
         self.offline_success_count = 0
         self.online_success_flags = []
+        # Per-episode max reward past the fabricated index 0, kept in
+        # lockstep with the episode lists. Lets sample_reward_batch filter
+        # to reward-bearing episodes at ANY threshold without rescanning
+        # reward arrays.
+        self.offline_max_rewards = []
+        self.online_max_rewards = []
         self._raw = collections.defaultdict(list)
         self.total_transitions = 0
 
@@ -53,9 +59,11 @@ class OnlineReplay:
 
         self.online_episodes.append(dreamer_ep)
         self.online_success_flags.append(self._is_success(dreamer_ep))
+        self.online_max_rewards.append(self._max_reward(dreamer_ep))
         if len(self.online_episodes) > self.max_episodes:
             self.online_episodes.pop(0) # Drop the oldest episode, FIFO
             self.online_success_flags.pop(0) # kept in lockstep
+            self.online_max_rewards.pop(0) # kept in lockstep
 
     # Warm start from the static OGBench dataset, put some dataset episodes into replay at start
     def seed_from_offline(self, dreamer_episodes, n=None, rng=None):
@@ -66,6 +74,12 @@ class OnlineReplay:
             eps = [eps[i] for i in idx]
         self.offline_episodes.extend(eps)
         self.offline_success_count += sum(self._is_success(ep) for ep in eps)
+        self.offline_max_rewards.extend(self._max_reward(ep) for ep in eps)
+
+    def _max_reward(self, dreamer_ep):
+        # Index 0 is skipped for the same reason as in _is_success below.
+        r = dreamer_ep['reward'][1:]
+        return float(r.max()) if len(r) else -np.inf
 
     def _is_success(self, dreamer_ep):
         # reward[0] is the fabricated 0.0 that ogbench_to_dreamer_episode
@@ -96,6 +110,32 @@ class OnlineReplay:
     def ready(self, seq_len, min_episodes=1):
         usable = [e for e in self.dreamer_episodes if len(e[self.obs_key]) >= seq_len]
         return len(usable) >= min_episodes
+
+    def sample_reward_batch(self, batch_size, seq_len, reward_thresh,
+                            rng=None):
+        """ v2 self-imitation sampling: like sample_batch with
+            bias_start_to_reward, but ALSO filtered to episodes whose max
+            reward clears reward_thresh. sample_dreamer_batch picks episodes
+            uniformly and only biases the window start WITHIN an episode, so
+            in a buffer where reward-bearing episodes are rare the bias alone
+            still returns mostly floor windows; the episode filter is what
+            makes the batch actually reward-dense. Returns None while no
+            qualifying episode exists -- the caller falls back to uniform,
+            so this is inert until the first partial success. Intended ONLY
+            for the actor's flow-BC batch; critic and world-model training
+            batches stay uniform (see sample_batch's warning below). """
+        if rng is None:
+            rng = np.random.default_rng()
+        pairs = list(zip(self.offline_episodes, self.offline_max_rewards)) + \
+            list(zip(self.online_episodes, self.online_max_rewards))
+        usable = [e for e, m in pairs
+                  if m > reward_thresh and len(e[self.obs_key]) >= seq_len]
+        if not usable:
+            return None
+        return OGBenchMethods.sample_dreamer_batch(
+            usable, batch_size, seq_len,
+            obs_key=self.obs_key, action_key=self.action_key, rng=rng,
+            bias_start_to_reward=True, reward_thresh=reward_thresh)
 
     def sample_batch(self, batch_size, seq_len, rng=None,
                      bias_start_to_reward=False, bias_reward_thresh=None):

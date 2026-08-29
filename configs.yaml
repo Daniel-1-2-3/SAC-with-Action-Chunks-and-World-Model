@@ -278,6 +278,39 @@ defaults:
       # (~350k in run 1); 900k end = before the reference's steep phase.
       explore_beta_decay_start: 500000
       explore_beta_decay_end: 900000
+      # v2 novelty source. 'draws' = the original std-over-stochastic-rollouts
+      # disagreement (floored by the RSSM's own sampling, cannot anneal).
+      # 'rnd' = Random Network Distillation error at each candidate's imagined
+      # END state: one rollout per candidate, deterministic score, and the
+      # error decays wherever the policy has actually been -- the bonus
+      # self-anneals per state with no schedule. The decay_start/end knobs
+      # above are unused in either mode (never wired into this trainer).
+      explore_novelty: rnd
+      # Freeze the bonus's Welford normalizer after this many scored values
+      # (16 per decision; 4000 ~= 250 decisions ~= 1250 env steps). A
+      # tracking normalizer re-inflates a decaying signal and cancels the
+      # anneal; freezing pins beta to an early-training scale so decayed
+      # RND error means a genuinely small bonus. 0 = never freeze (v1).
+      explore_norm_freeze: 4000
+      rnd_hidden: 256
+      rnd_out: 128
+      rnd_lr: 1e-4
+      rnd_buffer: 2048
+      rnd_batch: 256
+      # Train the predictor every this many env steps (one minibatch from
+      # the visited-feature ring buffer).
+      rnd_train_every: 4
+      # v2 self-imitation BC: this fraction of the actor's flow-matching
+      # batch comes from the top pooled-reward chunk windows of reward-
+      # bearing episodes (see sample_reward_batch). Keeps the behavior flow
+      # -- and with it the 16 candidates -- tracking the policy's best
+      # behavior instead of the buffer average. 0 = v1 behavior. Critic and
+      # world-model batches stay uniform regardless.
+      sil_frac: 0.5
+      # Reward level that counts as reward-bearing for the SIL batch. On
+      # cube-double the floor step reward is -2 and one placed cube is -1,
+      # so -1.5 catches partial progress; full successes only would be -0.5.
+      sil_reward_thresh: -1.5
       # Real chunk transitions per critic/actor update -- QC's batch_size.
       batch_size: 256
       bc_batch: 256
@@ -290,7 +323,12 @@ defaults:
       critic_target_tau: 0.005
       ensemble: 2
       q_agg: mean
-      alpha: 300.0
+      # v2 from-scratch deviation from the reference table's 300 (Table 4,
+      # cube-double, tuned for demo-anchored offline-to-online). With no
+      # dataset the anchor pins the actor to its own junk replay; 30 keeps
+      # the flow trained (candidate diversity) while letting Q-gradients
+      # actually move the actor. Restore 300 for any pretrained-data rerun.
+      alpha: 30.0
       flow_steps: 10
       eef_slice: [12, 15]
       # --- world-model accuracy checks, run at every eval (wm_diagnostics.py)
@@ -355,6 +393,11 @@ defaults:
       critic_target_tau: 0.005
       ensemble: 2
       q_agg: mean
-      alpha: 300.0
+      # v2 from-scratch deviation from the reference table's 300 (Table 4,
+      # cube-double, tuned for demo-anchored offline-to-online). With no
+      # dataset the anchor pins the actor to its own junk replay; 30 keeps
+      # the flow trained (candidate diversity) while letting Q-gradients
+      # actually move the actor. Restore 300 for any pretrained-data rerun.
+      alpha: 30.0
       flow_steps: 10
       eef_slice: [12, 15]

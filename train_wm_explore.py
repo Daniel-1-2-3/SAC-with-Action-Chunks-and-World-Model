@@ -20,6 +20,7 @@ from sac_chunked.chunk_utils import real_chunk_transitions
 from sac_chunked.evaluation_chunk import eval_chunk_in_env, EvalCSV
 from sac_chunked.wm_diagnostics import wm_report, print_wm_report
 from wm.explore import ExploreSelector
+from wm.rnd import RNDNovelty
 from helpers.interop import numeric_metrics, unwrap
 from helpers.ogbench_methods import OGBenchMethods
 from helpers.online_replay import OnlineReplay
@@ -57,14 +58,43 @@ def _agent_update(policy, replay, wm_batch, seq_len, chunk_config,
         target = real_reward + gamma_h * real_mask * \
             policy.chunk_target_values(next_obs)
 
+    # v2 self-imitation BC: replace sil_frac of the flow-matching batch with
+    # the top pooled-reward chunk windows from reward-bearing episodes, so
+    # the behavior flow -- and through distillation the 16 candidates --
+    # tracks the policy's best behavior instead of the buffer average.
+    # ONLY the bc_* args change: the critic batch and the distill/Q batch
+    # stay uniform, so value estimates keep covering ordinary states.
+    # Inert (uniform) until the first reward-bearing episode exists.
+    bc_feat, bc_chunk, bc_valid = obs, chunk, step_valid
+    sil_frac = getattr(chunk_config, 'sil_frac', 0.0)
+    sil_n_used = 0
+    if sil_frac > 0.0:
+        sil_batch = replay.sample_reward_batch(
+            wm_batch, seq_len, chunk_config.sil_reward_thresh, rng=rng)
+        if sil_batch is not None:
+            sil_data = real_chunk_transitions(
+                sil_batch, chunk_len, gamma, obs_key=OBS_KEY,
+                action_key=ACTION_KEY)
+            if sil_data is not None and len(sil_data['idx']) > 0:
+                n_sil = min(int(round(take * sil_frac)), len(sil_data['idx']))
+                # Top-k by pooled chunk reward: the best windows of the best
+                # episodes. Degrades toward uniform when rewards are equal.
+                top = np.argsort(sil_data['reward'][:, 0])[-n_sil:]
+                n_uni = take - n_sil
+                bc_feat = torch.cat([obs[:n_uni], to(sil_data['obs'][top])])
+                bc_chunk = torch.cat([chunk[:n_uni], to(sil_data['chunk'][top])])
+                bc_valid = torch.cat([step_valid[:n_uni],
+                                      to(sil_data['step_valid'][top])])
+                sil_n_used = n_sil
+
     metrics = {}
     metrics.update(prefixed(policy.update_critic(
         obs, chunk, target, valid, metrics_on=metrics_on), 'sac'))
     # One batch drives distill/Q and the flow-matching term, exactly as
     # agents/acfql.py does.
     metrics.update(prefixed(policy.update_actor(
-        obs, torch.ones_like(valid), bc_feat=obs, bc_chunk=chunk,
-        bc_valid=step_valid, metrics_on=metrics_on), 'sac'))
+        obs, torch.ones_like(valid), bc_feat=bc_feat, bc_chunk=bc_chunk,
+        bc_valid=bc_valid, metrics_on=metrics_on), 'sac'))
     policy.update_target()
 
     if not metrics_on:
@@ -78,6 +108,7 @@ def _agent_update(policy, replay, wm_batch, seq_len, chunk_config,
     metrics['sac/valid_frac'] = valid.mean().item()
     metrics['sac/chunk_diversity'] = policy.chunk_diversity(obs)
     metrics['diagnosis/batch_reward_max'] = real_reward.max().item()
+    metrics['sac/sil_frac_actual'] = sil_n_used / max(take, 1)
     return metrics
 
 def train(config):
@@ -104,11 +135,14 @@ def train(config):
     set_seed_everywhere(config.seed)
     print(f'PyTorch device: {device} | JAX devices: {jax.devices()}')
     if explore_n > 1 and chunk_config.explore_beta != 0.0:
+        _nov = getattr(chunk_config, 'explore_novelty', 'draws')
+        _sig = ('RND error at the imagined end state (self-annealing)'
+                if _nov == 'rnd' else
+                f'model disagreement over {chunk_config.explore_draws} draws')
         print(f'Exploration bonus: best-of-{explore_n} at every COLLECTION '
               f'chunk boundary, score = Q + {chunk_config.explore_beta} * '
-              f'z(model disagreement over {chunk_config.explore_draws} '
-              f'draws) | training is plain QC-FQL | eval acts with the bare '
-              f'policy')
+              f'z({_sig}) | training is plain QC-FQL | eval acts with the '
+              f'bare policy')
     elif explore_n > 1:
         print(f'explore_beta=0: critic-only best-of-{explore_n} (the QC '
               f'paper\'s method). World model unused for scoring -- this is '
@@ -154,9 +188,20 @@ def train(config):
         flow_steps=chunk_config.flow_steps, q_agg=chunk_config.q_agg,
         compile_nets=chunk_config.compile_nets,
     )
+    rnd = None
+    if getattr(chunk_config, 'explore_novelty', 'draws') == 'rnd' \
+            and chunk_config.explore_beta != 0.0 and explore_n > 1:
+        rnd = RNDNovelty(
+            device, hidden=chunk_config.rnd_hidden, out=chunk_config.rnd_out,
+            lr=chunk_config.rnd_lr, buffer_size=chunk_config.rnd_buffer,
+            batch=chunk_config.rnd_batch,
+            train_every=chunk_config.rnd_train_every)
     selector = ExploreSelector(
         bridge, policy, action_dim, chunk_len, explore_n,
-        chunk_config.explore_beta, chunk_config.explore_draws, device)
+        chunk_config.explore_beta, chunk_config.explore_draws, device,
+        novelty_mode=getattr(chunk_config, 'explore_novelty', 'draws'),
+        norm_freeze=getattr(chunk_config, 'explore_norm_freeze', 0),
+        rnd=rnd)
 
     eval_csv = EvalCSV(out_dir / 'eval_log.csv', arm=f'world_model_{ARM}',
                        env_name=general_config.env_name, seed=config.seed, chunk_len=chunk_len)
