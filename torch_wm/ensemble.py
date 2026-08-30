@@ -14,33 +14,49 @@
     this is lossless in spirit, trains straight off replay, and keeps the
     v3 finding available: `obs_slice` restricts the disagreement to object
     dims so novelty means 'objects predicted to move somewhere new'.
+
+    Implementation: all K heads live in stacked parameter tensors and every
+    forward runs the whole ensemble in fused einsum passes -- one kernel
+    per layer for all heads, no per-head loop.
 """
+import math
+
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class DisagreementEnsemble(nn.Module):
     def __init__(self, obs_dim, act_dim, k=5, hidden=256, layers=2,
                  lr=3e-4, obs_slice=None, device='cpu'):
         super().__init__()
+        assert layers == 2, 'stacked implementation is fixed at 2 layers'
         self.k = k
         self.obs_slice = (slice(obs_slice[0], obs_slice[1])
                           if obs_slice else None)
         out_dim = (obs_slice[1] - obs_slice[0]) if obs_slice else obs_dim
+        d_in = obs_dim + act_dim
 
-        def head():
-            seq, d = [], obs_dim + act_dim
-            for _ in range(layers):
-                seq += [nn.Linear(d, hidden), nn.SiLU()]
-                d = hidden
-            seq += [nn.Linear(d, out_dim)]
-            return nn.Sequential(*seq)
+        def w(fan_in, *shape):
+            t = torch.empty(*shape)
+            nn.init.uniform_(t, -1 / math.sqrt(fan_in), 1 / math.sqrt(fan_in))
+            return nn.Parameter(t)
 
-        self.heads = nn.ModuleList([head() for _ in range(self.k)])
+        self.w1, self.b1 = w(d_in, k, d_in, hidden), w(d_in, k, hidden)
+        self.w2, self.b2 = w(hidden, k, hidden, hidden), w(hidden, k, hidden)
+        self.w3, self.b3 = w(hidden, k, hidden, out_dim), w(hidden, k, out_dim)
         self.to(device)
         self.device = device
         self.opt = torch.optim.Adam(self.parameters(), lr=lr)
+
+    def _forward_all(self, x):
+        """ x (B, d_in) -> predictions (K, B, out_dim), all heads fused. """
+        h = F.silu(torch.einsum('bi,kih->kbh', x, self.w1)
+                   + self.b1.unsqueeze(1))
+        h = F.silu(torch.einsum('kbh,khj->kbj', h, self.w2)
+                   + self.b2.unsqueeze(1))
+        return torch.einsum('kbj,kjo->kbo', h, self.w3) + self.b3.unsqueeze(1)
 
     def _targets(self, next_obs):
         return next_obs[:, self.obs_slice] if self.obs_slice else next_obs
@@ -50,13 +66,13 @@ class DisagreementEnsemble(nn.Module):
                                        device=self.device)
         obs, act, next_obs = to(obs), to(act), to(next_obs)
         x = torch.cat([obs, act], -1)
-        tgt = self._targets(next_obs)
+        tgt = self._targets(next_obs).unsqueeze(0)            # (1, B, D)
+        preds = self._forward_all(x)                          # (K, B, D)
         # independent bootstrap masks per head so the heads disagree from
         # data noise, not only from initialization
-        loss = 0.0
-        for h in self.heads:
-            mask = (torch.rand(len(x), 1, device=self.device) < 0.8).float()
-            loss = loss + (mask * (h(x) - tgt) ** 2).mean()
+        mask = (torch.rand(self.k, len(x), 1,
+                           device=self.device) < 0.8).float()
+        loss = (mask * (preds - tgt) ** 2).mean() * self.k
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         self.opt.step()
@@ -67,5 +83,5 @@ class DisagreementEnsemble(nn.Module):
         """ obs (B, obs_dim), act (B, act_dim) tensors -> (B,) intrinsic
             reward. Variance across ensemble means, averaged over dims. """
         x = torch.cat([obs, act], -1)
-        preds = torch.stack([h(x) for h in self.heads])       # (K, B, D)
+        preds = self._forward_all(x)                          # (K, B, D)
         return preds.var(dim=0, unbiased=True).mean(-1)       # (B,)

@@ -13,6 +13,13 @@
       - Standard GRUCell instead of the 8-block block-diagonal GRU.
       - Reward head is symlog-MSE instead of two-hot discretized regression.
       - AdamW(lr=1e-4, clip=100) instead of LaProp with AGC and warmup.
+
+    Performance notes: the GRU recurrence is inherently sequential, but
+    everything hoistable is hoisted out of the time loop -- the encoder runs
+    once over (B*T), and all KL math is vectorized over (B, T) after the
+    loop, so the loop body is just the recurrent linears. use_compile=True
+    additionally fuses the whole train step with torch.compile (falls back
+    silently if unsupported); first call pays a one-off compilation delay.
 """
 import numpy as np
 import torch
@@ -43,7 +50,7 @@ class WorldModel(nn.Module):
     def __init__(self, obs_dim, act_dim, deter=512, hidden=512, stoch=32,
                  classes=16, units=512, enc_layers=3, dec_layers=3,
                  unimix=0.01, free_nats=1.0, lr=1e-4, device='cpu',
-                 scales=None):
+                 scales=None, use_compile=False):
         super().__init__()
         self.obs_dim, self.act_dim = obs_dim, act_dim
         self.deter, self.stoch, self.classes = deter, stoch, classes
@@ -64,6 +71,12 @@ class WorldModel(nn.Module):
         self.to(device)
         self.device = device
         self.opt = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=1e-4)
+        self._train_fn = self._train_impl
+        if use_compile and hasattr(torch, 'compile'):
+            try:
+                self._train_fn = torch.compile(self._train_impl)
+            except Exception as e:
+                print(f'torch.compile unavailable ({e}); running eager')
 
     # ---------- distribution helpers ----------
     def _dist_probs(self, logits):
@@ -159,19 +172,35 @@ class WorldModel(nn.Module):
         reward, cont = to(batch['reward']), to(batch['cont'])
         is_first = torch.as_tensor(np.asarray(batch['is_first'], bool),
                                    device=self.device)
+        out = self._train_fn(obs, action, reward, cont, is_first)
+        return {k: float(v.item()) for k, v in out.items()}
+
+    def _train_impl(self, obs, action, reward, cont, is_first):
         B, T = obs.shape[:2]
-        carry = self.init(B)
-        feats, dyn_kl, rep_kl = [], 0.0, 0.0
-        for t in range(T):
-            carry, post_p, prior_p = self.obs_step(
-                carry, action[:, t], obs[:, t], is_first[:, t])
-            feats.append(self.feat(carry))
-            # KL balancing with free nats, per DreamerV3
-            dyn = self._kl(post_p.detach(), prior_p)
-            rep = self._kl(post_p, prior_p.detach())
-            dyn_kl = dyn_kl + torch.clamp(dyn, min=self.free_nats).mean()
-            rep_kl = rep_kl + torch.clamp(rep, min=self.free_nats).mean()
+        # hoisted: encode every timestep in one pass
+        embeds = self.encoder(symlog(obs.reshape(B * T, -1))
+                              ).reshape(B, T, -1)
+        mask = (~is_first).float()                          # (B, T)
+        deter = torch.zeros(B, self.deter, device=obs.device)
+        stoch = torch.zeros(B, self.stoch * self.classes, device=obs.device)
+        feats, post_l, prior_l = [], [], []
+        for t in range(T):                # recurrence: irreducibly sequential
+            m = mask[:, t:t + 1]
+            deter = self.gru(self.pre_gru(
+                torch.cat([stoch * m, action[:, t] * m], -1)), deter * m)
+            pl = self.obs_logits(torch.cat([deter, embeds[:, t]], -1))
+            post_l.append(pl)
+            prior_l.append(self.img_logits(deter))
+            stoch = self._sample(self._dist_probs(pl)).flatten(1)
+            feats.append(torch.cat([deter, stoch], -1))
         feats = torch.stack(feats, 1)
+        # hoisted: all KL math vectorized over (B, T)
+        post_p = self._dist_probs(torch.stack(post_l, 1))
+        prior_p = self._dist_probs(torch.stack(prior_l, 1))
+        dyn = torch.clamp(self._kl(post_p.detach(), prior_p),
+                          min=self.free_nats).mean()
+        rep = torch.clamp(self._kl(post_p, prior_p.detach()),
+                          min=self.free_nats).mean()
         rec = ((self.decoder(feats) - symlog(obs)) ** 2).mean()
         rew = ((self.reward_head(feats).squeeze(-1) - symlog(reward)) ** 2)
         # index 0 carries the fabricated pre-step reward; mask it out of the
@@ -182,13 +211,11 @@ class WorldModel(nn.Module):
             self.cont_head(feats).squeeze(-1), cont)
         s = self.scales
         loss = (s['rec'] * rec + s['rew'] * rew + s['con'] * con +
-                s['dyn'] * dyn_kl / T + s['rep'] * rep_kl / T)
+                s['dyn'] * dyn + s['rep'] * rep)
         self.opt.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(self.parameters(), 100.0)
         self.opt.step()
-        return {'loss/state': float(rec.item()),
-                'loss/rew': float(rew.item()),
-                'loss/con': float(con.item()),
-                'loss/dyn': float((dyn_kl / T).item()),
-                'loss/rep': float((rep_kl / T).item())}
+        return {'loss/state': rec.detach(), 'loss/rew': rew.detach(),
+                'loss/con': con.detach(), 'loss/dyn': dyn.detach(),
+                'loss/rep': rep.detach()}

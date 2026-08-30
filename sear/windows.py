@@ -11,9 +11,13 @@
       valid[k-1]    = 1                  (full windows only; per-prefix
                                           validity is inherent: every prefix
                                           of a full window is in-episode)
+
+    Fully vectorized: windows for all (b, t) are materialized with numpy
+    sliding views and boolean-compressed in one shot -- no Python loops.
 """
 import numpy as np
 import torch
+from numpy.lib.stride_tricks import sliding_window_view as swv
 
 
 def build_windows(seqs, chunk_len, obs_key='state', action_key='action',
@@ -22,35 +26,38 @@ def build_windows(seqs, chunk_len, obs_key='state', action_key='action',
         Returns dict of torch tensors, M = number of windows kept. """
     if rng is None:
         rng = np.random.default_rng()
-    obs, act = seqs[obs_key], seqs[action_key]
-    rew, cont = seqs['reward'], seqs['cont']
-    is_first = seqs['is_first']
+    obs = np.ascontiguousarray(seqs[obs_key])
+    act = np.ascontiguousarray(seqs[action_key])
+    rew = np.ascontiguousarray(seqs['reward'])
+    cont = np.ascontiguousarray(seqs['cont'])
+    is_first = np.ascontiguousarray(seqs['is_first'])
     B, T = rew.shape
     N = chunk_len
-    starts = np.arange(0, T - N)                      # t, needs t+N <= T-1
-    o_list, a_list, r_list, no_list, b_list = [], [], [], [], []
-    for b in range(B):
-        # exclude windows that cross an episode boundary (an is_first
-        # inside (t, t+N]) -- boundaries only occur at sequence start in
-        # this replay, but imagined episodes keep the same invariant.
-        firsts = np.flatnonzero(is_first[b])
-        for t in starts:
-            if np.any((firsts > t) & (firsts <= t + N)):
-                continue
-            o_list.append(obs[b, t])
-            a_list.append(act[b, t + 1: t + N + 1])
-            r_list.append(rew[b, t + 1: t + N + 1])
-            no_list.append(obs[b, t + 1: t + N + 1])
-            b_list.append(cont[b, t + 1: t + N + 1])
-    M = len(o_list)
+    W = T - N                                  # window starts t = 0..W-1
+    if W <= 0:
+        return None
+    # exclude windows crossing an episode boundary: any is_first inside
+    # (t, t+N]. sliding view over is_first gives (B, W, N+1) covering
+    # indices t..t+N; positions 1: are the exclusion zone.
+    bad = swv(is_first, N + 1, axis=1)[:, :W, 1:].any(-1)     # (B, W)
+    keep = ~bad
+    o = obs[:, :W][keep]                                       # (M, D)
+    # windows over the shifted-by-one tail arrays: index t+1..t+N
+    a_w = swv(act[:, 1:], N, axis=1)                           # (B, W', N?, A)
+    a_w = np.moveaxis(a_w, -1, 2)[:, :W][keep]                 # (M, N, A)
+    r_w = swv(rew[:, 1:], N, axis=1)[:, :W][keep]              # (M, N)
+    no_w = swv(obs[:, 1:], N, axis=1)                          # (B, W', D?, N)
+    no_w = np.moveaxis(no_w, -1, 2)[:, :W][keep]               # (M, N, D)
+    b_w = swv(cont[:, 1:], N, axis=1)[:, :W][keep]             # (M, N)
+    M = len(o)
     if M == 0:
         return None
     if take is not None and M > take:
         idx = rng.choice(M, size=take, replace=False)
-    else:
-        idx = np.arange(M)
-    to = lambda x: torch.as_tensor(
-        np.asarray(x, dtype=np.float32)[idx], device=device)
-    return {'obs': to(o_list), 'actions': to(a_list), 'rewards': to(r_list),
-            'next_obs': to(no_list), 'boot': to(b_list),
-            'valid': torch.ones(len(idx), N, device=device)}
+        o, a_w, r_w, no_w, b_w = (x[idx] for x in (o, a_w, r_w, no_w, b_w))
+        M = take
+    to = lambda x: torch.as_tensor(np.ascontiguousarray(x, dtype=np.float32),
+                                   device=device)
+    return {'obs': to(o), 'actions': to(a_w), 'rewards': to(r_w),
+            'next_obs': to(no_w), 'boot': to(b_w),
+            'valid': torch.ones(M, N, device=device)}

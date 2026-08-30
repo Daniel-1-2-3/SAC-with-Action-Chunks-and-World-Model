@@ -103,8 +103,9 @@ def train(config):
     N = cfg.chunk_len
 
     replay = EpisodeReplay(OBS_KEY, ACTION_KEY, cfg.max_episodes)
-    wm = WorldModel(obs_dim, act_dim, device=device,
-                    lr=cfg.wm_lr) if cfg.use_world_model else None
+    wm = WorldModel(obs_dim, act_dim, device=device, lr=cfg.wm_lr,
+                    use_compile=cfg.wm_compile) if cfg.use_world_model \
+        else None
     ensemble = DisagreementEnsemble(
         obs_dim, act_dim, k=cfg.ensemble_k,
         obs_slice=cfg.ensemble_obs_slice, device=device) \

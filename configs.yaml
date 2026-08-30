@@ -449,6 +449,9 @@ train_sear:
     wm_batch: 16
     wm_every: 2
     wm_lr: 1e-4
+    # torch.compile the WM train step (one-off compile delay at first
+    # update; silently falls back to eager if unsupported)
+    wm_compile: True
     use_world_model: True
     ensemble_k: 5
     # cube-double object dims; [19, 28] single, [19, 46] triple; null = full
