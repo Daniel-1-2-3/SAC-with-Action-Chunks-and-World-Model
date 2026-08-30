@@ -169,6 +169,29 @@ class WorldModel(nn.Module):
     def pred_reward(self, feats):
         return symexp(self.reward_head(feats)).squeeze(-1)
 
+    def optimism_update(self, deters, zs, advantages, alpha, eta):
+        """ OWM's optimistic dynamics loss (Mete et al. 2026, Eq. 9),
+            applied to imagined explorer rollouts:
+              L = -alpha * sum_l A_l * log p(z_{l+1} | h_{l+1})
+                  - eta * sum_l H(p(. | h_{l+1}))
+            Pushes the prior toward sampled latents on high-advantage
+            imagined transitions -- the model becomes mildly optimistic
+            about outcomes that beat the env-value baseline -- with an
+            entropy term against collapse. Structurally the actor loss
+            with log pi replaced by log p, exactly as the paper frames it.
+            deters (B, H, deter), zs (B, H, S, C) one-hot samples,
+            advantages (B, H) already normalized, all detached. """
+        probs = self._dist_probs(self.img_logits(deters))    # (B,H,S,C)
+        logp = (zs * torch.log(probs + 1e-8)).sum([-1, -2])  # (B, H)
+        ent = -(probs * torch.log(probs + 1e-8)).sum([-1, -2])
+        loss = -(alpha * (advantages * logp).mean() + eta * ent.mean())
+        self.opt.zero_grad(set_to_none=True)
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.parameters(), 100.0)
+        self.opt.step()
+        return {'owm_loss': float(loss.item()),
+                'owm_logp': float(logp.mean().item())}
+
     # ---------- training ----------
     def train_batch(self, batch):
         """ batch: dict of numpy (B, T, ...): obs 'state', 'action',

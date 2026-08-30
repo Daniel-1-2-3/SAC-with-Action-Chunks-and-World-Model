@@ -12,11 +12,14 @@
                     (expected future novelty). Executed in the environment
                     to collect informative real data.
 
-    The integration seam (ours, and the only non-paper component):
-    collection alternates whole episodes between the two policies,
-    explorer-heavy before the first online partial success, task-heavy
-    after. Replay stores per-step transitions, so SEAR's action-conditioned
-    critic consumes explorer-collected data unchanged.
+    The integration seam (ours, and the only non-paper components):
+    (1) the explorer collects (all or nearly all) episodes and SEAR learns
+    off-policy from the shared per-step replay -- mirroring P2E, whose task
+    policy also never collects; there is NO event-driven schedule; and
+    (2) a small fraction of each training batch is drawn from
+    reward-bearing episodes (biased sampling, no importance correction,
+    fraction kept small), so rare found rewards are amplified instead of
+    diluted in the growing buffer.
 
     use_world_model=False collapses to the SEAR-only baseline.
 
@@ -115,7 +118,10 @@ def train(config):
     N = cfg.chunk_len
 
     replay = EpisodeReplay(OBS_KEY, ACTION_KEY, cfg.max_episodes)
-    task = SEARAgent(obs_dim, act_dim, N, gamma=cfg.gamma, device=device)
+    task = SEARAgent(obs_dim, act_dim, N, gamma=cfg.gamma, device=device,
+                     alpha_min=cfg.alpha_min,
+                     critic_kw=dict(vmin=cfg.critic_vmin,
+                                    vmax=cfg.critic_vmax))
     wm = ensemble = explorer = None
     if cfg.use_world_model:
         wm = WorldModel(obs_dim, act_dim, device=device, lr=cfg.wm_lr,
@@ -125,6 +131,7 @@ def train(config):
             device=device)
         explorer = P2EExplorer(wm.feat_dim, act_dim,
                                horizon=cfg.imagine_horizon, gamma=cfg.gamma,
+                               reward_mix=cfg.explore_reward_mix,
                                device=device)
 
     print(f'sear-p2e | task=SEAR(chunk {N}) | '
@@ -133,14 +140,15 @@ def train(config):
 
     trigger_step = None
     acting = 'explorer' if explorer else 'task'
-    chunk, pos = None, N                       # task-policy chunk state
+    chunk, pos, prefix_len = None, N, N        # task-policy chunk state
     ex_carry, prev_a, ep_start = None, None, True   # explorer latent state
     ep_steps = 0
     metrics_acc = {}
 
     def reset_episode_state():
-        nonlocal chunk, pos, ex_carry, prev_a, ep_start, ep_steps
-        chunk, pos = None, N
+        nonlocal chunk, pos, prefix_len, ex_carry, prev_a, ep_start, \
+            ep_steps
+        chunk, pos, prefix_len = None, N, 0
         ex_carry = wm.init(1) if (explorer and wm) else None
         prev_a = np.zeros(act_dim, np.float32)
         ep_start, ep_steps = True, 0
@@ -156,9 +164,12 @@ def train(config):
                 np.asarray([ep_start], bool))
             a = explorer.act(feat)[0]
         else:
-            # SEAR collection: chunked, with random replanning
-            if pos >= N or rng.random() < cfg.replan_prob:
+            # SEAR random replanning (Sec 4.4): 'we only execute a random
+            # prefix of each chunk' -- draw a fresh chunk, run a uniform
+            # random prefix length of it, replan.
+            if pos >= prefix_len:
                 chunk = task.act(obs, deterministic=False)
+                prefix_len = int(rng.integers(1, N + 1))
                 pos = 0
             a = chunk[pos]
             pos += 1
@@ -174,19 +185,22 @@ def train(config):
             obs, _ = env.reset()
             reset_episode_state()
             if explorer:
-                frac = cfg.explore_frac_pre if trigger_step is None \
-                    else cfg.explore_frac_post
-                acting = 'explorer' if rng.random() < frac else 'task'
+                acting = 'explorer' if rng.random() < cfg.explore_frac \
+                    else 'task'
 
+        # first-partial is a logged milestone only -- it changes nothing
         if trigger_step is None and \
                 replay.best_online_reward > cfg.success_reward_thresh:
             trigger_step = step
-            print(f'trigger at step {step} '
+            print(f'first partial at step {step} '
                   f'(best online reward {replay.best_online_reward:.2f})')
 
         # ---------------- updates ----------------
         if step > cfg.start_training and replay.ready(cfg.seq_len):
-            seqs = replay.sample_seqs(cfg.wm_batch, cfg.seq_len, rng)
+            seqs = replay.sample_seqs(
+                cfg.wm_batch, cfg.seq_len, rng,
+                reward_frac=cfg.reward_batch_frac,
+                reward_thresh=cfg.success_reward_thresh)
             win = build_windows(seqs, N, OBS_KEY, ACTION_KEY,
                                 take=cfg.batch_size, rng=rng, device=device)
             if win is not None:
@@ -203,12 +217,17 @@ def train(config):
                 starts = feat_to_carry(wm, flat[idx])
                 metrics_acc.update(prefixed(
                     explorer.update(wm, ensemble, starts), 'explorer'))
+                if cfg.owm_alpha > 0:
+                    rc = explorer.last_rollout
+                    metrics_acc.update(prefixed(wm.optimism_update(
+                        rc['deters'], rc['zs'], rc['advantages'],
+                        cfg.owm_alpha, cfg.owm_eta), 'wm'))
 
         # ---------------- logging / eval / ckpt ----------------
         if step % cfg.log_every == 0:
             stats = replay.success_stats(cfg.success_reward_thresh)
             metrics_acc.update(prefixed(stats, 'replay'))
-            metrics_acc['diagnosis/trigger_fired'] = float(
+            metrics_acc['diagnosis/first_partial_seen'] = float(
                 trigger_step is not None)
             wandb.log(metrics_acc, step=step)
             metrics_acc = {}

@@ -65,10 +65,42 @@ class EpisodeReplay:
     def ready(self, seq_len):
         return any(len(e[self.obs_key]) >= seq_len for e in self.episodes)
 
-    def sample_seqs(self, batch, seq_len, rng):
+    def sample_seqs(self, batch, seq_len, rng, reward_frac=0.0,
+                    reward_thresh=-1.5):
+        """ Uniform sequence sampling, with an optional fraction of the
+            batch drawn from reward-bearing episodes, start-biased so the
+            sequence contains a reward hit. Biased sampling without
+            importance correction (labeled): the fraction is kept small so
+            the bias stays modest. """
         eps = [e for e in self.episodes if len(e[self.obs_key]) >= seq_len]
-        return sample_sequences(eps, batch, seq_len, self.obs_key,
-                                self.action_key, rng)
+        n_r = int(round(batch * reward_frac))
+        out = None
+        if n_r > 0:
+            rich = [e for e in eps
+                    if len(e['reward']) > 1
+                    and e['reward'][1:].max() > reward_thresh]
+            if rich:
+                keys = [self.obs_key, self.action_key, 'reward', 'is_first',
+                        'is_terminal', 'cont']
+                out = {k: [] for k in keys}
+                for _ in range(n_r):
+                    ep = rich[rng.integers(0, len(rich))]
+                    hits = 1 + np.flatnonzero(
+                        ep['reward'][1:] > reward_thresh)
+                    h = int(hits[rng.integers(0, len(hits))])
+                    lo = max(0, h - seq_len + 1)
+                    hi = min(h, len(ep[self.obs_key]) - seq_len)
+                    start = int(rng.integers(lo, hi + 1)) if hi >= lo else 0
+                    for k in keys:
+                        out[k].append(ep[k][start:start + seq_len])
+            else:
+                n_r = 0
+        uni = sample_sequences(eps, batch - n_r, seq_len, self.obs_key,
+                               self.action_key, rng)
+        if out is None:
+            return uni
+        return {k: np.concatenate([np.stack(out[k]), uni[k]])
+                for k in uni}
 
     def sample_pairs(self, batch, rng):
         """ Flat (obs, act, next_obs) transitions for the ensemble. """

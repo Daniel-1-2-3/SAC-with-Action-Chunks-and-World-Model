@@ -15,9 +15,11 @@
     Actor update -- Eq. 9's reverse-KL, which reduces to the SAC form:
       maximize E[ Q^(N)(s, atilde) - alpha * sum_i gamma^i log pi(atilde_i|s) ].
 
-    Assumptions (appendix values not extracted; marked for tuning):
-    temperature target entropy = -act_dim per step (SAC convention) scaled
-    by sum_i gamma^i; both networks Adam 3e-4; tau 0.005.
+    Appendix C values (extracted, no longer assumptions): AdamW lr 3e-4
+    weight decay 1e-4; target critic update ratio (tau) 0.05; target
+    entropy -dim(A^N) = -N*act_dim; batch 256; UTD 1; distributional
+    transformer critic (see critic.py). The entropy term inside targets
+    keeps Eq. 7's gamma^i discounting.
 """
 import numpy as np
 import torch
@@ -70,8 +72,8 @@ class SEARAgent:
         (real replay, env reward) and an explorer (imagined transitions,
         disagreement reward). Identical code, different diet. """
 
-    def __init__(self, obs_dim, act_dim, chunk_len, gamma=0.99, tau=0.005,
-                 lr=3e-4, device='cpu', critic_kw=None):
+    def __init__(self, obs_dim, act_dim, chunk_len, gamma=0.99, tau=0.05,
+                 lr=3e-4, alpha_min=1e-3, device='cpu', critic_kw=None):
         self.chunk_len, self.act_dim, self.gamma = chunk_len, act_dim, gamma
         self.tau, self.device = tau, device
         self.policy = ChunkGaussianPolicy(obs_dim, act_dim, chunk_len
@@ -79,14 +81,22 @@ class SEARAgent:
         self.critic = TwinCritic(obs_dim, act_dim, chunk_len,
                                  **(critic_kw or {})).to(device)
         self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
-        self.p_opt = torch.optim.Adam(self.policy.parameters(), lr=lr)
-        self.c_opt = torch.optim.Adam(
+        self.p_opt = torch.optim.AdamW(self.policy.parameters(), lr=lr,
+                                       weight_decay=1e-4)
+        self.c_opt = torch.optim.AdamW(
             list(self.critic.q1.parameters()) +
-            list(self.critic.q2.parameters()), lr=lr)
+            list(self.critic.q2.parameters()), lr=lr, weight_decay=1e-4)
         self.a_opt = torch.optim.Adam([self.log_alpha], lr=lr)
+        # Alpha floor (ours, labeled): with target entropy -dim(A^N) the
+        # fresh policy's entropy exceeds the target by ~40 nats, so SAC
+        # correctly decays alpha toward zero until Q sharpens. The floor
+        # keeps a minimal entropy pressure alive so the policy can never
+        # freeze completely while Q is flat.
+        self.alpha_min = alpha_min
         g = gamma ** torch.arange(chunk_len, dtype=torch.float32)
         self.gammas = g.to(device)                       # (N,)
-        self.target_entropy = -float(act_dim) * float(g.sum())
+        # Appendix C: target entropy = -dim(A^N) = -(N * act_dim)
+        self.target_entropy = -float(act_dim * chunk_len)
 
     @property
     def alpha(self):
@@ -130,10 +140,14 @@ class SEARAgent:
             k = torch.arange(1, N + 1, device=self.device, dtype=torch.float32)
             targets = nstep + (self.gamma ** k) * boot * qhat     # (B, N)
 
-        q1, q2 = self.critic.online(obs, actions)                 # (B, N) x2
-        critic_loss = (valid * ((q1 - targets) ** 2 +
-                                (q2 - targets) ** 2)).sum() / \
+        l1, l2 = self.critic.online_logits(obs, actions)     # (B, N, bins)
+        tgt_dist = self.critic.q1.two_hot(targets)           # (B, N, bins)
+        ce1 = -(tgt_dist * F.log_softmax(l1, -1)).sum(-1)    # (B, N)
+        ce2 = -(tgt_dist * F.log_softmax(l2, -1)).sum(-1)
+        critic_loss = (valid * (ce1 + ce2)).sum() / \
             (2 * valid.sum().clamp(min=1.0))
+        with torch.no_grad():
+            q1 = (F.softmax(l1, -1) * self.critic.q1.bin_values).sum(-1)
         self.c_opt.zero_grad(set_to_none=True)
         critic_loss.backward()
         nn.utils.clip_grad_norm_(
@@ -151,12 +165,16 @@ class SEARAgent:
         nn.utils.clip_grad_norm_(self.policy.parameters(), 10.0)
         self.p_opt.step()
 
-        # --- temperature ---
+        # --- temperature --- (ent is the discounted log-prob sum; compare
+        # against the undiscounted paper target via the raw per-step sum)
         alpha_loss = -(self.log_alpha *
-                       (ent.detach() + self.target_entropy)).mean()
+                       (logp_pi.sum(-1).detach()
+                        + self.target_entropy)).mean()
         self.a_opt.zero_grad(set_to_none=True)
         alpha_loss.backward()
         self.a_opt.step()
+        with torch.no_grad():
+            self.log_alpha.clamp_(min=float(np.log(self.alpha_min)))
 
         self.critic.soft_update(self.tau)
         with torch.no_grad():
@@ -165,6 +183,7 @@ class SEARAgent:
                 'actor_loss': float(actor_loss.item()),
                 'alpha': float(self.alpha.item()),
                 'entropy': float((-ent / self.gammas.sum()).mean().item()),
+                'entropy_total': float((-logp_pi.sum(-1)).mean().item()),
                 'q_mean': float(q1[:, -1].mean().item()),
                 'q_max': float(q1[:, -1].max().item()),
                 'chunk_abs_mean': float(chunk_abs.item()),
