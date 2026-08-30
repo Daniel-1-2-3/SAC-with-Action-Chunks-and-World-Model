@@ -24,7 +24,7 @@ train_sear:
     ensemble_obs_slice:
     - 19
     - 37
-    imagine_horizon: 15
+    imagine_horizon: 5
     explore_every: 2
     imagine_batch: 256
     critic_vmin: -260.0
@@ -39,7 +39,7 @@ train_sear:
     reward_batch_frac: 0.15
     alpha_min: 0.001
     explore_reward_mix: 0.3
-    owm_alpha: 0.1
+    owm_alpha: 0.0
     owm_eta: 0.001
     success_reward_thresh: -1.5
     log_every: 500

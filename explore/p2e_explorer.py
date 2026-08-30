@@ -74,8 +74,15 @@ class P2EExplorer:
         for p in self.slow_env_value.parameters():
             p.requires_grad_(False)
         self.ev_opt = torch.optim.Adam(self.env_value.parameters(), lr=lr)
-        self.adv_scale = 1.0            # EMA scale for env advantages
-        self.dis_scale = 1.0            # EMA scale for disagreement
+        # scales init as None and seed from the FIRST batch's stats --
+        # initializing at 1.0 made the (noisy, untrained) advantage term
+        # 30-300x louder than real disagreement (~0.01) for the first
+        # ~500 updates, training the explorer on noise
+        self.adv_scale = None
+        self.dis_scale = None
+        self.dis_clip = None            # EMA of disagreement 97.5th pct
+        self.mix_warmup = 2000          # updates before the mix reaches full
+        self._updates = 0
 
     # ---------- policy ----------
     def _dist(self, feat):
@@ -105,6 +112,10 @@ class P2EExplorer:
             detached). Rolls H steps through the prior WITH gradients. """
         carry = {k: v.detach() for k, v in start_carry.items()}
         feats, rewards, logps, deters, zs = [], [], [], [], []
+        # anti-exploitation clip: disagreement above a running upper
+        # percentile is capped, so single off-manifold spikes cannot
+        # dominate the objective -- the explorer must earn reward broadly
+        # (standard intrinsic-reward practice, e.g. RND reward clipping)
         for _ in range(self.horizon):
             feat = wm.feat(carry)
             a, logp = self.sample(feat)
@@ -118,6 +129,11 @@ class P2EExplorer:
         feats = torch.stack(feats, 1)                    # (B, H+1, F)
         rewards = torch.stack(rewards, 1)                # (B, H)
         logps = torch.stack(logps, 1)                    # (B, H)
+        with torch.no_grad():
+            hi = float(torch.quantile(rewards, 0.975).item())
+            self.dis_clip = hi if self.dis_clip is None \
+                else 0.99 * self.dis_clip + 0.01 * hi
+        rewards = rewards.clamp(max=self.dis_clip)
 
         def lam_returns(rews, slow_v):
             # lambda-returns, backward recursion (Dreamer):
@@ -136,15 +152,22 @@ class P2EExplorer:
             slow_ev = self.slow_env_value(feats.detach()).squeeze(-1)
             env_rets = lam_returns(env_rews, slow_ev)
             env_adv = env_rets - slow_ev[:, :-1]                 # (B, H)
-            self.adv_scale = 0.99 * self.adv_scale + 0.01 * float(
-                (torch.quantile(env_adv, 0.95)
-                 - torch.quantile(env_adv, 0.05)).item())
-            self.dis_scale = 0.99 * self.dis_scale + 0.01 * float(
-                (torch.quantile(rewards, 0.95)
-                 - torch.quantile(rewards, 0.05)).item())
+            a_range = float((torch.quantile(env_adv, 0.95)
+                             - torch.quantile(env_adv, 0.05)).item())
+            d_range = float((torch.quantile(rewards, 0.95)
+                             - torch.quantile(rewards, 0.05)).item())
+            self.adv_scale = a_range if self.adv_scale is None \
+                else 0.99 * self.adv_scale + 0.01 * a_range
+            self.dis_scale = d_range if self.dis_scale is None \
+                else 0.99 * self.dis_scale + 0.01 * d_range
+        self._updates += 1
+        raw_disagreement = rewards            # kept for the diagnostic
         if self.reward_mix > 0:
+            # mix ramps in over mix_warmup updates so the env-value head
+            # has learned a baseline before its advantages steer anything
+            mix = self.reward_mix * min(1.0, self._updates / self.mix_warmup)
             rewards = rewards / max(1e-8, self.dis_scale) + \
-                self.reward_mix * env_adv / max(1e-8, self.adv_scale)
+                mix * env_adv / max(1e-8, self.adv_scale)
 
         with torch.no_grad():
             slow_v = self.slow_value(feats).squeeze(-1)  # (B, H+1)
@@ -193,7 +216,8 @@ class P2EExplorer:
                 torch.empty(feats.shape[0], self.act_dim,
                             device=feats.device)) * 2 - 1
             d_rand = ensemble.disagreement(feats[:, 0].detach(), rand_a)
-        ratio = float((rewards[:, 0].detach().mean()
+        # raw disagreement vs random -- unpolluted by the mix
+        ratio = float((raw_disagreement[:, 0].detach().mean()
                        / d_rand.mean().clamp(min=1e-12)).item())
         # rollout cache for the OWM optimistic dynamics loss (detached)
         self.last_rollout = dict(
