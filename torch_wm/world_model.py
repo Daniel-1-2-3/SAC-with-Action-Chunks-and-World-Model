@@ -71,6 +71,7 @@ class WorldModel(nn.Module):
         self.to(device)
         self.device = device
         self.opt = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=1e-4)
+        self.last_feats = self.last_embeds = self.last_actions = None
         self._train_fn = self._train_impl
         if use_compile and hasattr(torch, 'compile'):
             try:
@@ -144,6 +145,12 @@ class WorldModel(nn.Module):
         carry, _, _ = self.obs_step(carry, act, obs, first)
         return carry, self.feat(carry)
 
+    def img_step_grad(self, carry, action):
+        """ img_step WITHOUT no_grad -- used by the explorer's imagination
+            training so gradients flow through the dynamics (Dreamer-style
+            pathwise; the categorical sample is straight-through). """
+        return self.img_step(carry, action)
+
     @torch.no_grad()
     def imagine(self, carry, actions):
         """ actions: (B, T, act_dim) tensor. Rolls the prior. Returns feats
@@ -172,7 +179,12 @@ class WorldModel(nn.Module):
         reward, cont = to(batch['reward']), to(batch['cont'])
         is_first = torch.as_tensor(np.asarray(batch['is_first'], bool),
                                    device=self.device)
-        out = self._train_fn(obs, action, reward, cont, is_first)
+        out, feats, embeds = self._train_fn(obs, action, reward, cont,
+                                            is_first)
+        # cached (detached) for the latent disagreement ensemble: inputs
+        # (feat_t, action_{t+1}) -> target embed_{t+1}, P2E's training pairs
+        self.last_feats, self.last_embeds = feats, embeds
+        self.last_actions = action
         return {k: float(v.item()) for k, v in out.items()}
 
     def _train_impl(self, obs, action, reward, cont, is_first):
@@ -216,6 +228,7 @@ class WorldModel(nn.Module):
         loss.backward()
         nn.utils.clip_grad_norm_(self.parameters(), 100.0)
         self.opt.step()
-        return {'loss/state': rec.detach(), 'loss/rew': rew.detach(),
-                'loss/con': con.detach(), 'loss/dyn': dyn.detach(),
-                'loss/rep': rep.detach()}
+        return ({'loss/state': rec.detach(), 'loss/rew': rew.detach(),
+                 'loss/con': con.detach(), 'loss/dyn': dyn.detach(),
+                 'loss/rep': rep.detach()},
+                feats.detach(), embeds.detach())

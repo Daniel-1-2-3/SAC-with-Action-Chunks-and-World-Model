@@ -456,11 +456,10 @@ train_sear:
     ensemble_k: 5
     # cube-double object dims; [19, 28] single, [19, 46] triple; null = full
     ensemble_obs_slice: [19, 37]
-    imagine_every: 50
-    imagine_batch: 16
-    imagine_horizon_chunks: 4
-    imagined_capacity: 400
-    explorer_updates: 4
+    # P2E explorer (Dreamer-style imagination training)
+    imagine_horizon: 15
+    explore_every: 2
+    imagine_batch: 256
     # SEAR random replanning probability during collection (paper gives the
     # mechanism; the value is our assumption -- expected chunk length ~N)
     replan_prob: 0.05

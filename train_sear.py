@@ -1,223 +1,142 @@
-""" SEAR + Plan2Explore trainer: from scratch, single budget.
+""" Plan2Explore's exploration agent, faithful to the paper:
 
-    Two SEAR learners share one architecture:
-      task agent   -- trained on real replay with environment reward;
-                      it is the ONLY policy evaluated.
-      explorer     -- trained on imagined rollouts labeled with ensemble
-                      disagreement (Plan2Explore, off-policy adaptation);
-                      its job is to collect informative real data.
+      "We learn the exploration policy using Dreamer: the exploration
+       policy is optimized purely from trajectories imagined under the
+       model to maximize the intrinsic rewards computed by the model
+       itself."  (P2E Sec. 3.1)
 
-    Collection alternates whole episodes between the two policies. Before
-    the first online partial success the mix is explorer-heavy; after the
-    trigger it shifts task-heavy (the project's event-trigger pattern,
-    promoted from patch to scheduler). Both policies collect with SEAR's
-    random replanning. Eval runs the task policy with a receding horizon.
+    Actor and value operate on LATENT model states. Training: start states
+    are posterior latents from replay sequences; the actor rolls the prior
+    forward H steps with gradients flowing through the dynamics (pathwise,
+    straight-through categorical samples); each imagined (state, action)
+    is rewarded with ensemble disagreement; values regress lambda-returns
+    against an EMA target network; the actor ascends the lambda-return plus
+    a small entropy bonus (Dreamer's actent).
 
-    Run:
-      python train_sear.py --train_sear.env_name=cube-double-play-singletask-v0
+    Deviations, labeled: single-step actor (P2E's is single-step too --
+    the CHUNKED task learner is SEAR's side of the house; replay stores
+    per-step actions, so SEAR consumes explorer-collected data unchanged);
+    the RSSM substrate is the DreamerV3-style categorical port rather than
+    P2E's Gaussian PlaNet latents.
 """
-import os
-# Headless rendering: MuJoCo defaults to GLFW, which needs X11 and core-dumps
-# on display-less pods. EGL renders on the GPU without a display. Set before
-# anything imports mujoco. Override with MUJOCO_GL=osmesa for CPU-only pods.
-os.environ.setdefault('MUJOCO_GL', 'egl')
-import pathlib
-import sys
-import time
-from collections import deque
-
 import numpy as np
-import ogbench
 import torch
-import wandb
+import torch.nn as nn
 
-from explore.imagination import imagine_episodes
-from helpers.common import (load_config, prefixed, sample_sequences,
-                            set_seed_everywhere, temporal_coherence)
-from helpers.sear_replay import EpisodeReplay
-from sear.agent import SEARAgent
-from sear.windows import build_windows
-from torch_wm.ensemble import DisagreementEnsemble
-from torch_wm.world_model import WorldModel
-
-OBS_KEY, ACTION_KEY = 'state', 'action'
+from sear.agent import LOG_STD_MAX, LOG_STD_MIN
 
 
-def run_eval(env, agent, cfg, eef_slice):
-    returns, lens, succ, coh = [], [], [], []
-    frames = []
-    for ep_i in range(cfg.eval_episodes):
-        obs, _ = env.reset()
-        done, ep_ret, steps = False, 0.0, 0
-        chunk, pos = None, cfg.chunk_len
-        eefs = []
-        while not done and steps < cfg.eval_max_steps:
-            # receding horizon: replan every eval_receding steps
-            if pos >= cfg.eval_receding:
-                chunk = agent.act(obs, deterministic=True)
-                pos = 0
-            a = chunk[pos]
-            pos += 1
-            obs, r, term, trunc, info = env.step(a)
-            if ep_i == 0 and steps % 2 == 0:
-                try:
-                    f = env.render()
-                    if f is not None:
-                        frames.append(f)
-                except Exception:
-                    pass
-            eefs.append(obs[eef_slice[0]:eef_slice[1]])
-            ep_ret += r
-            steps += 1
-            done = term or trunc
-        returns.append(ep_ret)
-        lens.append(steps)
-        succ.append(float(info.get('success', 0.0)))
-        coh.append(temporal_coherence(np.asarray(eefs)))
-    metrics = {'mean_return': float(np.mean(returns)),
-               'success_rate': float(np.mean(succ)),
-               'mean_episode_len': float(np.mean(lens)),
-               'coherence': float(np.mean(coh))}
-    return metrics, frames
+def mlp(inp, units, layers, out):
+    seq, d = [], inp
+    for _ in range(layers):
+        seq += [nn.Linear(d, units), nn.SiLU()]
+        d = units
+    seq += [nn.Linear(d, out)]
+    return nn.Sequential(*seq)
 
 
-def train(config):
-    cfg = config.train_sear
-    set_seed_everywhere(config.seed)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    rng = np.random.default_rng(config.seed)
-    out_dir = pathlib.Path(cfg.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    wandb.init(project=cfg.wandb_project, mode=cfg.wandb_mode,
-               config=dict(config))
+class P2EExplorer:
+    def __init__(self, feat_dim, act_dim, horizon=15, gamma=0.99, lam=0.95,
+                 actent=3e-4, lr=3e-4, slow_rate=0.02, device='cpu'):
+        self.feat_dim, self.act_dim = feat_dim, act_dim
+        self.horizon, self.gamma, self.lam = horizon, gamma, lam
+        self.actent, self.device = actent, device
+        self.actor = mlp(feat_dim, 512, 3, 2 * act_dim).to(device)
+        self.value = mlp(feat_dim, 512, 3, 1).to(device)
+        self.slow_value = mlp(feat_dim, 512, 3, 1).to(device)
+        self.slow_value.load_state_dict(self.value.state_dict())
+        for p in self.slow_value.parameters():
+            p.requires_grad_(False)
+        self.slow_rate = slow_rate
+        self.a_opt = torch.optim.Adam(self.actor.parameters(), lr=lr)
+        self.v_opt = torch.optim.Adam(self.value.parameters(), lr=lr)
 
-    try:
-        env = ogbench.make_env_and_datasets(
-            cfg.env_name, env_only=True, render_mode='rgb_array')
-    except TypeError:
-        # older ogbench without env kwargs passthrough: no video, run on
-        env = ogbench.make_env_and_datasets(cfg.env_name, env_only=True)
-    obs, _ = env.reset(seed=config.seed)
-    obs_dim = int(np.prod(env.observation_space.shape))
-    act_dim = int(np.prod(env.action_space.shape))
-    N = cfg.chunk_len
+    # ---------- policy ----------
+    def _dist(self, feat):
+        out = self.actor(feat)
+        mean, log_std = out.chunk(2, -1)
+        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
+        return mean, log_std
 
-    replay = EpisodeReplay(OBS_KEY, ACTION_KEY, cfg.max_episodes)
-    wm = WorldModel(obs_dim, act_dim, device=device, lr=cfg.wm_lr,
-                    use_compile=cfg.wm_compile) if cfg.use_world_model \
-        else None
-    ensemble = DisagreementEnsemble(
-        obs_dim, act_dim, k=cfg.ensemble_k,
-        obs_slice=cfg.ensemble_obs_slice, device=device) \
-        if cfg.use_world_model else None
-    task = SEARAgent(obs_dim, act_dim, N, gamma=cfg.gamma, device=device)
-    explorer = SEARAgent(obs_dim, act_dim, N, gamma=cfg.gamma,
-                         device=device) if cfg.use_world_model else None
-    imagined = deque(maxlen=cfg.imagined_capacity)
+    def sample(self, feat, deterministic=False):
+        mean, log_std = self._dist(feat)
+        pre = mean if deterministic else \
+            mean + torch.randn_like(mean) * log_std.exp()
+        act = torch.tanh(pre)
+        logp = (-0.5 * ((pre - mean) / log_std.exp()) ** 2 - log_std
+                - 0.5 * np.log(2 * np.pi))
+        logp = (logp - torch.log(1 - act ** 2 + 1e-6)).sum(-1)
+        return act, logp
 
-    print(f'sear-p2e | task=SEAR(chunk {N}) | '
-          f'{"explorer=SEAR-on-imagined-disagreement (P2E)" if explorer else "NO explorer (SEAR-only baseline)"} | '
-          f'eval=task policy, receding horizon {cfg.eval_receding}')
+    @torch.no_grad()
+    def act(self, feat, deterministic=False):
+        a, _ = self.sample(feat, deterministic)
+        return a.cpu().numpy()
 
-    trigger_step = None
-    acting = 'explorer' if explorer else 'task'
-    chunk, pos = None, N
-    ep_steps = 0
-    metrics_acc = {}
+    # ---------- imagination training (Dreamer-style) ----------
+    def update(self, wm, ensemble, start_carry):
+        """ start_carry: dict of latent tensors for B start states (posterior,
+            detached). Rolls H steps through the prior WITH gradients. """
+        carry = {k: v.detach() for k, v in start_carry.items()}
+        feats, rewards, logps = [], [], []
+        for _ in range(self.horizon):
+            feat = wm.feat(carry)
+            a, logp = self.sample(feat)
+            rewards.append(ensemble.disagreement(feat, a))
+            feats.append(feat)
+            logps.append(logp)
+            carry = wm.img_step_grad(carry, a)
+        feats.append(wm.feat(carry))
+        feats = torch.stack(feats, 1)                    # (B, H+1, F)
+        rewards = torch.stack(rewards, 1)                # (B, H)
+        logps = torch.stack(logps, 1)                    # (B, H)
 
-    for step in range(1, cfg.num_online_steps + 1):
-        # ---------------- collection ----------------
-        replan = (pos >= N) or (rng.random() < cfg.replan_prob)
-        if replan:
-            if step <= cfg.num_seed_steps:
-                chunk = rng.uniform(-1, 1, size=(N, act_dim)).astype(
-                    np.float32)
-            else:
-                actor = explorer if (acting == 'explorer' and explorer) \
-                    else task
-                chunk = actor.act(obs, deterministic=False)
-            pos = 0
-        a = chunk[pos]
-        pos += 1
-        next_obs, r, term, trunc, _ = env.step(a)
-        ep_steps += 1
-        if ep_steps >= cfg.max_episode_steps:
-            trunc = True
-        replay.add_step(obs, a, r, next_obs, term, trunc)
-        obs = next_obs
-        if term or trunc:
-            obs, _ = env.reset()
-            ep_steps, pos = 0, N
-            # scheduler: pick next episode's policy
-            if explorer:
-                frac = cfg.explore_frac_pre if trigger_step is None \
-                    else cfg.explore_frac_post
-                acting = 'explorer' if rng.random() < frac else 'task'
+        with torch.no_grad():
+            slow_v = self.slow_value(feats).squeeze(-1)  # (B, H+1)
+        # lambda-returns, backward recursion (Dreamer):
+        # R_t = r_t + gamma * ((1 - lam) * v_{t+1} + lam * R_{t+1})
+        returns = [slow_v[:, -1]]
+        for t in reversed(range(self.horizon)):
+            returns.append(rewards[:, t] + self.gamma * (
+                (1 - self.lam) * slow_v[:, t + 1]
+                + self.lam * returns[-1]))
+        returns = torch.stack(returns[::-1][:-1], 1)     # (B, H)
 
-        # event trigger: first online partial success
-        if trigger_step is None and \
-                replay.best_online_reward > cfg.success_reward_thresh:
-            trigger_step = step
-            print(f'trigger at step {step} '
-                  f'(best online reward {replay.best_online_reward:.2f})')
+        # actor: ascend the return through the dynamics + entropy bonus
+        actor_loss = (-returns + self.actent * logps).mean()
+        self.a_opt.zero_grad(set_to_none=True)
+        actor_loss.backward()
+        nn.utils.clip_grad_norm_(self.actor.parameters(), 100.0)
+        self.a_opt.step()
 
-        # ---------------- updates ----------------
-        if step > cfg.start_training and replay.ready(cfg.seq_len):
-            seqs = replay.sample_seqs(cfg.wm_batch, cfg.seq_len, rng)
-            win = build_windows(seqs, N, OBS_KEY, ACTION_KEY,
-                                take=cfg.batch_size, rng=rng, device=device)
-            if win is not None:
-                metrics_acc.update(prefixed(task.update(win), 'task'))
-            if wm is not None and step % cfg.wm_every == 0:
-                metrics_acc.update(wm.train_batch(seqs))
-                o, a_, no = replay.sample_pairs(cfg.batch_size, rng)
-                metrics_acc.update(prefixed(
-                    ensemble.train_batch(o, a_, no), 'wm'))
-            if explorer is not None and step % cfg.imagine_every == 0:
-                starts = replay.sample_start_obs(cfg.imagine_batch, rng)
-                imagined.extend(imagine_episodes(
-                    wm, explorer, ensemble, starts,
-                    cfg.imagine_horizon_chunks, OBS_KEY, ACTION_KEY))
-                for _ in range(cfg.explorer_updates):
-                    iseqs = sample_sequences(
-                        list(imagined), cfg.batch_size // 4,
-                        min(cfg.seq_len,
-                            cfg.imagine_horizon_chunks * N + 1),
-                        OBS_KEY, ACTION_KEY, rng)
-                    iwin = build_windows(iseqs, N, OBS_KEY, ACTION_KEY,
-                                         take=cfg.batch_size, rng=rng,
-                                         device=device)
-                    if iwin is not None:
-                        metrics_acc.update(prefixed(
-                            explorer.update(iwin), 'explorer'))
+        # value: regress lambda-returns on detached features
+        v = self.value(feats[:, :-1].detach()).squeeze(-1)
+        value_loss = ((v - returns.detach()) ** 2).mean()
+        self.v_opt.zero_grad(set_to_none=True)
+        value_loss.backward()
+        nn.utils.clip_grad_norm_(self.value.parameters(), 100.0)
+        self.v_opt.step()
+        with torch.no_grad():
+            for p, sp in zip(self.value.parameters(),
+                             self.slow_value.parameters()):
+                sp.mul_(1 - self.slow_rate).add_(self.slow_rate * p)
+        return {'actor_loss': float(actor_loss.item()),
+                'value_loss': float(value_loss.item()),
+                'imag_reward_mean': float(rewards.mean().item()),
+                'imag_reward_max': float(rewards.max().item()),
+                'imag_value_mean': float(returns.mean().item()),
+                'imag_action_abs': float(
+                    logps.new_tensor(0.0).item()) if False else float(
+                    torch.tanh(self._dist(feats[:, 0].detach())[0]
+                               ).abs().mean().item())}
 
-        # ---------------- logging / eval / ckpt ----------------
-        if step % cfg.log_every == 0:
-            stats = replay.success_stats(cfg.success_reward_thresh)
-            metrics_acc.update(prefixed(stats, 'replay'))
-            metrics_acc['diagnosis/trigger_fired'] = float(
-                trigger_step is not None)
-            wandb.log(metrics_acc, step=step)
-            metrics_acc = {}
-        if step % cfg.eval_every == 0:
-            em, frames = run_eval(env, task, cfg, cfg.eef_slice)
-            log = prefixed(em, 'eval')
-            if frames:
-                arr = np.stack(frames).transpose(0, 3, 1, 2)
-                log['eval/video'] = wandb.Video(arr, fps=15, format='mp4')
-            wandb.log(log, step=step)
-            obs, _ = env.reset()
-            ep_steps, pos = 0, N
-            replay.end_episode()
-        if step % cfg.save_every == 0:
-            torch.save({'task': task.state_dict(),
-                        'explorer': explorer.state_dict() if explorer
-                        else None,
-                        'wm': wm.state_dict() if wm else None,
-                        'step': step},
-                       out_dir / 'sear_latest.pt')
-    wandb.finish()
+    # ---------- persistence ----------
+    def state_dict(self):
+        return {'actor': self.actor.state_dict(),
+                'value': self.value.state_dict(),
+                'slow_value': self.slow_value.state_dict()}
 
-
-if __name__ == '__main__':
-    train(load_config('train_sear', argv=sys.argv[1:]))
+    def load_state_dict(self, sd):
+        self.actor.load_state_dict(sd['actor'])
+        self.value.load_state_dict(sd['value'])
+        self.slow_value.load_state_dict(sd['slow_value'])
