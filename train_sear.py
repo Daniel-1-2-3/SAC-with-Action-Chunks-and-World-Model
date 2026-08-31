@@ -43,6 +43,7 @@ from explore.p2e_explorer import P2EExplorer
 from helpers.common import (load_config, prefixed, set_seed_everywhere,
                             temporal_coherence)
 from helpers.curriculum import Curriculum
+from helpers.her import GoalTools
 from helpers.sear_replay import EpisodeReplay
 from sear.agent import SEARAgent
 from sear.windows import build_windows
@@ -52,7 +53,7 @@ from torch_wm.world_model import WorldModel
 OBS_KEY, ACTION_KEY = 'state', 'action'
 
 
-def run_eval(env, agent, cfg, eef_slice):
+def run_eval(env, agent, cfg, eef_slice, gc=lambda o: o):
     returns, lens, succ, coh = [], [], [], []
     frames = []
     for ep_i in range(cfg.eval_episodes):
@@ -62,7 +63,7 @@ def run_eval(env, agent, cfg, eef_slice):
         eefs = []
         while not done and steps < cfg.eval_max_steps:
             if pos >= cfg.eval_receding:
-                chunk = agent.act(obs, deterministic=True)
+                chunk = agent.act(gc(obs), deterministic=True)
                 pos = 0
             a = chunk[pos]
             pos += 1
@@ -117,6 +118,13 @@ def train(config):
     obs_dim = int(np.prod(env.observation_space.shape))
     act_dim = int(np.prod(env.action_space.shape))
     N = cfg.chunk_len
+    goal_tools = GoalTools(env, thresh=cfg.her_thresh) if cfg.use_her \
+        else None
+    goal_dim = goal_tools.goal_dim if goal_tools else 0
+    task_goal = goal_tools.task_goal() if goal_tools else None
+    replay = None  # forward decl for set_goal below
+    gc = (lambda o: np.concatenate([o, task_goal]).astype(np.float32)) \
+        if goal_tools else (lambda o: o)
 
     curriculum = Curriculum(
         env, spawn_frac=cfg.spawn_frac, pool_frac=cfg.reset_pool_frac,
@@ -124,8 +132,9 @@ def train(config):
         reward_thresh=cfg.success_reward_thresh, rng=rng)
 
     replay = EpisodeReplay(OBS_KEY, ACTION_KEY, cfg.max_episodes)
-    task = SEARAgent(obs_dim, act_dim, N, gamma=cfg.gamma, device=device,
-                     alpha_min=cfg.alpha_min,
+    replay.set_goal(task_goal)
+    task = SEARAgent(obs_dim + goal_dim, act_dim, N, gamma=cfg.gamma,
+                     device=device, alpha_min=cfg.alpha_min,
                      critic_kw=dict(vmin=cfg.critic_vmin,
                                     vmax=cfg.critic_vmax))
     wm = ensemble = explorer = None
@@ -179,23 +188,29 @@ def train(config):
             # prefix of each chunk' -- draw a fresh chunk, run a uniform
             # random prefix length of it, replan.
             if pos >= prefix_len:
-                chunk = task.act(obs, deterministic=False)
+                chunk = task.act(gc(obs), deterministic=False)
                 prefix_len = int(rng.integers(1, N + 1))
                 pos = 0
             a = chunk[pos]
             pos += 1
+        ach = goal_tools.achieved() if goal_tools else None
         next_obs, r, term, trunc, _ = env.step(a)
+        next_ach = goal_tools.achieved() if goal_tools else None
         ep_steps += 1
         ep_start = False
         prev_a = a
         if ep_steps >= cfg.max_episode_steps:
             trunc = True
         curriculum.maybe_pool(r)
-        replay.add_step(obs, a, r, next_obs, term, trunc)
+        replay.add_step(obs, a, r, next_obs, term, trunc,
+                        achieved=ach, next_achieved=next_ach)
         obs = next_obs
         if term or trunc:
             obs, _ = env.reset()
             obs = curriculum.on_reset(obs)
+            if goal_tools is not None:
+                task_goal = goal_tools.task_goal()
+                replay.set_goal(task_goal)
             reset_episode_state()
             if explorer:
                 acting = 'explorer' if rng.random() < cfg.explore_frac \
@@ -214,8 +229,11 @@ def train(config):
                 cfg.wm_batch, cfg.seq_len, rng,
                 reward_frac=cfg.reward_batch_frac,
                 reward_thresh=cfg.success_reward_thresh)
+            her = (dict(goal_tools=goal_tools, task_goal=task_goal,
+                        frac=cfg.her_frac) if goal_tools else None)
             win = build_windows(seqs, N, OBS_KEY, ACTION_KEY,
-                                take=cfg.batch_size, rng=rng, device=device)
+                                take=cfg.batch_size, rng=rng, device=device,
+                                her=her)
             if win is not None:
                 metrics_acc.update(prefixed(task.update(win), 'task'))
             if wm is not None and step % cfg.wm_every == 0:
@@ -246,7 +264,7 @@ def train(config):
             wandb.log(metrics_acc, step=step)
             metrics_acc = {}
         if step % cfg.eval_every == 0:
-            em, frames = run_eval(env, task, cfg, cfg.eef_slice)
+            em, frames = run_eval(env, task, cfg, cfg.eef_slice, gc)
             log = prefixed(em, 'eval')
             if frames:
                 arr = np.stack(frames).transpose(0, 3, 1, 2)
@@ -254,6 +272,8 @@ def train(config):
             wandb.log(log, step=step)
             obs, _ = env.reset()
             obs = curriculum.on_reset(obs)   # training episode resumes
+            gt.calibrate(obs)
+            replay.set_goal(gt.task_goal())
             reset_episode_state()
             replay.end_episode()
         if step % cfg.save_every == 0:

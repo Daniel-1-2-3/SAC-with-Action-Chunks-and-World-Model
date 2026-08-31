@@ -2,7 +2,16 @@
     the simulator's own state -- no demonstrations, no external data, no
     task knowledge:
 
-    1. SPAWN RANDOMIZATION. At reset, cube free-joint positions are
+    1. TARGETED SPAWN (preferred when the env exposes goal positions as
+       mocap bodies, which OGBench's target-cube rendering uses): ONE
+       randomly chosen cube is placed at its own goal position and the
+       rest are scattered. That starts the episode with a cube already
+       placed -- a guaranteed better-than-floor reward -- without any
+       hardcoded coordinates or demonstration data: the goal position is
+       read from the simulator the same way the renderer reads it. Only
+       one cube is placed so the episode is not instantly terminal.
+
+    1b. SPAWN RANDOMIZATION (fallback when no goal handles exist). At reset, cube free-joint positions are
        resampled uniformly inside the box spanned by positions the env
        itself produces at natural resets (learned online, nothing
        hardcoded). Goal zones occupy part of that box, so a fraction of
@@ -70,8 +79,10 @@ class Curriculum:
         self.free_adr = []          # qpos start index of each free joint
         self._lo = self._hi = None  # observed xy box per free joint
         self._resets_seen = 0
-        self.warmup_resets = 20     # natural resets used to bound the box
-        self.stats = {'pool_size': 0, 'spawned': 0, 'restored': 0}
+        self.warmup_resets = 5     # natural resets used to bound the box
+        self.n_mocap = 0            # goal handles, if the env exposes them
+        self.stats = {'pool_size': 0, 'spawned': 0, 'restored': 0,
+                      'targeted': 0}
 
         handles = _mj(env)
         if handles is None:
@@ -97,10 +108,16 @@ class Curriculum:
                 print('curriculum: no free joints found -- DISABLED')
             return
         self.enabled = True
+        try:
+            self.n_mocap = int(model.nmocap)
+        except Exception:
+            self.n_mocap = 0
+        self.targeted = self.n_mocap >= len(self.free_adr) > 0
         if verbose:
             print(f'curriculum: {len(self.free_adr)} free joints '
-                  f'(objects) found | spawn_frac={spawn_frac} '
-                  f'pool_frac={pool_frac}')
+                  f'(objects), {self.n_mocap} goal handles | '
+                  f'mode={"TARGETED (cube placed at its goal)" if self.targeted else "random spawn box"} | '
+                  f'spawn_frac={spawn_frac} pool_frac={pool_frac}')
 
     # ---------- state snapshot / restore ----------
     def snapshot(self):
@@ -175,9 +192,19 @@ class Curriculum:
             lo = self._lo[i] - 0.05 * span[i]
             hi = self._hi[i] + 0.05 * span[i]
             qpos[a:a + 2] = self.rng.uniform(lo, hi)
+        if self.targeted:
+            # place ONE cube exactly at its goal (read from the sim's own
+            # mocap targets); the others stay scattered, so the episode
+            # starts with a partial reward and is not instantly terminal
+            k = int(self.rng.integers(0, len(self.free_adr)))
+            a = self.free_adr[k]
+            tgt = np.asarray(data.mocap_pos[k], dtype=np.float64)
+            qpos[a:a + 3] = tgt
+            self.stats['targeted'] += 1
         return self._apply(qpos, qvel)
 
     def metrics(self):
         return {'pool_size': len(self.pool),
                 'episodes_spawned': self.stats['spawned'],
+                'episodes_targeted': self.stats['targeted'],
                 'episodes_restored': self.stats['restored']}

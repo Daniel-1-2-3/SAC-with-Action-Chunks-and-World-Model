@@ -80,7 +80,13 @@ class SEARAgent:
                                           ).to(device)
         self.critic = TwinCritic(obs_dim, act_dim, chunk_len,
                                  **(critic_kw or {})).to(device)
-        self.log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        # alpha init 0.1 (ours, labeled): at alpha=1 the MaxEnt entropy
+        # bonus inflates early targets by ~+10-15, which the distributional
+        # clamp welds to vmax on sparse tasks (Q saturates and never
+        # recovers ranking). 0.1 keeps the transient inside the value
+        # range; alpha still adapts from there.
+        self.log_alpha = torch.tensor([float(np.log(0.1))],
+                                      requires_grad=True, device=device)
         self.p_opt = torch.optim.AdamW(self.policy.parameters(), lr=lr,
                                        weight_decay=1e-4)
         self.c_opt = torch.optim.AdamW(

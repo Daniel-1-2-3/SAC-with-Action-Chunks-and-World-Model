@@ -28,7 +28,8 @@ train_sear:
     explore_every: 2
     imagine_batch: 256
     critic_vmin: -260.0
-    critic_vmax: 10.0
+    # headroom above 0 for the soft value (reward + alpha*entropy)
+    critic_vmax: 60.0
     eval_receding: 5
     eval_episodes: 20
     eval_max_steps: 500
@@ -52,6 +53,13 @@ train_sear:
     # a better-than-floor reward was earned (Go-Explore style)
     reset_pool_frac: 0.25
     reset_pool_size: 2000
+    # --- Hindsight Experience Replay (Andrychowicz et al. 2017) ---
+    use_her: True
+    # fraction of training windows relabeled with a 'future' achieved goal
+    # (paper's best strategy; 0.8 ~= their k=4 ratio)
+    her_frac: 0.8
+    # goal-success distance in meters (measured against this env)
+    her_thresh: 0.04
     explore_reward_mix: 0.3
     owm_alpha: 0.0
     owm_eta: 0.001

@@ -67,13 +67,14 @@ def ogbench_to_dreamer_episode(obs_list, act_list, rew_list, term_list,
 
 
 def sample_sequences(episodes, batch_size, seq_len, obs_key='state',
-                     action_key='action', rng=None):
+                     action_key='action', rng=None, extra_keys=()):
     """ Uniform sequence sampling from a list of dreamer-format episodes.
         Returns dict of (B, T, ...) arrays. Episodes shorter than seq_len
         are skipped by the caller (filter before calling). """
     if rng is None:
         rng = np.random.default_rng()
-    keys = [obs_key, action_key, 'reward', 'is_first', 'is_terminal', 'cont']
+    keys = [obs_key, action_key, 'reward', 'is_first', 'is_terminal',
+            'cont'] + list(extra_keys)
     batch = {k: [] for k in keys}
     for _ in range(batch_size):
         ep = episodes[rng.integers(0, len(episodes))]

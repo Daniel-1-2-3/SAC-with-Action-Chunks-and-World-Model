@@ -14,16 +14,23 @@ class EpisodeReplay:
         self.max_episodes = max_episodes
         self.episodes = []
         self._obs, self._act, self._rew, self._term = [], [], [], []
+        self._ach = []
+        self._goal = None
         self.best_online_reward = -np.inf
         self.total_steps = 0
 
-    def add_step(self, obs, action, reward, next_obs, terminated, truncated):
+    def add_step(self, obs, action, reward, next_obs, terminated, truncated,
+                 achieved=None, next_achieved=None):
         if not self._obs:
             self._obs.append(np.asarray(obs, np.float32))
+            if achieved is not None:
+                self._ach.append(np.asarray(achieved, np.float32))
         self._act.append(np.asarray(action, np.float32))
         self._rew.append(float(reward))
         self._term.append(bool(terminated))
         self._obs.append(np.asarray(next_obs, np.float32))
+        if next_achieved is not None:
+            self._ach.append(np.asarray(next_achieved, np.float32))
         self.total_steps += 1
         if terminated or truncated:
             self.end_episode()
@@ -32,6 +39,12 @@ class EpisodeReplay:
         if not self._act:
             return
         ep = self._build(self._obs, self._act, self._rew, self._term)
+        if self._ach:
+            ep['achieved'] = np.asarray(self._ach, np.float32)
+        if self._goal is not None:
+            ep['goal'] = np.tile(self._goal,
+                                 (len(ep[self.obs_key]), 1)).astype(
+                np.float32)
         self.episodes.append(ep)
         if len(self.episodes) > self.max_episodes:
             self.episodes.pop(0)
@@ -40,6 +53,7 @@ class EpisodeReplay:
             self.best_online_reward = max(self.best_online_reward,
                                           float(r.max()))
         self._obs, self._act, self._rew, self._term = [], [], [], []
+        self._ach = []
 
     def _build(self, obs, act, rew, term):
         T = len(obs)                                     # steps + 1
@@ -61,6 +75,11 @@ class EpisodeReplay:
         ep['cont'] = (~ep['is_terminal']).astype(np.float32)
         return ep
 
+    def set_goal(self, goal):
+        """ Record the active task goal; stored with the episode so its
+            windows are labeled with THEIR goal, not a later one. """
+        self._goal = None if goal is None else np.asarray(goal, np.float32)
+
     # ---------- sampling ----------
     def ready(self, seq_len):
         return any(len(e[self.obs_key]) >= seq_len for e in self.episodes)
@@ -73,6 +92,8 @@ class EpisodeReplay:
             importance correction (labeled): the fraction is kept small so
             the bias stays modest. """
         eps = [e for e in self.episodes if len(e[self.obs_key]) >= seq_len]
+        extra = [k for k in ('achieved', 'goal')
+                 if eps and k in eps[0]]
         n_r = int(round(batch * reward_frac))
         out = None
         if n_r > 0:
@@ -81,7 +102,7 @@ class EpisodeReplay:
                     and e['reward'][1:].max() > reward_thresh]
             if rich:
                 keys = [self.obs_key, self.action_key, 'reward', 'is_first',
-                        'is_terminal', 'cont']
+                        'is_terminal', 'cont'] + extra
                 out = {k: [] for k in keys}
                 for _ in range(n_r):
                     ep = rich[rng.integers(0, len(rich))]
@@ -96,7 +117,7 @@ class EpisodeReplay:
             else:
                 n_r = 0
         uni = sample_sequences(eps, batch - n_r, seq_len, self.obs_key,
-                               self.action_key, rng)
+                               self.action_key, rng, extra_keys=extra)
         if out is None:
             return uni
         return {k: np.concatenate([np.stack(out[k]), uni[k]])

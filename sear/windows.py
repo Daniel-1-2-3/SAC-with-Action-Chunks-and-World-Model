@@ -21,7 +21,16 @@ from numpy.lib.stride_tricks import sliding_window_view as swv
 
 
 def build_windows(seqs, chunk_len, obs_key='state', action_key='action',
-                  take=None, rng=None, device='cpu'):
+                  take=None, rng=None, device='cpu', her=None):
+    """ her: optional dict(goal_tools=..., task_goal=(G,), frac=float).
+        When given, sequences must carry 'achieved' (B, T, G); each window
+        gets a goal (HER 'future' relabeling with prob frac, else the task
+        goal), rewards are recomputed for relabeled windows, and obs /
+        next_obs are returned with the goal CONCATENATED, so the agent is
+        an ordinary SEAR learner over the extended observation.
+
+        Original docstring below.
+    """
     """ seqs: dict of (B, T, ...) numpy from helpers.common.sample_sequences.
         Returns dict of torch tensors, M = number of windows kept. """
     if rng is None:
@@ -42,10 +51,18 @@ def build_windows(seqs, chunk_len, obs_key='state', action_key='action',
     bad = swv(is_first, N + 1, axis=1)[:, :W, 1:].any(-1)     # (B, W)
     keep = ~bad
     o = obs[:, :W][keep]                                       # (M, D)
+    goals = her_rewards = None
+    if her is not None:
+        from helpers.her import relabel_windows
+        goals, her_rewards = relabel_windows(
+            seqs, N, her['goal_tools'], her['task_goal'], her['frac'],
+            rng, obs_key)
+        goals = goals[keep]                                    # (M, G)
     # windows over the shifted-by-one tail arrays: index t+1..t+N
     a_w = swv(act[:, 1:], N, axis=1)                           # (B, W', N?, A)
     a_w = np.moveaxis(a_w, -1, 2)[:, :W][keep]                 # (M, N, A)
-    r_w = swv(rew[:, 1:], N, axis=1)[:, :W][keep]              # (M, N)
+    r_w = (her_rewards[keep] if her_rewards is not None
+           else swv(rew[:, 1:], N, axis=1)[:, :W][keep])       # (M, N)
     no_w = swv(obs[:, 1:], N, axis=1)                          # (B, W', D?, N)
     no_w = np.moveaxis(no_w, -1, 2)[:, :W][keep]               # (M, N, D)
     b_w = swv(cont[:, 1:], N, axis=1)[:, :W][keep]             # (M, N)
@@ -55,7 +72,13 @@ def build_windows(seqs, chunk_len, obs_key='state', action_key='action',
     if take is not None and M > take:
         idx = rng.choice(M, size=take, replace=False)
         o, a_w, r_w, no_w, b_w = (x[idx] for x in (o, a_w, r_w, no_w, b_w))
+        if goals is not None:
+            goals = goals[idx]
         M = take
+    if goals is not None:
+        o = np.concatenate([o, goals], -1)
+        no_w = np.concatenate(
+            [no_w, np.repeat(goals[:, None, :], N, axis=1)], -1)
     to = lambda x: torch.as_tensor(np.ascontiguousarray(x, dtype=np.float32),
                                    device=device)
     return {'obs': to(o), 'actions': to(a_w), 'rewards': to(r_w),
