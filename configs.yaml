@@ -35,8 +35,13 @@ train_sear:
     eef_slice:
     - 12
     - 15
-    explore_frac: 1.0
-    reward_batch_frac: 0.15
+    # 0 = SEAR collects everything and no explorer is built; the world
+    # model + reward head train passively on SEAR's data for eval-time
+    # planning (plan_eval.py). >0 re-enables the P2E explorer.
+    explore_frac: 0.0
+    # RLPD-style symmetric sampling: half of each training batch from
+    # reward-bearing episodes
+    reward_batch_frac: 0.5
     alpha_min: 0.001
     explore_reward_mix: 0.3
     owm_alpha: 0.0

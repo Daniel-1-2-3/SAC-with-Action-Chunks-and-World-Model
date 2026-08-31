@@ -129,13 +129,18 @@ def train(config):
         ensemble = LatentDisagreementEnsemble(
             wm.feat_dim, act_dim, wm.embed_dim, k=cfg.ensemble_k,
             device=device)
-        explorer = P2EExplorer(wm.feat_dim, act_dim,
-                               horizon=cfg.imagine_horizon, gamma=cfg.gamma,
-                               reward_mix=cfg.explore_reward_mix,
-                               device=device)
+        if cfg.explore_frac > 0:
+            explorer = P2EExplorer(wm.feat_dim, act_dim,
+                                   horizon=cfg.imagine_horizon,
+                                   gamma=cfg.gamma,
+                                   reward_mix=cfg.explore_reward_mix,
+                                   device=device)
 
-    print(f'sear-p2e | task=SEAR(chunk {N}) | '
-          f'{"explorer=P2E (latent disagreement, imagination-trained)" if explorer else "NO explorer (SEAR-only baseline)"} | '
+    mode = ('explorer=P2E (latent disagreement, imagination-trained)'
+            if explorer else
+            ('passive WM (SEAR collects; model trains for eval planning)'
+             if wm is not None else 'NO world model (SEAR-only baseline)'))
+    print(f'sear-p2e | task=SEAR(chunk {N}) | {mode} | '
           f'eval=task policy, receding horizon {cfg.eval_receding}')
 
     trigger_step = None
