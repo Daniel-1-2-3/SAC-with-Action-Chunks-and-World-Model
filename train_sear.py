@@ -121,6 +121,8 @@ def train(config):
     goal_tools = GoalTools(env, thresh=cfg.her_thresh) if cfg.use_her \
         else None
     goal_dim = goal_tools.goal_dim if goal_tools else 0
+    if goal_tools is not None:
+        goal_tools.calibrate(obs)      # solve obs-space center first
     task_goal = goal_tools.task_goal() if goal_tools else None
     replay = None  # forward decl for set_goal below
     gc = (lambda o: np.concatenate([o, task_goal]).astype(np.float32)) \
@@ -209,6 +211,7 @@ def train(config):
             obs, _ = env.reset()
             obs = curriculum.on_reset(obs)
             if goal_tools is not None:
+                goal_tools.calibrate(obs)
                 task_goal = goal_tools.task_goal()
                 replay.set_goal(task_goal)
             reset_episode_state()
@@ -272,8 +275,10 @@ def train(config):
             wandb.log(log, step=step)
             obs, _ = env.reset()
             obs = curriculum.on_reset(obs)   # training episode resumes
-            gt.calibrate(obs)
-            replay.set_goal(gt.task_goal())
+            if goal_tools is not None:
+                goal_tools.calibrate(obs)
+                task_goal = goal_tools.task_goal()
+                replay.set_goal(task_goal)
             reset_episode_state()
             replay.end_episode()
         if step % cfg.save_every == 0:
