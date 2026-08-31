@@ -42,6 +42,7 @@ import wandb
 from explore.p2e_explorer import P2EExplorer
 from helpers.common import (load_config, prefixed, set_seed_everywhere,
                             temporal_coherence)
+from helpers.curriculum import Curriculum
 from helpers.sear_replay import EpisodeReplay
 from sear.agent import SEARAgent
 from sear.windows import build_windows
@@ -117,6 +118,11 @@ def train(config):
     act_dim = int(np.prod(env.action_space.shape))
     N = cfg.chunk_len
 
+    curriculum = Curriculum(
+        env, spawn_frac=cfg.spawn_frac, pool_frac=cfg.reset_pool_frac,
+        pool_size=cfg.reset_pool_size,
+        reward_thresh=cfg.success_reward_thresh, rng=rng)
+
     replay = EpisodeReplay(OBS_KEY, ACTION_KEY, cfg.max_episodes)
     task = SEARAgent(obs_dim, act_dim, N, gamma=cfg.gamma, device=device,
                      alpha_min=cfg.alpha_min,
@@ -184,10 +190,12 @@ def train(config):
         prev_a = a
         if ep_steps >= cfg.max_episode_steps:
             trunc = True
+        curriculum.maybe_pool(r)
         replay.add_step(obs, a, r, next_obs, term, trunc)
         obs = next_obs
         if term or trunc:
             obs, _ = env.reset()
+            obs = curriculum.on_reset(obs)
             reset_episode_state()
             if explorer:
                 acting = 'explorer' if rng.random() < cfg.explore_frac \
@@ -234,6 +242,7 @@ def train(config):
             metrics_acc.update(prefixed(stats, 'replay'))
             metrics_acc['diagnosis/first_partial_seen'] = float(
                 trigger_step is not None)
+            metrics_acc.update(prefixed(curriculum.metrics(), 'curriculum'))
             wandb.log(metrics_acc, step=step)
             metrics_acc = {}
         if step % cfg.eval_every == 0:
@@ -244,6 +253,7 @@ def train(config):
                 log['eval/video'] = wandb.Video(arr, fps=15, format='mp4')
             wandb.log(log, step=step)
             obs, _ = env.reset()
+            obs = curriculum.on_reset(obs)   # training episode resumes
             reset_episode_state()
             replay.end_episode()
         if step % cfg.save_every == 0:

@@ -43,6 +43,15 @@ train_sear:
     # reward-bearing episodes
     reward_batch_frac: 0.5
     alpha_min: 0.001
+    # --- training-time initial-state curriculum (eval is never affected) ---
+    # fraction of TRAINING episodes that start with object positions
+    # resampled inside the env's own observed spawn box; some land in goal
+    # zones, manufacturing reward-bearing starts with no task knowledge
+    spawn_frac: 0.3
+    # fraction that restart from a pooled simulator state snapshotted when
+    # a better-than-floor reward was earned (Go-Explore style)
+    reset_pool_frac: 0.25
+    reset_pool_size: 2000
     explore_reward_mix: 0.3
     owm_alpha: 0.0
     owm_eta: 0.001
