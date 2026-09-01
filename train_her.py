@@ -57,6 +57,31 @@ class GoalTools:
                     if int(model.jnt_type[j]) == free]
         self.n = len(self.adr)
         self.goal_dim = 3 * self.n
+        # DIAGNOSTIC ONLY. The effector is never part of the goal, the
+        # reward, or the policy input -- putting it in the goal was the
+        # bug that broke the earlier SEAR run. It is read here purely to
+        # log how close the gripper gets to the cube.
+        self.eef_id = None
+        for i in range(model.nsite):
+            nm = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_SITE, i)
+            if nm and any(k in nm.lower() for k in
+                          ('effector', 'pinch', 'grip', 'hand')) \
+                    and 'target' not in nm.lower():
+                self.eef_id = i
+                print(f'HER: effector site "{nm}" (diagnostic only)')
+                break
+        if self.eef_id is None:
+            print('HER: no effector site found; '
+                  'gripper-distance metrics disabled')
+
+    def grip_cube_dist(self):
+        """ Distance from the gripper to the nearest cube, metres.
+            Returns None if no effector site was found. """
+        if self.eef_id is None:
+            return None
+        eef = np.asarray(self._data.site_xpos[self.eef_id], np.float32)
+        cubes = self.achieved().reshape(self.n, 3)
+        return float(np.min(np.linalg.norm(cubes - eef, axis=-1)))
 
     def achieved(self):
         return np.concatenate(
@@ -202,6 +227,7 @@ def train(args):
                 ep = {'obs': [obs], 'ach': [gt.achieved()], 'act': [],
                       'goal': goal}
                 prefix_left, held_act, held_noise = 0, None, None
+                ep_grip_min = np.inf
                 for _ in range(args.max_episode_steps):
                     if args.explore_chunk_len > 1 and prefix_left <= 0:
                         # SEAR collection (Sec 4.4): commit to a random
@@ -239,6 +265,9 @@ def train(args):
                                       act_low, act_high).astype(np.float32)
                     prefix_left -= 1
                     obs, _, term, trunc, _ = env.step(act)
+                    gd = gt.grip_cube_dist()
+                    if gd is not None:
+                        ep_grip_min = min(ep_grip_min, gd)
                     ep['obs'].append(obs)
                     ep['ach'].append(gt.achieved())
                     ep['act'].append(act)
@@ -247,12 +276,15 @@ def train(args):
                         break
                 for k in ('obs', 'ach', 'act'):
                     ep[k] = np.array(ep[k], np.float32)
+                ep['grip_min'] = ep_grip_min
                 replay.add(ep)
                 norm_o.update(ep['obs'])
                 norm_g.update(np.concatenate([ep['ach'], goal[None]]))
 
             disp = [float(np.linalg.norm(e['ach'][-1] - e['ach'][0]))
                     for e in replay.eps[-16:]]
+            gmin = [e['grip_min'] for e in replay.eps[-16:]
+                    if np.isfinite(e.get('grip_min', np.inf))]
             cl_acc, al_acc, q_acc, rz_acc = [], [], [], []
             for _ in range(args.updates_per_cycle):
                 o, g, a, r, o2, g2 = replay.sample(args.batch_size,
@@ -287,6 +319,10 @@ def train(args):
                        'her/q_max': np.max(q_acc),
                        'her/relabeled_reward_zero_frac': np.mean(rz_acc),
                        'her/cube_disp_mean': float(np.mean(disp)),
+                       'her/grip_cube_min_dist': float(np.mean(gmin))
+                       if gmin else -1.0,
+                       'her/grip_close_frac': float(np.mean(
+                           np.array(gmin) < 0.05)) if gmin else -1.0,
                        'her/cube_moved_frac': float(
                            np.mean(np.array(disp) > 0.01)),
                        'her/buffer_transitions': replay.size},
