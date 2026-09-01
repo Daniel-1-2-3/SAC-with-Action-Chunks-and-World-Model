@@ -1,0 +1,11 @@
+# Arm 1: critic best-of-N (QC's own best-of-N), seeds 0 and 1
+python train_sac_chunked.py --train_sac_chunked.general.run_name=criticN_triple_s0 --train_sac_chunked.general.out_dir=runs/criticN_s0 --seed=0
+python train_sac_chunked.py --train_sac_chunked.general.run_name=criticN_triple_s1 --train_sac_chunked.general.out_dir=runs/criticN_s1 --seed=1
+
+# Arm 2: world-model best-of-N, standard single-chunk scoring, seeds 0 and 1
+python train_sac_chunked_wm.py --train_sac_chunked_wm.general.run_name=wmN_triple_s0 --train_sac_chunked_wm.general.out_dir=runs/wmN_s0 --seed=0
+python train_sac_chunked_wm.py --train_sac_chunked_wm.general.run_name=wmN_triple_s1 --train_sac_chunked_wm.general.out_dir=runs/wmN_s1 --seed=1
+
+# Optional control: plain QC-FQL, no selection at all, seeds 0 and 1
+python train_sac_chunked.py --train_sac_chunked.general.run_name=qcfql_triple_s0 --train_sac_chunked.general.out_dir=runs/qcfql_s0 --train_sac_chunked.chunk.select_n=1 --seed=0
+python train_sac_chunked.py --train_sac_chunked.general.run_name=qcfql_triple_s1 --train_sac_chunked.general.out_dir=runs/qcfql_s1 --train_sac_chunked.chunk.select_n=1 --seed=1

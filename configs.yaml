@@ -1,61 +1,302 @@
 defaults:
+
   seed: 0
-train_sear:
-  train_sear:
-    env_name: cube-double-play-singletask-v0
-    out_dir: sear_runs
-    wandb_project: sear-p2e
-    wandb_mode: online
-    chunk_len: 5
-    gamma: 0.99
-    num_online_steps: 1000000
-    num_seed_steps: 4000
-    start_training: 5000
-    max_episode_steps: 500
-    max_episodes: 2000
-    seq_len: 48
-    batch_size: 256
-    wm_batch: 16
-    wm_every: 2
-    wm_lr: 0.0001
-    wm_compile: true
-    use_world_model: true
-    ensemble_k: 5
-    ensemble_obs_slice:
-    - 19
-    - 37
-    imagine_horizon: 5
-    imagine_batch: 256
-    critic_vmin: -260.0
-    # headroom above 0 for the soft value (reward + alpha*entropy)
-    critic_vmax: 60.0
-    eval_receding: 5
-    eval_episodes: 20
-    eval_max_steps: 500
-    eef_slice:
-    - 12
-    - 15
-    # RLPD-style symmetric sampling: fraction of each training batch drawn
-    # from reward-bearing episodes. FIXED from 0.5, which over-represented
-    # a single early episode ~100x on every update when only one or two
-    # reward episodes existed.
-    reward_batch_frac: 0.15
-    alpha_min: 0.001
-    # --- Hindsight Experience Replay (Andrychowicz et al. 2017) ---
-    use_her: True
-    # fraction of training windows relabeled with a 'future' achieved goal
-    # (paper's best strategy; 0.8 ~= their k=4 ratio)
-    her_frac: 0.8
-    # goal-success distance in meters (measured against this env)
-    her_thresh: 0.04
-    # reject a relabeled 'future' goal if the achieved state is ALREADY
-    # within this many thresholds of it at the window start. Without this,
-    # a cube that never moves makes every relabeled goal satisfied on
-    # arrival, reward 0 everywhere, and q_max pinned at the ceiling.
-    her_reject_satisfied: True
-    # -0.5 for cube-single (reward is 0/-1, so anything above -1 is a
-    # partial); -1.5 for cube-double (reward 0/-1/-2)
-    success_reward_thresh: -0.5
-    log_every: 500
-    eval_every: 10000
-    save_every: 50000
+  batch_size: 32
+  batch_length: 64
+
+  jax:
+    platform: cuda
+    compute_dtype: float32
+    policy_devices: [0]
+    train_devices: [0]
+    mock_devices: 0
+    prealloc: True
+    jit: True
+    debug: False
+    expect_devices: 0
+    enable_policy: True
+    coordinator_address: ''
+
+  agent:
+    loss_scales: {rec: 1.0, rew: 1.0, con: 1.0, dyn: 1.0, rep: 0.1, policy: 1.0, value: 1.0, repval: 0.3}
+    opt: {lr: 4e-5, agc: 0.3, eps: 1e-20, beta1: 0.9, beta2: 0.999, momentum: True, wd: 1e-4, schedule: const, warmup: 1000, anneal: 0}
+    ac_grads: False
+    dyn:
+      typ: rssm
+      rssm: {deter: 512, hidden: 512, stoch: 32, classes: 16, act: silu, norm: rms, unimix: 0.01, outscale: 1.0, winit: trunc_normal_in, imglayers: 2, obslayers: 1, dynlayers: 1, absolute: False, blocks: 8, free_nats: 1.0}
+    enc:
+      typ: simple
+      simple: {depth: 64, mults: [2, 3, 4, 4], layers: 3, units: 512, act: silu, norm: rms, winit: trunc_normal_in, symlog: True, outer: False, kernel: 5, strided: False}
+    dec:
+      typ: simple
+      simple: {depth: 64, mults: [2, 3, 4, 4], layers: 3, units: 512, act: silu, norm: rms, outscale: 1.0, winit: trunc_normal_in, outer: False, kernel: 5, bspace: 8, strided: False}
+    rewhead: {layers: 2, units: 512, act: silu, norm: rms, output: symexp_twohot, outscale: 0.0, winit: trunc_normal_in, bins: 255}
+    conhead: {layers: 2, units: 512, act: silu, norm: rms, output: binary, outscale: 1.0, winit: trunc_normal_in}
+    policy: {layers: 3, units: 1024, act: silu, norm: rms, minstd: 0.1, maxstd: 1.0, outscale: 0.01, unimix: 0.01, winit: trunc_normal_in}
+    value: {layers: 3, units: 1024, act: silu, norm: rms, output: symexp_twohot, outscale: 0.0, winit: trunc_normal_in, bins: 255}
+    policy_dist_disc: categorical
+    policy_dist_cont: bounded_normal
+    imag_last: 0
+    imag_length: 15
+    horizon: 333
+    contdisc: True
+    imag_loss: {slowtar: False, lam: 0.95, actent: 3e-4, slowreg: 1.0}
+    repl_loss: {slowtar: False, lam: 0.95, slowreg: 1.0}
+    slowvalue: {rate: 0.02, every: 1}
+    retnorm: {impl: perc, rate: 0.01, limit: 1.0, perclo: 5.0, perchi: 95.0, debias: False}
+    valnorm: {impl: none, rate: 0.01, limit: 1e-8}
+    advnorm: {impl: none, rate: 0.01, limit: 1e-8}
+    reward_grad: True
+    repval_loss: True
+    repval_grad: True
+    report: True
+    report_gradnorms: False
+
+  train_sac_wm:
+
+    general:
+      env_name: cube-single-play-singletask-v0
+      wm_ckpt: ''
+      seed_from_offline: True
+      num_seed_steps: 4000
+      num_train_steps: 500000
+      log_every: 100
+      save_every: 10000
+      eval_every: 10000
+      eval_episodes: 10
+      out_dir: train_sac_wm_out
+      wandb_project: world-model-sac
+      wandb_mode: online
+
+    dreamer:
+      train_every: 1
+      max_episodes: 2000
+
+    sac:
+      train_every: 5
+      horizon: 15
+      imagination_batch: 1024
+      gamma: 0.99
+      lam: 0.95
+      reward_shift: 1.0
+      lr: 3e-4
+      feature_dim: 512
+      hidden_dim: 256
+      critic_target_tau: 0.005
+      init_ent_coef: 1.0
+
+  # Baseline arm. Keep every value below that also appears under
+  # train_sac_wm.sac IDENTICAL to it -- gamma, reward_shift, lr, feature_dim,
+  # hidden_dim, critic_target_tau, init_ent_coef are shared by design and the
+  # comparison stops being controlled the moment one side is tuned alone.
+  # train_every and batch_size are the exceptions: those are legitimately
+  # method-specific and sit here at their standard SAC values.
+  train_sac:
+
+    general:
+      env_name: cube-single-play-singletask-v0
+      seed_from_offline: True
+      num_seed_steps: 4000
+      num_train_steps: 500000
+      log_every: 100
+      save_every: 10000
+      eval_every: 10000
+      eval_episodes: 10
+      out_dir: train_sac_out
+      wandb_project: world-model-sac
+      wandb_mode: online
+
+    sac:
+      train_every: 1
+      batch_size: 256
+      replay_capacity: 1000000
+      gamma: 0.99
+      reward_shift: 1.0
+      lr: 3e-4
+      feature_dim: 512
+      hidden_dim: 256
+      critic_target_tau: 0.005
+      init_ent_coef: 1.0
+  # ---------------------------------------------------------------------
+  # Action-chunked arms: QC-FQL, ported from github.com/ColinQiyangLi/qc
+  # (agents/acfql.py, actor_type=distill-ddpg). Every key that appears in
+  # BOTH train_sac_chunked_wm.chunk and train_sac_chunked.chunk must hold the
+  # same value -- the policy is the controlled variable and the only thing
+  # allowed to differ between arms is whether a world model exists.
+  # train_every, batch_size, imagination_batch and bc_batch are the
+  # exceptions, since the arms genuinely draw their training data differently.
+  #
+  # VALUES TAKEN FROM THE REFERENCE, don't re-litigate:
+  #   hidden_dim 512 / num_layers 4   actor_hidden_dims = value_hidden_dims
+  #                                   = (512, 512, 512, 512)
+  #   ensemble 2                      num_qs for FQL-based agents
+  #   q_agg mean                      never min, for any agent in the repo
+  #   alpha 300                       Table 4, cube-double (100 for triple
+  #                                   and quadruple, 10000 for robomimic)
+  #   flow_steps 10, lr 3e-4, tau 0.005, batch_size 256, utd_ratio 1
+  #   chunk_len 5                     h=10 scored higher on cube-triple in the
+  #                                   h ablation; 5 is the paper's default
+  #                                   because it is cheaper
+  #
+  # There is no gradient clipping and no (1 + alpha) divisor in the actor
+  # loss. Those two were cancelling each other; the reference has neither.
+  #
+  # reward_shift is 0.0 -- QC feeds raw {-n..0} rewards straight through. The
+  # shift was a local addition and is what made alpha untransferable between
+  # cube-single and cube-double, since it turns "one cube placed" into a
+  # sustained +1/step on multi-cube tasks and inflates Q by ~65x.
+  #
+  # eef_slice [12,15] measured on both cube-single and cube-double.
+  # ---------------------------------------------------------------------
+
+  train_sac_chunked_wm:
+    # QC-FQL training + model-scored chunk selection at act time.
+    #
+    # TRAINING is plain QC-FQL on raw observations -- the target, critic,
+    # actor and batch are identical to the no-world-model arm, and
+    # _agent_update takes no world-model argument at all.
+    #
+    # The world model is used in ONE place: at every chunk boundary the
+    # ChunkSelector samples select_n candidate chunks from the one-step
+    # policy, imagines each through the model from the current posterior
+    # latent, scores it as
+    #
+    #   pooled imagined reward + gamma^h * cont * Q(decoded end state)
+    #
+    # and executes the argmax. This targets the observed bottleneck directly:
+    # the previous runs never found a single online success, and selection
+    # changes WHICH chunks get executed, i.e. whether success data ever
+    # appears. It also degrades gracefully -- if the scores are uninformative
+    # noise, the argmax over i.i.d. policy samples is distributed like a
+    # single policy sample, so the worst case is QC-FQL, not below it.
+    #
+    # select_n: 1 disables the selector entirely (select() is policy.act and
+    # observe/record_action are no-ops), so the run reduces to QC-FQL
+    # exactly. That is the control.
+    #
+    # Execution stays at chunk_len. The selector chooses which chunk runs;
+    # the open-loop commitment length is unchanged.
+
+    general:
+      env_name: cube-triple-play-singletask-v0
+      run_name: ''
+      wm_ckpt: ''
+      seed_from_offline: True
+      num_offline_steps: 250000
+      num_online_steps: 1000000
+      num_seed_steps: 4000
+      start_training: 5000
+      log_every: 100
+      save_every: 10000
+      eval_every: 10000
+      eval_episodes: 20
+      out_dir: train_sac_chunked_wm_out
+      wandb_project: beat-qc-fql
+      wandb_mode: online
+
+    dreamer:
+      # The world model has no counterpart in QC, so this cadence is a free
+      # choice. 10 is near standard Dreamer practice; 1 is ~5x slower for
+      # little gain (batch_size * batch_length = 2048 frames per update).
+      # 2, not 10 -- the world model gets 5x the updates per env step. It is
+      # the component every model-based variant depends on, and the offline
+      # phase costs no env steps, so this is cheap where it matters.
+      train_every: 2
+      max_episodes: 2000
+
+    chunk:
+      chunk_len: 5
+      # Candidate chunks sampled and model-scored per decision. This is the
+      # exploitation knob: QC's best-of-N analysis bounds the KL from the
+      # sampling policy by log N - (N-1)/N, and the paper used N=32 on
+      # cube-*. 16 halves the per-decision model cost; raise it if
+      # select/score_std says the scores separate candidates cleanly.
+      # 1 disables the selector -> exact QC-FQL (the control run).
+      select_n: 16
+      # Chunks imagined per candidate. 1 = the repo's original scoring:
+      # imagine the candidate chunk only (chunk_len steps, latent), then ONE
+      # decode at the end for Q(decoded end state). Raising it adds a decode
+      # per extra chunk (the follow-on chunk is sampled from the policy at
+      # the decoded intermediate state), so depth costs decoder error.
+      # Keep at 1 unless testing depth deliberately.
+      select_rollout_chunks: 1
+      # Real chunk transitions per critic/actor update -- QC's batch_size.
+      batch_size: 256
+      bc_batch: 256
+      train_every: 1
+      gamma: 0.99
+      reward_shift: 0.0
+      lr: 3e-4
+      hidden_dim: 512
+      num_layers: 4
+      critic_target_tau: 0.005
+      ensemble: 2
+      q_agg: mean
+      alpha: 300.0
+      flow_steps: 10
+      eef_slice: [12, 15]
+      # --- world-model accuracy checks, run at every eval (wm_diagnostics.py)
+      # These run OFFLINE against replay windows and spend ZERO env steps. The
+      # windows are sampled with bias_start_to_reward so they are guaranteed to
+      # contain reward variation -- without that every ground-truth reward is
+      # identical and every correlation is undefined.
+      # Replay windows measured per report. 0 disables.
+      wm_diag_states: 256
+      # Prior draws averaged per prediction. RSSM.imagine samples stoch every
+      # step, so one draw understates accuracy. The single-draw error is
+      # reported separately, since that is what the SELECTOR actually
+      # consumes (one draw per candidate).
+      wm_diag_samples: 4
+      # Rollout depth of the accuracy report. The selector only ever looks 1
+      # chunk ahead, so 1 measures exactly what it consumes.
+      wm_diag_depth: 1
+      # torch.compile(mode='default') on the actor/critic. The per-step cost is
+      # ~400 tiny kernel launches rather than arithmetic, so fusing them is the
+      # lever. Costs a minute or two at startup; set False if it misbehaves --
+      # it is a pure speed change and alters no results.
+      compile_nets: True
+
+  train_sac_chunked:
+
+    general:
+      env_name: cube-triple-play-singletask-v0
+      run_name: ''
+      seed_from_offline: True
+      num_offline_steps: 250000
+      num_online_steps: 1000000
+      num_seed_steps: 4000
+      start_training: 5000 # see the note under train_sac_chunked_wm.general
+      log_every: 100
+      save_every: 10000
+      eval_every: 10000
+      eval_episodes: 20
+      out_dir: train_sac_chunked_out
+      wandb_project: beat-qc-fql
+      wandb_mode: online
+
+    chunk:
+      chunk_len: 5
+      # Candidate chunks per decision, scored by the ONLINE CRITIC
+      # Q(s, chunk) -- QC's own best-of-N. Same N as the world-model arm so
+      # the two arms differ only in what does the scoring. 1 = plain QC-FQL.
+      select_n: 16
+      train_every: 1
+      utd_ratio: 1
+      batch_size: 256
+      # Floor only -- train_sac_chunked.py raises this at runtime to
+      # max(replay_capacity, offline_dataset_size + num_online_steps + 1),
+      # matching main.py's `max(buffer_size, train_dataset.size + 1)`. A
+      # fixed 1M would already be full from the offline seed alone on
+      # cube-double, so the first online transition would evict offline data.
+      replay_capacity: 1000000
+      gamma: 0.99
+      reward_shift: 0.0
+      lr: 3e-4
+      hidden_dim: 512
+      num_layers: 4
+      critic_target_tau: 0.005
+      ensemble: 2
+      q_agg: mean
+      alpha: 300.0
+      flow_steps: 10
+      eef_slice: [12, 15]
