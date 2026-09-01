@@ -201,16 +201,43 @@ def train(args):
                 goal = gt.task_goal()
                 ep = {'obs': [obs], 'ach': [gt.achieved()], 'act': [],
                       'goal': goal}
+                prefix_left, held_act, held_noise = 0, None, None
                 for _ in range(args.max_episode_steps):
-                    if rng.random() < 0.2:
-                        act = rng.uniform(act_low, act_high).astype(
-                            np.float32)
+                    if args.explore_chunk_len > 1 and prefix_left <= 0:
+                        # SEAR collection (Sec 4.4): commit to a random
+                        # prefix of a chunk, then replan. Applied here to
+                        # DDPG's own exploration -- the action (or its
+                        # noise vector) is drawn once and HELD for the
+                        # prefix, instead of redrawn every step.
+                        prefix_left = int(rng.integers(
+                            1, args.explore_chunk_len + 1))
+                        if rng.random() < 0.2:
+                            held_act = rng.uniform(
+                                act_low, act_high).astype(np.float32)
+                            held_noise = None
+                        else:
+                            held_act = None
+                            held_noise = rng.normal(0, noise_std)
+                    elif args.explore_chunk_len <= 1:
+                        # paper's per-step exploration (Appendix A)
+                        prefix_left = 1
+                        if rng.random() < 0.2:
+                            held_act = rng.uniform(
+                                act_low, act_high).astype(np.float32)
+                            held_noise = None
+                        else:
+                            held_act = None
+                            held_noise = rng.normal(0, noise_std)
+
+                    if held_act is not None:
+                        act = held_act
                     else:
                         with torch.no_grad():
                             act, _ = actor(inputs(obs[None], goal[None]))
                         act = act.cpu().numpy()[0]
-                        act = np.clip(act + rng.normal(0, noise_std),
+                        act = np.clip(act + held_noise,
                                       act_low, act_high).astype(np.float32)
+                    prefix_left -= 1
                     obs, _, term, trunc, _ = env.step(act)
                     ep['obs'].append(obs)
                     ep['ach'].append(gt.achieved())
@@ -305,6 +332,13 @@ if __name__ == '__main__':
     p.add_argument('--gamma', type=float, default=0.98)
     p.add_argument('--polyak', type=float, default=0.95)
     p.add_argument('--thresh', type=float, default=0.04)
+    # SEAR-style collection (roadmap step 3): hold each exploratory
+    # action (or its noise vector) for a random prefix of this length,
+    # then replan. 1 = the paper's per-step exploration, the step-2
+    # control. iid per-step noise averages to zero net motion, so the arm
+    # jitters in place; committing for several steps produces travel,
+    # which is what makes cube contact possible.
+    p.add_argument('--explore_chunk_len', type=int, default=5)
     p.add_argument('--eval_episodes', type=int, default=20)
     p.add_argument('--seed', type=int, default=0)
     p.add_argument('--out_dir', default='sear_runs/her_ddpg_single')

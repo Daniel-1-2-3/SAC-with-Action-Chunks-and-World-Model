@@ -43,11 +43,31 @@ calling a null result.
 
 ### 3. SEAR exploration + DDPG + HER
 
-If the cube not getting bumped was the issue. Take only SEAR's collection
-(MaxEnt actions, random-prefix replanning), leave the DDPG+HER learner
-alone. The bar is low: SEAR only has to make the arm bump the cube; HER
-turns the bump into signal. If it does not work, look for other
-exploration solutions.
+CONFIRMED at step 2: `cube_moved_frac` ~0.08 and `cube_disp_mean` under
+1 cm, with `relabeled_reward_zero_frac` 0.78 against a relabel rate of
+0.8 -- almost every relabeled goal was already satisfied. The arm is not
+making contact.
+
+Fix: SEAR's collection idea (Sec 4.4, random-prefix chunk commitment)
+applied to DDPG's exploration. The exploratory action, or its noise
+vector, is drawn once and HELD for a random prefix instead of redrawn
+every step. iid per-step noise averages to zero net motion so the arm
+jitters in place; committing for several steps produces travel, which is
+what makes contact possible.
+
+```
+python train_her.py --env_name cube-single-play-singletask-v0 --explore_chunk_len 5 --epochs 60 --out_dir sear_runs/her_sear_single --wandb_project sear-her-wm
+```
+
+`--explore_chunk_len 1` is the exact step-2 control (the paper's per-step
+exploration). This is only SEAR's collection; the DDPG+HER learner is
+untouched, so any change is attributable to exploration alone.
+
+Read `her/cube_moved_frac` first. On a stub env where only sustained
+pushes move the cube, chunk_len 1 gives 0.12 and chunk_len 5 gives 0.94.
+If it does not clear roughly 0.3 here, try `--explore_chunk_len 10`, then
+look for other exploration solutions. The paper's own fallback (Sec 4.1
+footnote 3) is to start some training episodes near contact.
 
 ### 4. SEAR + action-chunked SAC + HER
 
