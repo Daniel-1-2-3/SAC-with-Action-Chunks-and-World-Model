@@ -2,6 +2,17 @@
     the simulator's own state -- no demonstrations, no external data, no
     task knowledge:
 
+    0. SPAWN-AT-EFFECTOR (HER's pick-and-place trick, self-generated).
+       HER's authors note that pick-and-place does not train from scratch
+       with object-position goals: they hand-recorded one grasped state and
+       began half of training there. This is the same idea without the
+       recorded state -- at reset, the cube is moved to the EFFECTOR'S OWN
+       CURRENT POSITION, so the episode starts with the object in contact
+       range of wherever the policy happens to have the arm. Nothing
+       external is injected: the effector pose is read from the sim and is
+       whatever the agent produced. Note this starts the cube in contact
+       range, NOT necessarily grasped -- fingers still have to close.
+
     1. TARGETED SPAWN (preferred when the env exposes goal positions as
        mocap bodies, which OGBench's target-cube rendering uses): ONE
        randomly chosen cube is placed at its own goal position and the
@@ -67,9 +78,12 @@ def _recompute_obs(env):
 
 class Curriculum:
     def __init__(self, env, spawn_frac=0.0, pool_frac=0.0, pool_size=2000,
-                 reward_thresh=-1.5, rng=None, verbose=True):
+                 reward_thresh=-1.5, at_effector_frac=0.0, goal_tools=None,
+                 rng=None, verbose=True):
         self.env = env
         self.spawn_frac = spawn_frac
+        self.at_effector_frac = at_effector_frac
+        self.goal_tools = goal_tools     # supplies the effector position
         self.pool_frac = pool_frac
         self.pool_size = pool_size
         self.reward_thresh = reward_thresh
@@ -82,7 +96,7 @@ class Curriculum:
         self.warmup_resets = 5     # natural resets used to bound the box
         self.n_mocap = 0            # goal handles, if the env exposes them
         self.stats = {'pool_size': 0, 'spawned': 0, 'restored': 0,
-                      'targeted': 0}
+                      'targeted': 0, 'at_effector': 0}
 
         handles = _mj(env)
         if handles is None:
@@ -152,7 +166,17 @@ class Curriculum:
             return obs
         self._observe_box()
         r = self.rng.random()
-        if self.pool and r < self.pool_frac:
+        if (self.at_effector_frac > 0 and self.goal_tools is not None
+                and r < self.at_effector_frac):
+            try:
+                obs = self._spawn_at_effector()
+                self.stats['at_effector'] += 1
+            except Exception as e:
+                print(f'curriculum: at-effector spawn failed ({e}) -- OFF')
+                self.at_effector_frac = 0.0
+            return obs
+        r = self.at_effector_frac + (1 - self.at_effector_frac) * self.rng.random()
+        if self.pool and r < self.at_effector_frac + self.pool_frac:
             qpos, qvel = self.pool[self.rng.integers(0, len(self.pool))]
             try:
                 obs = self._apply(qpos, qvel)
@@ -162,7 +186,8 @@ class Curriculum:
                 self.enabled = False
             return obs
         if (self._resets_seen >= self.warmup_resets
-                and r < self.pool_frac + self.spawn_frac):
+                and r < self.at_effector_frac + self.pool_frac
+                + self.spawn_frac):
             try:
                 obs = self._randomize_spawn()
                 self.stats['spawned'] += 1
@@ -170,6 +195,18 @@ class Curriculum:
                 print(f'curriculum: spawn failed ({e}) -- DISABLING')
                 self.enabled = False
         return obs
+
+    def _spawn_at_effector(self):
+        """ Move every cube to the effector's current position (small
+            jitter so multiple cubes don't overlap exactly), zero
+            velocities, and rebuild the observation. """
+        _, data = _mj(self.env)
+        eef = self.goal_tools._eef_raw().astype(np.float64)
+        qpos = np.array(data.qpos, copy=True)
+        qvel = np.zeros_like(data.qvel)
+        for i, a in enumerate(self.free_adr):
+            qpos[a:a + 3] = eef + self.rng.normal(0, 0.005, 3)
+        return self._apply(qpos, qvel)
 
     # ---------- spawn randomization ----------
     def _observe_box(self):
@@ -205,6 +242,7 @@ class Curriculum:
 
     def metrics(self):
         return {'pool_size': len(self.pool),
+                'episodes_at_effector': self.stats['at_effector'],
                 'episodes_spawned': self.stats['spawned'],
                 'episodes_targeted': self.stats['targeted'],
                 'episodes_restored': self.stats['restored']}

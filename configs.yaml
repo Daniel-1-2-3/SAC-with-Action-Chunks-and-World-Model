@@ -48,6 +48,11 @@ train_sear:
     # fraction of TRAINING episodes that start with object positions
     # resampled inside the env's own observed spawn box; some land in goal
     # zones, manufacturing reward-bearing starts with no task knowledge
+    # fraction of TRAINING episodes that start with the cube(s) moved to
+    # the effector's own current position -- HER's pick-and-place trick
+    # (Andrychowicz et al. Sec 4.1) with a self-generated state instead of
+    # a hand-recorded grasp. Needs use_her (supplies the effector handle).
+    spawn_at_effector_frac: 0.0
     spawn_frac: 0.3
     # fraction that restart from a pooled simulator state snapshotted when
     # a better-than-floor reward was earned (Go-Explore style)

@@ -52,8 +52,44 @@ class GoalTools:
         self.obs_start = 19             # OGBench: cube i block at 19 + 9i
         self.obs_stride = 9
         self.center = np.zeros((self.n_cubes, 3), np.float32)
-        print(f'HER: {self.n_cubes} cube(s), goal_dim {self.goal_dim}, '
-              f'success threshold {thresh} m (goals in obs space, x10)')
+        # The achieved goal is [end-effector position] + [cube positions].
+        # Cube-only goals are DEGENERATE before first contact: an untouched
+        # cube never moves, so a 'future' relabeled goal equals the cube's
+        # current position and the recomputed reward is 0 at every step --
+        # ~80% of windows then say 'whatever you did was correct', which
+        # trains a flat critic and an arbitrary policy. The effector moves
+        # every step, so including it makes relabeled rewards vary from the
+        # first episode: the agent first learns precise 3D positioning (the
+        # prerequisite for grasping), and cube-moving goals become
+        # learnable once contact starts happening.
+        self.eef_kind, self.eef_id = self._find_effector(model)
+        self.goal_dim = 3 * (1 + self.n_cubes)
+        print(f'HER: {self.n_cubes} cube(s) + effector, goal_dim '
+              f'{self.goal_dim}, threshold {thresh} m cube / '
+              f'{2 * thresh} m effector (obs space, x10)')
+
+    @staticmethod
+    def _find_effector(model):
+        import mujoco
+        keys = ('effector', 'pinch', 'grip', 'hand', 'attach', 'wrist',
+                'tool', 'ee')
+        for kind, n, obj in (('site', model.nsite, mujoco.mjtObj.mjOBJ_SITE),
+                             ('body', model.nbody, mujoco.mjtObj.mjOBJ_BODY)):
+            names = [(i, mujoco.mj_id2name(model, obj, i)) for i in range(n)]
+            for i, nm in names:
+                if nm and any(k in nm.lower() for k in keys) \
+                        and 'target' not in nm.lower():
+                    print(f'HER: effector = {kind} "{nm}"')
+                    return kind, i
+        raise RuntimeError(
+            'HER: could not find an effector site/body; names were '
+            + str([mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_SITE, i)
+                   for i in range(model.nsite)]))
+
+    def _eef_raw(self):
+        _, data = _mj(self.env)
+        src = data.site_xpos if self.eef_kind == 'site' else data.xpos
+        return np.asarray(src[self.eef_id], dtype=np.float32)
 
     def calibrate(self, obs):
         """ Solve the per-cube obs offset from the current sim state:
@@ -66,27 +102,33 @@ class GoalTools:
             self.center[i] = (np.asarray(data.qpos[a:a + 3], np.float32)
                               - obs[blk:blk + 3] / self.scale)
 
-    def to_obs_space(self, raw):
-        """ raw (..., n_cubes*3) meters -> obs-space goal features. """
+    def _scale(self, raw):
+        """ raw (..., 3*(1+n_cubes)) meters -> obs-space goal features.
+            All components share cube 0's calibrated center so the goal
+            vector sits in the same numeric range as the obs cube block. """
         r = np.asarray(raw, np.float32).reshape(
-            *np.shape(raw)[:-1], self.n_cubes, 3)
-        return (self.scale * (r - self.center)).reshape(
+            *np.shape(raw)[:-1], 1 + self.n_cubes, 3)
+        return (self.scale * (r - self.center[0])).reshape(
             *np.shape(raw)[:-1], self.goal_dim)
 
     def task_goal(self):
         """ The env's own goal: mocap target position(s), (goal_dim,). """
         _, data = _mj(self.env)
-        raw = np.asarray(data.mocap_pos[:self.n_cubes],
-                         dtype=np.float32).reshape(-1)
-        return self.to_obs_space(raw)
+        cubes = np.asarray(data.mocap_pos[:self.n_cubes],
+                           dtype=np.float32).reshape(self.n_cubes, 3)
+        # effector component of the task goal = the first cube's target
+        # (to place a cube there the gripper must be there)
+        raw = np.concatenate([cubes[0], cubes.reshape(-1)])
+        return self._scale(raw)
 
     def achieved(self):
         """ Current cube position(s), (goal_dim,). """
         _, data = _mj(self.env)
         raw = np.concatenate(
+            [self._eef_raw()] +
             [np.asarray(data.qpos[a:a + 3], dtype=np.float32)
              for a in self.adr])
-        return self.to_obs_space(raw)
+        return self._scale(raw)
 
     def reward(self, achieved, goal):
         """ Sparse binary reward, vectorized over leading dims.
@@ -95,48 +137,53 @@ class GoalTools:
             0/-1 for single; for multi-cube we return the env-style
             -(number of unplaced cubes)). """
         a = np.asarray(achieved).reshape(*np.shape(achieved)[:-1],
-                                         self.n_cubes, 3)
-        g = np.asarray(goal).reshape(*np.shape(goal)[:-1], self.n_cubes, 3)
-        placed = (np.linalg.norm(a - g, axis=-1) < self.thresh * self.scale)
-        return placed.sum(-1).astype(np.float32) - float(self.n_cubes)
+                                         1 + self.n_cubes, 3)
+        g = np.asarray(goal).reshape(*np.shape(goal)[:-1],
+                                     1 + self.n_cubes, 3)
+        dist = np.linalg.norm(a - g, axis=-1)
+        grip_ok = dist[..., 0] < 2 * self.thresh * self.scale
+        placed = (dist[..., 1:] < self.thresh * self.scale).sum(-1)
+        # the effector gates cube credit, so reward varies with the arm's
+        # own motion from episode one; range matches the env (-n_cubes..0)
+        return (placed * grip_ok).astype(np.float32) - float(self.n_cubes)
 
 
 def relabel_windows(seqs, chunk_len, goal_tools, task_goal, her_frac, rng,
                     obs_key='state'):
-    """ Given sampled sequences that include per-step 'achieved' (B, T, G),
-        produce a per-window goal array and per-window relabeled rewards,
-        following HER's 'future' strategy at the window level: with prob
-        her_frac a window's goal becomes an achieved state sampled from
-        later in ITS OWN sequence; otherwise the real task goal is kept
-        with the recorded rewards.
+    """ Per-window goals and rewards, HER Algorithm 1 adapted to chunks.
 
-        Returns (goals (B, W, G), rewards (B, T)) where rewards is a full
-        (B, T) relabeled reward array windows can be sliced from -- but
-        note relabeled rewards differ per window goal, so this returns a
-        per-window reward tensor instead: (B, W, N). W = T - chunk_len.
+        Two points of faithfulness that matter:
+        - ONE reward function everywhere. The paper computes r(s,a,g) for
+          the ORIGINAL goal as well as for relabeled ones; it never mixes
+          recorded environment rewards with recomputed ones. Doing that
+          would give the same goal vector two different meanings depending
+          on whether its window happened to be relabeled, which is a
+          contradiction the critic cannot resolve. Env rewards remain the
+          reported metric; they are not a training target here.
+        - 'future' strategy: the goal is an achieved state from later in
+          the SAME sequence, at or after the window's end so it is strictly
+          future for every prefix inside the chunk.
+
+        Returns goals (B, W, G) and rewards (B, W, N), fully vectorized.
     """
-    ach = seqs['achieved']                                # (B, T, G)
+    ach = seqs['achieved']                                  # (B, T, G)
     B, T, G = ach.shape
     N = chunk_len
     W = T - N
-    if 'goal' in seqs:      # each episode's own collection-time goal
-        goals = np.ascontiguousarray(
-            seqs['goal'][:, :W]).astype(np.float32)
+    if 'goal' in seqs:          # each episode's own collection-time goal
+        goals = np.ascontiguousarray(seqs['goal'][:, :W]).astype(np.float32)
     else:
         goals = np.tile(task_goal, (B, W, 1)).astype(np.float32)
-    # recorded rewards for the real-goal case, sliced per window
-    rew = seqs['reward']
-    rewards = np.stack([rew[:, t + 1: t + N + 1] for t in range(W)], 1)
-    use_her = rng.random((B, W)) < her_frac
-    for b in range(B):
-        for t in range(W):
-            if not use_her[b, t]:
-                continue
-            # future strategy, chunked adaptation: goal = achieved at a
-            # random index AT OR AFTER the window's end, so the goal is
-            # strictly future for every prefix inside the window
-            j = int(rng.integers(min(t + N, T - 1), T))
-            goals[b, t] = ach[b, j]
-            rewards[b, t] = goal_tools.reward(
-                ach[b, t + 1: t + N + 1], ach[b, j])
-    return goals, rewards
+
+    # future goals for every window, then keep them with prob her_frac
+    lows = np.minimum(np.arange(W) + N, T - 1)              # (W,)
+    j = rng.integers(np.broadcast_to(lows, (B, W)), T)      # (B, W)
+    future = ach[np.arange(B)[:, None], j]                  # (B, W, G)
+    use_her = (rng.random((B, W)) < her_frac)[..., None]
+    goals = np.where(use_her, future, goals).astype(np.float32)
+
+    # rewards from the single reward function, for every window and prefix
+    idx = np.arange(1, N + 1)[None, :] + np.arange(W)[:, None]   # (W, N)
+    ach_win = ach[:, idx]                                   # (B, W, N, G)
+    rewards = goal_tools.reward(ach_win, goals[:, :, None, :])
+    return goals, rewards.astype(np.float32)

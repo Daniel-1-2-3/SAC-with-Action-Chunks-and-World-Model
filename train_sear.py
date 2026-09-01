@@ -131,7 +131,9 @@ def train(config):
     curriculum = Curriculum(
         env, spawn_frac=cfg.spawn_frac, pool_frac=cfg.reset_pool_frac,
         pool_size=cfg.reset_pool_size,
-        reward_thresh=cfg.success_reward_thresh, rng=rng)
+        reward_thresh=cfg.success_reward_thresh,
+        at_effector_frac=cfg.spawn_at_effector_frac, goal_tools=goal_tools,
+        rng=rng)
 
     replay = EpisodeReplay(OBS_KEY, ACTION_KEY, cfg.max_episodes)
     replay.set_goal(task_goal)
