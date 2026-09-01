@@ -224,7 +224,9 @@ def train(args):
                 norm_o.update(ep['obs'])
                 norm_g.update(np.concatenate([ep['ach'], goal[None]]))
 
-            cl_acc, al_acc, q_acc = [], [], []
+            disp = [float(np.linalg.norm(e['ach'][-1] - e['ach'][0]))
+                    for e in replay.eps[-16:]]
+            cl_acc, al_acc, q_acc, rz_acc = [], [], [], []
             for _ in range(args.updates_per_cycle):
                 o, g, a, r, o2, g2 = replay.sample(args.batch_size,
                                                    future_p, gt, rng)
@@ -246,11 +248,22 @@ def train(args):
                 opt_a.zero_grad(); al.backward(); opt_a.step()
                 cl_acc.append(cl.item()); al_acc.append(al.item())
                 q_acc.append(q.max().item())
+                rz_acc.append(float((r == 0).mean()))
 
             with torch.no_grad():
                 for t, m in ((actor_t, actor), (critic_t, critic)):
                     for pt, pm in zip(t.parameters(), m.parameters()):
                         pt.mul_(args.polyak).add_(pm, alpha=1 - args.polyak)
+
+            wandb.log({'her/critic_loss': np.mean(cl_acc),
+                       'her/actor_loss': np.mean(al_acc),
+                       'her/q_max': np.max(q_acc),
+                       'her/relabeled_reward_zero_frac': np.mean(rz_acc),
+                       'her/cube_disp_mean': float(np.mean(disp)),
+                       'her/cube_moved_frac': float(
+                           np.mean(np.array(disp) > 0.01)),
+                       'her/buffer_transitions': replay.size},
+                      step=env_steps)
 
         succ, rets = [], []
         for _ in range(args.eval_episodes):
@@ -269,10 +282,6 @@ def train(args):
             rets.append(ret)
         wandb.log({'eval/success_rate': np.mean(succ),
                    'eval/mean_return': np.mean(rets),
-                   'her/critic_loss': np.mean(cl_acc),
-                   'her/actor_loss': np.mean(al_acc),
-                   'her/q_max': np.max(q_acc),
-                   'her/buffer_transitions': replay.size,
                    'her/epoch': epoch}, step=env_steps)
         print(f'epoch {epoch} steps {env_steps} '
               f'success {np.mean(succ):.2f} return {np.mean(rets):.1f}')

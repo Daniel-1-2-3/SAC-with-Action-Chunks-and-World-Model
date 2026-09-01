@@ -56,7 +56,8 @@ def build_windows(seqs, chunk_len, obs_key='state', action_key='action',
         from helpers.her import relabel_windows
         goals, her_rewards = relabel_windows(
             seqs, N, her['goal_tools'], her['task_goal'], her['frac'],
-            rng, obs_key)
+            rng, obs_key,
+            reject_satisfied=her.get('reject_satisfied', True))
         goals = goals[keep]                                    # (M, G)
     # windows over the shifted-by-one tail arrays: index t+1..t+N
     a_w = swv(act[:, 1:], N, axis=1)                           # (B, W', N?, A)

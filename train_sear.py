@@ -1,30 +1,24 @@
-""" SEAR + Plan2Explore trainer: from scratch, single budget.
+""" SEAR trainer (roadmap steps 3-5).
 
-    Two agents, each faithful to its paper:
-      task agent -- SEAR (Nagy et al. 2026): chunked MaxEnt policy, causal
-                    transformer critic with multi-horizon targets, random
-                    replanning at collection, receding-horizon eval.
-                    Trained on real replay with environment reward. The
-                    ONLY policy evaluated.
-      explorer   -- Plan2Explore (Sekar et al. 2020): single-step actor and
-                    value on latent model states, trained purely in
-                    imagination to maximize ensemble disagreement
-                    (expected future novelty). Executed in the environment
-                    to collect informative real data.
+    task agent -- SEAR (Nagy et al. 2026): chunked MaxEnt policy, causal
+                  transformer critic with multi-horizon targets, random
+                  replanning at collection, receding-horizon eval.
+                  Trained on real replay. The ONLY policy evaluated.
 
-    The integration seam (ours, and the only non-paper components):
-    (1) the explorer collects (all or nearly all) episodes and SEAR learns
-    off-policy from the shared per-step replay -- mirroring P2E, whose task
-    policy also never collects; there is NO event-driven schedule; and
-    (2) a small fraction of each training batch is drawn from
-    reward-bearing episodes (biased sampling, no importance correction,
-    fraction kept small), so rare found rewards are amplified instead of
-    diluted in the growing buffer.
+    Non-paper component: a small fraction of each training batch is drawn
+    from reward-bearing episodes (biased sampling, no importance
+    correction, fraction kept small), so rare found rewards are amplified
+    instead of diluted in the growing buffer.
 
-    use_world_model=False collapses to the SEAR-only baseline.
+    use_world_model=True trains a passive world model alongside (step 5:
+    best-of-N chunk selection at act time). It does not collect.
+
+    Removed for the HER roadmap: the Plan2Explore explorer (benched after
+    it lagged SEAR at finding partials) and the spawn/reset curriculum
+    (cube spawning was rejected as a direction).
 
     Run:
-      python train_sear.py --train_sear.env_name=cube-double-play-singletask-v0
+      python train_sear.py --train_sear.env_name=cube-single-play-singletask-v0
 """
 import os
 # Headless rendering: MuJoCo defaults to GLFW, which needs X11 and core-dumps
@@ -39,10 +33,8 @@ import ogbench
 import torch
 import wandb
 
-from explore.p2e_explorer import P2EExplorer
 from helpers.common import (load_config, prefixed, set_seed_everywhere,
                             temporal_coherence)
-from helpers.curriculum import Curriculum
 from helpers.her import GoalTools
 from helpers.sear_replay import EpisodeReplay
 from sear.agent import SEARAgent
@@ -91,9 +83,8 @@ def run_eval(env, agent, cfg, eef_slice, gc=lambda o: o):
 
 
 def feat_to_carry(wm, feats):
-    """ Reconstruct RSSM carries from flat features (feat = deter ++ stoch),
-        for imagination start states per P2E: 'latent states obtained by
-        encoding [observations] from the replay buffer'. """
+    """ Reconstruct RSSM carries from flat features (feat = deter ++ stoch).
+        Kept for step 5: imagined rollouts from replay-encoded states. """
     deter = feats[:, :wm.deter]
     stoch = feats[:, wm.deter:].reshape(-1, wm.stoch, wm.classes)
     return dict(deter=deter, stoch=stoch)
@@ -122,18 +113,11 @@ def train(config):
         else None
     goal_dim = goal_tools.goal_dim if goal_tools else 0
     if goal_tools is not None:
-        goal_tools.calibrate(obs)      # solve obs-space center first
+        goal_tools.calibrate(obs)
     task_goal = goal_tools.task_goal() if goal_tools else None
     replay = None  # forward decl for set_goal below
     gc = (lambda o: np.concatenate([o, task_goal]).astype(np.float32)) \
         if goal_tools else (lambda o: o)
-
-    curriculum = Curriculum(
-        env, spawn_frac=cfg.spawn_frac, pool_frac=cfg.reset_pool_frac,
-        pool_size=cfg.reset_pool_size,
-        reward_thresh=cfg.success_reward_thresh,
-        at_effector_frac=cfg.spawn_at_effector_frac, goal_tools=goal_tools,
-        rng=rng)
 
     replay = EpisodeReplay(OBS_KEY, ACTION_KEY, cfg.max_episodes)
     replay.set_goal(task_goal)
@@ -141,39 +125,28 @@ def train(config):
                      device=device, alpha_min=cfg.alpha_min,
                      critic_kw=dict(vmin=cfg.critic_vmin,
                                     vmax=cfg.critic_vmax))
-    wm = ensemble = explorer = None
+    wm = ensemble = None
     if cfg.use_world_model:
         wm = WorldModel(obs_dim, act_dim, device=device, lr=cfg.wm_lr,
                         use_compile=cfg.wm_compile)
         ensemble = LatentDisagreementEnsemble(
             wm.feat_dim, act_dim, wm.embed_dim, k=cfg.ensemble_k,
             device=device)
-        if cfg.explore_frac > 0:
-            explorer = P2EExplorer(wm.feat_dim, act_dim,
-                                   horizon=cfg.imagine_horizon,
-                                   gamma=cfg.gamma,
-                                   reward_mix=cfg.explore_reward_mix,
-                                   device=device)
 
-    mode = ('explorer=P2E (latent disagreement, imagination-trained)'
-            if explorer else
-            ('passive WM (SEAR collects; model trains for eval planning)'
-             if wm is not None else 'NO world model (SEAR-only baseline)'))
-    print(f'sear-p2e | task=SEAR(chunk {N}) | {mode} | '
+    mode = ('passive WM (SEAR collects; model trains for act-time selection)'
+            if wm is not None else 'NO world model (SEAR-only baseline)')
+    print(f'sear | task=SEAR(chunk {N}) | {mode} | '
           f'eval=task policy, receding horizon {cfg.eval_receding}')
 
     trigger_step = None
-    acting = 'explorer' if explorer else 'task'
     chunk, pos, prefix_len = None, N, N        # task-policy chunk state
-    ex_carry, prev_a, ep_start = None, None, True   # explorer latent state
+    prev_a, ep_start = None, True
     ep_steps = 0
     metrics_acc = {}
 
     def reset_episode_state():
-        nonlocal chunk, pos, prefix_len, ex_carry, prev_a, ep_start, \
-            ep_steps
+        nonlocal chunk, pos, prefix_len, prev_a, ep_start, ep_steps
         chunk, pos, prefix_len = None, N, 0
-        ex_carry = wm.init(1) if (explorer and wm) else None
         prev_a = np.zeros(act_dim, np.float32)
         ep_start, ep_steps = True, 0
 
@@ -182,11 +155,6 @@ def train(config):
         # ---------------- collection ----------------
         if step <= cfg.num_seed_steps:
             a = rng.uniform(-1, 1, act_dim).astype(np.float32)
-        elif acting == 'explorer':
-            ex_carry, feat = wm.encode_step(
-                ex_carry, obs[None], prev_a[None],
-                np.asarray([ep_start], bool))
-            a = explorer.act(feat)[0]
         else:
             # SEAR random replanning (Sec 4.4): 'we only execute a random
             # prefix of each chunk' -- draw a fresh chunk, run a uniform
@@ -205,21 +173,16 @@ def train(config):
         prev_a = a
         if ep_steps >= cfg.max_episode_steps:
             trunc = True
-        curriculum.maybe_pool(r)
         replay.add_step(obs, a, r, next_obs, term, trunc,
                         achieved=ach, next_achieved=next_ach)
         obs = next_obs
         if term or trunc:
             obs, _ = env.reset()
-            obs = curriculum.on_reset(obs)
             if goal_tools is not None:
                 goal_tools.calibrate(obs)
                 task_goal = goal_tools.task_goal()
                 replay.set_goal(task_goal)
             reset_episode_state()
-            if explorer:
-                acting = 'explorer' if rng.random() < cfg.explore_frac \
-                    else 'task'
 
         # first-partial is a logged milestone only -- it changes nothing
         if trigger_step is None and \
@@ -235,7 +198,9 @@ def train(config):
                 reward_frac=cfg.reward_batch_frac,
                 reward_thresh=cfg.success_reward_thresh)
             her = (dict(goal_tools=goal_tools, task_goal=task_goal,
-                        frac=cfg.her_frac) if goal_tools else None)
+                        frac=cfg.her_frac,
+                        reject_satisfied=cfg.her_reject_satisfied)
+                   if goal_tools else None)
             win = build_windows(seqs, N, OBS_KEY, ACTION_KEY,
                                 take=cfg.batch_size, rng=rng, device=device,
                                 her=her)
@@ -245,19 +210,6 @@ def train(config):
                 metrics_acc.update(wm.train_batch(seqs))
                 metrics_acc.update(prefixed(ensemble.train_from_wm(
                     wm.last_feats, wm.last_actions, wm.last_embeds), 'wm'))
-            if explorer is not None and step % cfg.explore_every == 0 \
-                    and wm.last_feats is not None:
-                flat = wm.last_feats.flatten(0, 1)
-                idx = torch.randint(0, flat.shape[0],
-                                    (cfg.imagine_batch,), device=flat.device)
-                starts = feat_to_carry(wm, flat[idx])
-                metrics_acc.update(prefixed(
-                    explorer.update(wm, ensemble, starts), 'explorer'))
-                if cfg.owm_alpha > 0:
-                    rc = explorer.last_rollout
-                    metrics_acc.update(prefixed(wm.optimism_update(
-                        rc['deters'], rc['zs'], rc['advantages'],
-                        cfg.owm_alpha, cfg.owm_eta), 'wm'))
 
         # ---------------- logging / eval / ckpt ----------------
         if step % cfg.log_every == 0:
@@ -265,7 +217,6 @@ def train(config):
             metrics_acc.update(prefixed(stats, 'replay'))
             metrics_acc['diagnosis/first_partial_seen'] = float(
                 trigger_step is not None)
-            metrics_acc.update(prefixed(curriculum.metrics(), 'curriculum'))
             wandb.log(metrics_acc, step=step)
             metrics_acc = {}
         if step % cfg.eval_every == 0:
@@ -276,7 +227,6 @@ def train(config):
                 log['eval/video'] = wandb.Video(arr, fps=15, format='mp4')
             wandb.log(log, step=step)
             obs, _ = env.reset()
-            obs = curriculum.on_reset(obs)   # training episode resumes
             if goal_tools is not None:
                 goal_tools.calibrate(obs)
                 task_goal = goal_tools.task_goal()
@@ -285,8 +235,6 @@ def train(config):
             replay.end_episode()
         if step % cfg.save_every == 0:
             torch.save({'task': task.state_dict(),
-                        'explorer': explorer.state_dict() if explorer
-                        else None,
                         'wm': wm.state_dict() if wm else None,
                         'step': step},
                        out_dir / 'sear_latest.pt')

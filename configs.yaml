@@ -25,7 +25,6 @@ train_sear:
     - 19
     - 37
     imagine_horizon: 5
-    explore_every: 2
     imagine_batch: 256
     critic_vmin: -260.0
     # headroom above 0 for the soft value (reward + alpha*entropy)
@@ -36,28 +35,12 @@ train_sear:
     eef_slice:
     - 12
     - 15
-    # 0 = SEAR collects everything and no explorer is built; the world
-    # model + reward head train passively on SEAR's data for eval-time
-    # planning (plan_eval.py). >0 re-enables the P2E explorer.
-    explore_frac: 0.0
-    # RLPD-style symmetric sampling: half of each training batch from
-    # reward-bearing episodes
-    reward_batch_frac: 0.5
+    # RLPD-style symmetric sampling: fraction of each training batch drawn
+    # from reward-bearing episodes. FIXED from 0.5, which over-represented
+    # a single early episode ~100x on every update when only one or two
+    # reward episodes existed.
+    reward_batch_frac: 0.15
     alpha_min: 0.001
-    # --- training-time initial-state curriculum (eval is never affected) ---
-    # fraction of TRAINING episodes that start with object positions
-    # resampled inside the env's own observed spawn box; some land in goal
-    # zones, manufacturing reward-bearing starts with no task knowledge
-    # fraction of TRAINING episodes that start with the cube(s) moved to
-    # the effector's own current position -- HER's pick-and-place trick
-    # (Andrychowicz et al. Sec 4.1) with a self-generated state instead of
-    # a hand-recorded grasp. Needs use_her (supplies the effector handle).
-    spawn_at_effector_frac: 0.0
-    spawn_frac: 0.3
-    # fraction that restart from a pooled simulator state snapshotted when
-    # a better-than-floor reward was earned (Go-Explore style)
-    reset_pool_frac: 0.25
-    reset_pool_size: 2000
     # --- Hindsight Experience Replay (Andrychowicz et al. 2017) ---
     use_her: True
     # fraction of training windows relabeled with a 'future' achieved goal
@@ -65,10 +48,14 @@ train_sear:
     her_frac: 0.8
     # goal-success distance in meters (measured against this env)
     her_thresh: 0.04
-    explore_reward_mix: 0.3
-    owm_alpha: 0.0
-    owm_eta: 0.001
-    success_reward_thresh: -1.5
+    # reject a relabeled 'future' goal if the achieved state is ALREADY
+    # within this many thresholds of it at the window start. Without this,
+    # a cube that never moves makes every relabeled goal satisfied on
+    # arrival, reward 0 everywhere, and q_max pinned at the ceiling.
+    her_reject_satisfied: True
+    # -0.5 for cube-single (reward is 0/-1, so anything above -1 is a
+    # partial); -1.5 for cube-double (reward 0/-1/-2)
+    success_reward_thresh: -0.5
     log_every: 500
     eval_every: 10000
     save_every: 50000
