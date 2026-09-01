@@ -1,13 +1,18 @@
 numpy<2
 
-# world model (JAX side)
+# Config loading only (elements.Config / elements.Flags).
+elements>=3.17.0
+
+# JAX stack. NOT needed by training any more -- the world model is TD-MPC2 in
+# PyTorch and nothing in the active code imports jax. These are here only for
+# the vendored embodied/ (DreamerV3) tree, which nothing imports either.
+# Safe to drop along with embodied/.
 jax[cuda12]<0.7.0
 optax
 chex
 einops
 jaxtyping
 ninjax>=3.5.1
-elements>=3.17.0
 
 # policy (PyTorch side) -- install from the CUDA index above, not plain PyPI,
 # or pip serves a CPU-only wheel
@@ -20,12 +25,11 @@ mujoco
 # config loading
 ruamel.yaml
 
-# rendering and plots: wm/check_rollout_animation.py, helpers/comparison.py,
-# helpers/test_physics.py
+# rendering and plots
 opencv-python
 matplotlib
 
-# elements / embodied support
+# embodied support (vendored tree only)
 google-resumable-media>=2.7.2
 granular>=0.20.3
 portal>=3.5.0

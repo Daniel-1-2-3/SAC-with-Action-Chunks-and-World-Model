@@ -242,13 +242,15 @@ def train(config):
     )
 
     # QC's own best-of-N: sample select_n candidate chunks, score each with
-    # the online critic Q(s, chunk), execute the argmax. No world model
-    # anywhere. select_n=1 is plain QC-FQL.
+    # the online critic Q(s, chunk), execute the argmax. No learned model
+    # anywhere. select_n=1 is plain QC-FQL. This is the CONTROL arm: the
+    # model arm samples the same select_n candidates from the same policy and
+    # differs only in what ranks them.
     selector = ChunkSelector(
         None, policy, action_dim, chunk_len, chunk_config.select_n, gamma,
-        device, obs_key=OBS_KEY, score_mode='critic')
+        device, score_mode='critic')
     arm_name = ('critic_best_of_n' if chunk_config.select_n > 1
-                else 'no_world_model')
+                else 'no_model')
     eval_csv = EvalCSV(out_dir / 'eval_log.csv', arm=arm_name,
                        env_name=general_config.env_name, seed=config.seed, chunk_len=chunk_len)
     eef_slice = tuple(chunk_config.eef_slice)
@@ -256,9 +258,8 @@ def train(config):
 
     def run_eval(step, n_updates):
         results = eval_chunk_in_env(
-            env, None, policy, action_dim, general_config.eval_episodes,
-            device, OBS_KEY, chunk_len, eef_slice=eef_slice, record_video=True,
-            selector=selector)
+            env, policy, general_config.eval_episodes, OBS_KEY, chunk_len,
+            eef_slice=eef_slice, record_video=True, selector=selector)
         print(f'step {step:7d} | return {results["mean_return"]:.2f} | '
               f'success {results["success_rate"]:.2f} | coherence {results["coherence"]:.4f}')
         eval_csv.append(step, n_updates, time.time() - start_time, results)
@@ -343,6 +344,10 @@ def train(config):
             metrics['diagnosis/replay_transitions'] = len(replay)
             metrics['diagnosis/gradient_updates'] = n_updates
             metrics['diagnosis/phase'] = 1
+            # select/score_gap and select/score_std, logged under the same
+            # names the model arm uses, so "how separated are the candidates"
+            # is comparable between the two scorers.
+            metrics.update(selector.pop_stats())
             _succ = replay.success_stats
             metrics['replay/success_frac_total'] = _succ['total_frac']
             metrics['replay/success_frac_online'] = _succ['online_frac']

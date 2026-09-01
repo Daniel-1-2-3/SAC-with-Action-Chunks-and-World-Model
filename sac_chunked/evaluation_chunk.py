@@ -1,6 +1,5 @@
 import csv
 import pathlib
-import jax
 import numpy as np
 from sac_chunked.chunk_utils import temporal_coherence
 from helpers.interop import extract_state
@@ -10,27 +9,20 @@ EVAL_CSV_FIELDS = [
     'mean_return', 'success_rate', 'coherence', 'mean_episode_len', 'wall_time_s',
 ]
 
-def eval_chunk_in_env(env, bridge, policy, action_dim, num_episodes, device,
-                      obs_key, chunk_len, eef_slice=(0, 3), record_video=False,
-                      selector=None):
+def eval_chunk_in_env(env, policy, num_episodes, obs_key, chunk_len,
+                      eef_slice=(0, 3), record_video=False, selector=None):
     """ Chunked evaluation.
 
         The actor is queried once every chunk_len steps and the chunk is
         executed open loop, matching how the policy is used during training.
 
-        bridge=None, selector=None: raw observations straight into the actor
-        (the no-world-model arm, and the world-model arm's policy path).
+        selector=None: raw observations straight into the actor.
 
         selector: a ChunkSelector. Evaluation then measures the DEPLOYED
-        behavior -- model-scored chunk selection -- not the bare policy. The
-        selector's own observe/record_action calls keep its posterior latent
-        filtered on every step; with select_n<=1 they are no-ops and this is
-        identical to the bare-policy path.
-
-        bridge non-None (legacy latent-policy path): the observation is
-        encoded on EVERY step so the RSSM posterior stays correct for the
-        next chunk decision -- committing to actions is not a reason to stop
-        looking. """
+        behavior -- whatever ranks the candidate chunks in that arm -- not the
+        bare policy. With select_n<=1 the selector is a pass-through and this
+        is identical to the bare-policy path. Selection is stateless in both
+        arms, so evaluation needs no per-step bookkeeping. """
     returns, successes, lengths, coherences = [], [], [], []
     frames = []
 
@@ -46,13 +38,6 @@ def eval_chunk_in_env(env, bridge, policy, action_dim, num_episodes, device,
 
     for ep in range(num_episodes):
         obs, info = env.reset()
-        if selector is not None:
-            selector.reset()
-        if bridge is not None:
-            enc_carry, dyn_carry = bridge.init_encode(1)
-            prevact = np.zeros((1, action_dim), dtype=np.float32)
-            is_first = np.array([True])
-
         done = False
         ep_return = 0.0
         ep_success = False
@@ -68,21 +53,11 @@ def eval_chunk_in_env(env, bridge, policy, action_dim, num_episodes, device,
             state = extract_state(obs, obs_key)
             eef_track.append(state[0][eef_slice[0]:eef_slice[1]])
 
-            if bridge is not None:
-                enc_carry, dyn_carry, feat_j = bridge.encode_step(
-                    enc_carry, dyn_carry, state, prevact, is_first)
-                feat_np = np.asarray(jax.device_get(feat_j))[0].copy()
-            else:
-                feat_np = state[0]
-
-            if selector is not None:
-                selector.observe(state[0])
-
             if chunk_pos >= chunk_len:
                 if selector is not None:
                     chunk = selector.select(state[0])
                 else:
-                    chunk = policy.act(feat_np, eval_mode=True)
+                    chunk = policy.act(state[0], eval_mode=True)
                 chunk_pos = 0
             action = chunk[chunk_pos]
             chunk_pos += 1
@@ -96,11 +71,6 @@ def eval_chunk_in_env(env, bridge, policy, action_dim, num_episodes, device,
             if ep == 0:
                 safe_render()
 
-            if selector is not None:
-                selector.record_action(action)
-            if bridge is not None:
-                prevact = action.reshape(1, -1).astype(np.float32)
-                is_first = np.array([False])
             obs = next_obs
 
         returns.append(ep_return)

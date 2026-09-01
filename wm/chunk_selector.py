@@ -1,113 +1,78 @@
-import jax
 import numpy as np
 import torch
 
-from sac_chunked.chunk_utils import pool_chunk
-from helpers.interop import jax_to_torch
-
-def decode_obs(bridge, carry, obs_key, device):
-    """ Latent -> predicted observation, as a torch tensor.
-
-        The actor and critic live in observation space, so every point where
-        an imagined latent has to talk to them goes through here. The result
-        is a PREDICTION, not a real state: it carries decoder error on top of
-        whatever dynamics error accumulated to reach this latent. wm_report
-        measures both against real replay states. """
-    decoded = bridge.decode_state(carry)[obs_key]
-    return torch.as_tensor(np.asarray(decoded, dtype=np.float32), device=device)
 
 class ChunkSelector:
-    """ Model-scored best-of-N chunk selection. The ONLY place the world model
-        influences behavior.
+    """ Best-of-N chunk selection. The ONLY place the latent model influences
+        behavior.
 
-        At every chunk boundary: sample n candidate chunks from the one-step
-        policy at the raw observation, imagine each through the world model
-        from the current posterior latent, score it as
+        At every chunk boundary: sample n candidate chunks from the QC-FQL
+        one-step policy at the raw observation, then rank them. What does the
+        ranking is the experiment:
 
-            pooled imagined reward + gamma^h * cont * Q(decoded end state)
+          score_mode 'model'   TD-MPC2 latent model. Encode the observation
+                               once, imagine each candidate chunk in latent
+                               space, score it as
 
-        and execute the argmax. Training never sees any of this -- the critic
-        and actor update on real replay chunks with the plain QC-FQL target.
+                                 sum_t gamma^t * r_model(z_t, a_t)
+                                   + gamma^H * Q_model(z_H, pi(z_H))
+
+                               Nothing decodes back to observation space at
+                               any point -- the reward head and the Q both
+                               read the latent directly. Both terms are
+                               symlog two-hot predictions, so they are in the
+                               same units as each other and as the QC critic.
+
+          score_mode 'critic'  Q(s, chunk) from the online QC critic. This is
+                               the QC paper's own best-of-N and needs no model
+                               at all. It is the control arm.
+
+        Training never sees any of this. The critic and actor update on real
+        replay chunks with the plain QC-FQL target, so the model's entire
+        effect on the run is through WHICH chunks get executed -- i.e. through
+        the data that selection collects.
 
         Failure containment: candidates are i.i.d. samples from the policy, so
         if the scores are uninformative noise the argmax is distributed like a
         single policy sample and the agent degrades to QC-FQL rather than
         below it. The exception is a model that SYSTEMATICALLY prefers chunks
-        it predicts well (e.g. do-nothing chunks); watch select/score_gap
-        together with eval/coherence for that.
+        it predicts well (do-nothing chunks are the usual case); watch
+        select/score_gap together with eval/coherence for that.
 
-        n <= 1 disables everything here: observe/record_action are no-ops and
-        select() is exactly policy.act. That is the QC-FQL control run.
+        n <= 1 disables everything here -- select() is exactly policy.act.
+        That is the QC-FQL control run.
 
-        The posterior latent is maintained by one encode_step per env step
-        (observe). That is scorer plumbing, not a policy input -- the policy
-        reads the raw observation. A history-less single-step encode is not a
-        substitute: the RSSM's deter state starts empty and the rollout from
-        it is meaningless.
+        The TD-MPC2 encoder is Markov, so there is no posterior to keep
+        filtered between steps and no per-step encode. The selector is
+        stateless.
 
-        Attribution: every decision also scores the same candidates with the
-        online critic alone, Q(s, chunk) -- which is the QC paper's own
-        best-of-N method. select/pick_agreement near 1.0 means the model adds
-        nothing beyond the critic and this run reduces to QC. """
+        Attribution: in model mode every decision ALSO scores the same
+        candidates with the online critic alone. select/pick_agreement near
+        1.0 means the model adds nothing beyond the critic and this run
+        reduces to QC. """
 
-    def __init__(self, bridge, policy, action_dim, chunk_len, n, gamma, device,
-                 obs_key='state', reward_shift=0.0, score_mode='model',
-                 rollout_chunks=1):
-        """ score_mode 'model': the docstring above (needs a bridge).
-            score_mode 'critic': the SAME best-of-N mechanics, but the score
-            is Q(s, chunk) from the online critic -- QC's own best-of-N. No
-            bridge, no encoding, no imagination; the world model is not
-            involved at all. This is the critic-selection control arm.
+    def __init__(self, model, policy, action_dim, chunk_len, n, gamma, device,
+                 score_mode='model', rollout_chunks=1):
+        """ model: a TDMPC2Model, or None in critic mode.
             rollout_chunks (model mode): imagine this many chunks ahead. The
-            first is the candidate; each further chunk is sampled from the
-            policy at the decoded intermediate state. Lookahead depth is
-            rollout_chunks * chunk_len steps; score is the discounted pooled
-            imagined reward over all of it plus the discounted terminal
-            Q(decoded end state). """
+            first is the candidate; each further chunk's actions come from the
+            model's policy prior at the imagined latent. Lookahead depth is
+            rollout_chunks * chunk_len steps and costs nothing but dynamics
+            steps -- no decode, so depth does not compound decoder error the
+            way it did with the previous scorer. """
         assert score_mode in ('model', 'critic'), score_mode
+        assert score_mode == 'critic' or model is not None
         self.score_mode = score_mode
         self.rollout_chunks = max(1, int(rollout_chunks))
-        self.bridge = bridge
+        self.model = model
         self.policy = policy
         self.action_dim = action_dim
         self.chunk_len = chunk_len
         self.n = int(n)
         self.enabled = self.n > 1
         self.gamma = gamma
-        self.gamma_h = gamma ** chunk_len
         self.device = device
-        self.obs_key = obs_key
-        self.reward_shift = reward_shift
         self._stats = {}
-        self.reset()
-
-    def reset(self):
-        """ Call at every episode start (env.reset). """
-        if not self.enabled or self.score_mode == 'critic':
-            return
-        self.enc, self.dyn = self.bridge.init_encode(1)
-        self.prevact = np.zeros((1, self.action_dim), dtype=np.float32)
-        self.is_first = np.array([True])
-
-    def observe(self, state_1d):
-        """ Call once per env step with the CURRENT raw observation, before
-            acting. Filters the posterior so select() imagines from an
-            up-to-date latent. Encoding continues on every step of an
-            executing chunk -- committing to actions is not a reason to stop
-            looking. """
-        if not self.enabled or self.score_mode == 'critic':
-            return
-        s = np.asarray(state_1d, dtype=np.float32).reshape(1, -1)
-        self.enc, self.dyn, _ = self.bridge.encode_step(
-            self.enc, self.dyn, s, self.prevact, self.is_first)
-        self.is_first = np.array([False])
-
-    def record_action(self, action_1d):
-        """ Call after env.step with the action that was EXECUTED, so the next
-            observe() conditions on it. """
-        if not self.enabled or self.score_mode == 'critic':
-            return
-        self.prevact = np.asarray(action_1d, dtype=np.float32).reshape(1, -1)
 
     def _acc(self, key, value):
         s, c = self._stats.get(key, (0.0, 0))
@@ -122,8 +87,8 @@ class ChunkSelector:
 
     @torch.no_grad()
     def select(self, state_1d):
-        """ state_1d: (obs_dim,) raw observation, the same one observe() just
-            saw. Returns (chunk_len, action_dim). """
+        """ state_1d: (obs_dim,) raw observation.
+            Returns (chunk_len, action_dim). """
         if not self.enabled:
             return self.policy.act(np.asarray(state_1d, dtype=np.float32),
                                    eval_mode=False)
@@ -131,12 +96,12 @@ class ChunkSelector:
         feat = torch.as_tensor(np.asarray(state_1d, dtype=np.float32),
                                device=self.device).reshape(1, -1)
         feat_n = feat.repeat(self.n, 1)
-        cands = self.policy.sample_chunk(feat_n) # (n, chunk_len * action_dim)
+        cands = self.policy.sample_chunk(feat_n)  # (n, chunk_len * action_dim)
 
         # Critic score of the SAME candidates -- QC's own best-of-N ranking.
         # In critic mode it picks; in model mode it is logged for attribution.
         critic_score = self.policy._agg(
-            self.policy.critic(feat_n, cands)).squeeze(-1) # (n,)
+            self.policy.critic(feat_n, cands)).squeeze(-1)  # (n,)
 
         if self.score_mode == 'critic':
             idx = int(torch.argmax(critic_score).item())
@@ -146,45 +111,25 @@ class ChunkSelector:
             return cands[idx].detach().cpu().numpy().reshape(
                 self.chunk_len, self.action_dim)
 
-        carry_h = {k: np.repeat(np.asarray(jax.device_get(v)), self.n, axis=0)
-                   for k, v in self.dyn.items()}
-        carry = self.bridge.place_seed(carry_h)
-        # Discounted pooled reward over rollout_chunks imagined chunks:
-        #   score = sum_j disc_j * pooled_r_j + disc_end * Q(decoded end)
-        # with disc advancing by gamma^chunk_len * pooled_cont per chunk, so
-        # imagined termination cuts everything after it.
-        score = torch.zeros(self.n, 1, device=self.device)
-        disc = torch.ones(self.n, 1, device=self.device)
-        chunk_np = cands.detach().cpu().numpy()
-        for j in range(self.rollout_chunks):
-            if j > 0:
-                mid_obs = decode_obs(self.bridge, carry, self.obs_key,
-                                     self.device)
-                chunk_np = self.policy.sample_chunk(
-                    mid_obs).detach().cpu().numpy()
-            carry, _, reward_j, cont_j = self.bridge.img_chunk(
-                carry, chunk_np, self.chunk_len)
-            # (n, chunk_len) -> (chunk_len, n, 1), step-major (pool_chunk).
-            r = jax_to_torch(reward_j, self.device).transpose(0, 1) \
-                .unsqueeze(-1) + self.reward_shift
-            c = jax_to_torch(cont_j, self.device).transpose(0, 1).unsqueeze(-1)
-            pooled_r, pooled_c = pool_chunk(r, c, self.gamma)
-            score = score + disc * pooled_r
-            disc = disc * self.gamma_h * pooled_c
+        z = self.model.encode(feat_n)
+        chunk_actions = cands.reshape(self.n, self.chunk_len, self.action_dim)
+        z, r_term, disc = self.model.rollout_chunk(z, chunk_actions)
+        for _ in range(self.rollout_chunks - 1):
+            z, r_j, disc = self.model.rollout_pi_chunk(z, self.chunk_len, disc)
+            r_term = r_term + r_j
 
-        end_obs = decode_obs(self.bridge, carry, self.obs_key, self.device)
-        end_v = self.policy.chunk_target_values(end_obs)
-        q_term = (disc * end_v).squeeze(-1)   # (n,)
-        r_term = score.squeeze(-1)            # (n,) pooled imagined reward
+        end_v = self.model.terminal_value(z)
+        q_term = (disc * end_v).squeeze(-1)  # (n,)
+        r_term = r_term.squeeze(-1)          # (n,) pooled imagined reward
         score = r_term + q_term
 
         # TERM ATTRIBUTION. The ranking is decided by whichever term VARIES
-        # across the n candidates, not by whichever is larger. If
-        # r_term_std is ~0 while q_term_std is large, this arm is not
-        # "world model scoring" at all -- it is the critic evaluated on a
-        # DECODED state, and the world model contributes nothing to the
-        # ordering. term_r_share is the reward term's share of the total
-        # spread; near 0 means model reward is irrelevant to the pick.
+        # across the n candidates, not by whichever is larger. If r_term_std
+        # is ~0 while q_term_std is large, this arm is not "model reward
+        # scoring" at all -- it is a latent value function, and the reward
+        # head contributes nothing to the ordering. term_r_share is the
+        # reward term's share of the total spread; near 0 means model reward
+        # is irrelevant to the pick.
         r_std = float(r_term.std().item())
         q_std = float(q_term.std().item())
         self._acc('term_r_std', r_std)
@@ -198,7 +143,7 @@ class ChunkSelector:
                   float(int(torch.argmax(r_term).item())
                         == int(torch.argmax(score).item())))
         # Would ranking by the Q term ALONE pick the same chunk? Near 1.0
-        # means the pick is entirely Q(decoded end state).
+        # means the pick is entirely the latent value.
         self._acc('term_q_only_agree',
                   float(int(torch.argmax(q_term).item())
                         == int(torch.argmax(score).item())))

@@ -2,8 +2,6 @@ import os
 import requests
 import numpy as np
 import ogbench
-import jax.numpy as jnp
-import elements
 
 class OGBenchMethods:
     """
@@ -318,49 +316,6 @@ class OGBenchMethods:
         return out
 
     @staticmethod
-    def sample_jax_dreamer_batch(
-        episodes,
-        batch_size: int,
-        seq_len: int,
-        obs_key: str = "state",
-        action_key: str = "action",
-        rng: np.random.Generator | None = None,
-        force_reset_at_chunk_start: bool = True,
-    ):
-        batch = OGBenchMethods.sample_dreamer_batch(
-            episodes=episodes,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            obs_key=obs_key,
-            action_key=action_key,
-            rng=rng,
-            force_reset_at_chunk_start=force_reset_at_chunk_start,
-        )
-
-        return OGBenchMethods.to_jax(batch)
-
-    @staticmethod
-    def make_spaces(obs_dim: int, action_dim: int, obs_key: str = "state", action_key: str = "action"):
-        """
-        Creates obs_space and act_space matching the flat batch, 
-        used for initializing Dreamer agent or the RSSM
-        """
-
-        obs_space = {
-            obs_key: elements.Space(np.float32, (obs_dim,)),
-            "reward": elements.Space(np.float32, ()),
-            "is_first": elements.Space(bool, (), 0, 2),
-            "is_last": elements.Space(bool, (), 0, 2),
-            "is_terminal": elements.Space(bool, (), 0, 2),
-        }
-
-        act_space = {
-            action_key: elements.Space(np.float32, (action_dim,)),
-        }
-
-        return obs_space, act_space
-
-    @staticmethod
     def print_summary(dataset: dict, episodes=None, obs_key: str = "state"):
         obs_dim = dataset["observations"].shape[-1]
         action_dim = dataset["actions"].shape[-1]
@@ -376,18 +331,3 @@ class OGBenchMethods:
             print(f"min length:  {lengths.min()}")
             print(f"mean length: {lengths.mean():.1f}")
             print(f"max length:  {lengths.max()}")
-    
-    @staticmethod
-    def to_jax(batch: dict): # Converts numpy batch to jax arrays
-        out = {}
-        for k, v in batch.items():
-            if v.dtype == np.bool_:
-                out[k] = jnp.asarray(v, dtype=bool)
-            elif v.dtype == np.uint8:
-                out[k] = jnp.asarray(v, dtype=jnp.uint8)
-            elif v.dtype == np.int32:
-                out[k] = jnp.asarray(v, dtype=jnp.int32)
-            else:
-                out[k] = jnp.asarray(v, dtype=jnp.float32)
-
-        return out
