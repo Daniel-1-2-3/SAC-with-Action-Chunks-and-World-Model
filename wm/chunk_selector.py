@@ -174,7 +174,34 @@ class ChunkSelector:
 
         end_obs = decode_obs(self.bridge, carry, self.obs_key, self.device)
         end_v = self.policy.chunk_target_values(end_obs)
-        score = (score + disc * end_v).squeeze(-1) # (n,)
+        q_term = (disc * end_v).squeeze(-1)   # (n,)
+        r_term = score.squeeze(-1)            # (n,) pooled imagined reward
+        score = r_term + q_term
+
+        # TERM ATTRIBUTION. The ranking is decided by whichever term VARIES
+        # across the n candidates, not by whichever is larger. If
+        # r_term_std is ~0 while q_term_std is large, this arm is not
+        # "world model scoring" at all -- it is the critic evaluated on a
+        # DECODED state, and the world model contributes nothing to the
+        # ordering. term_r_share is the reward term's share of the total
+        # spread; near 0 means model reward is irrelevant to the pick.
+        r_std = float(r_term.std().item())
+        q_std = float(q_term.std().item())
+        self._acc('term_r_std', r_std)
+        self._acc('term_q_std', q_std)
+        self._acc('term_r_share', r_std / (r_std + q_std + 1e-8))
+        self._acc('term_r_absmean', float(r_term.abs().mean().item()))
+        self._acc('term_q_absmean', float(q_term.abs().mean().item()))
+        # Would ranking by imagined reward ALONE pick the same chunk as the
+        # full score? Near 1.0 means the reward term drives the pick.
+        self._acc('term_r_only_agree',
+                  float(int(torch.argmax(r_term).item())
+                        == int(torch.argmax(score).item())))
+        # Would ranking by the Q term ALONE pick the same chunk? Near 1.0
+        # means the pick is entirely Q(decoded end state).
+        self._acc('term_q_only_agree',
+                  float(int(torch.argmax(q_term).item())
+                        == int(torch.argmax(score).item())))
 
         idx = int(torch.argmax(score).item())
         self._acc('score_gap', (score[idx] - score.mean()).item())
