@@ -1,26 +1,24 @@
 import os
-os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false') # Don't let JAX hog the GPU before torch inits
 os.environ.setdefault('MUJOCO_GL', 'egl') # Headless for video rendering
 
 import pathlib
 import time
 import elements
-import jax
 import numpy as np
 import ruamel.yaml as yaml
 import torch
 import wandb
 import ogbench
 
-from dreamer.wm_agent import WorldModelAgent
-from dreamer.wm_bridge import WorldModelBridge
 from sac_chunked.sac_chunk_agent import ChunkAgent
 from helpers.sac_wm_utils import set_seed_everywhere
 from sac_chunked.chunk_utils import real_chunk_transitions
 from sac_chunked.evaluation_chunk import eval_chunk_in_env, EvalCSV
-from sac_chunked.wm_diagnostics import wm_report, print_wm_report
+from tdmpc.agent import TDMPC2Model
+from tdmpc.data import latent_rollout_windows
+from tdmpc.diagnostics import model_report, print_wm_report
 from wm.chunk_selector import ChunkSelector
-from helpers.interop import numeric_metrics, unwrap
+from helpers.interop import numeric_metrics
 from helpers.ogbench_methods import OGBenchMethods
 from helpers.online_replay import OnlineReplay
 
@@ -39,62 +37,41 @@ def load_config(folder, argv=None):
     config = elements.Flags(config).parse(other)
     return config
 
-def build_agent_config(config, batch_size, seq_len, logdir):
-    return elements.Config(
-        **config.agent,
-        logdir=str(logdir),
-        seed=config.seed,
-        jax=config.jax,
-        batch_size=batch_size,
-        batch_length=seq_len,
-        replay_context=0,
-        report_length=seq_len,
-        replica=0,
-        replicas=1,
-    )
-
 def build_real_env(env_name, load_offline_dataset):
     if load_offline_dataset:
         return OGBenchMethods.load_ogbench(env_name)
     env = ogbench.make_env_and_datasets(env_name, env_only=True)
     return env, None, None
 
-def _param_norm(params):
-    """ Norm over FLOATING-POINT leaves only. tree_leaves(params) also returns
-        integer counters, and squaring those made the reported norm move for
-        reasons unrelated to the weights. """
-    leaves = [x for x in jax.tree_util.tree_leaves(params)
-              if hasattr(x, 'dtype')
-              and jax.numpy.issubdtype(x.dtype, jax.numpy.floating)]
-    if not leaves:
-        return float('nan')
-    squares = [jax.numpy.sum(jax.numpy.square(x)) for x in leaves]
-    total = jax.numpy.sum(jax.numpy.stack(squares))
-    return float(jax.device_get(total)) ** 0.5
-
 def _prefixed(d, default_prefix):
     return {k if '/' in k else f'{default_prefix}/{k}': v for k, v in d.items()}
 
-def _wm_update(wm_agent, replay, batch_size, seq_len, rng, global_step):
-    """ DreamerV3 world-model update on real replay sequences. The ONLY
-        consumers of this model are the ChunkSelector (action scoring) and
-        the wm_report diagnostics -- critic and actor training never touch
-        it. Co-trained so the model keeps tracking the state distribution the
+def _model_update(model, replay, batch_size, seq_len, tdmpc_config, device, rng,
+                  metrics_on=True):
+    """ TD-MPC2 joint update on real replay windows: latent consistency,
+        reward, value, then the policy prior.
+
+        The ONLY consumers of this model are the ChunkSelector (chunk scoring)
+        and the diagnostics -- the QC-FQL critic and actor never touch it.
+        Co-trained so the model keeps tracking the state distribution the
         policy is currently visiting. """
     batch_np = replay.sample_batch(batch_size, seq_len, rng=rng)
-    batch = OGBenchMethods.to_jax(batch_np)
-    batch.pop('discount', None)
-    batch['seed'] = wm_agent._seeds(global_step, wm_agent.train_mirrored)
-    wm_carry = wm_agent.init_train(batch_size)
-    wm_carry, outs, wm_mets = wm_agent.train(wm_carry, batch)
-    return wm_mets
+    w = latent_rollout_windows(batch_np, tdmpc_config.horizon,
+                               obs_key=OBS_KEY, action_key=ACTION_KEY)
+    if w is None or len(w['obs']) == 0:
+        return {}
+    take = min(tdmpc_config.batch_size, len(w['obs']))
+    sel = rng.choice(len(w['obs']), size=take, replace=False)
+    to = lambda x: torch.as_tensor(x[sel], device=device).float()
+    return model.update(to(w['obs']), to(w['action']), to(w['reward']),
+                        to(w['mask']), to(w['valid']), metrics_on=metrics_on)
 
 def _agent_update(policy, replay, wm_batch, seq_len, chunk_config,
                   chunk_len, device, rng, gamma, gamma_h, metrics_on=True):
-    """ Plain QC-FQL on real replay chunks. Deliberately takes no bridge and
-        no world-model argument: the training path CANNOT touch the model, by
-        signature. The world model influences this run only through which
-        chunks the ChunkSelector chose to execute -- i.e. through the data.
+    """ Plain QC-FQL on real replay chunks. Deliberately takes no model
+        argument: the training path CANNOT touch the latent model, by
+        signature. The model influences this run only through which chunks the
+        ChunkSelector chose to execute -- i.e. through the data.
 
             target = R_real + gamma^h * mask * Q(s_next) """
     batch_np = replay.sample_batch(wm_batch, seq_len, rng=rng)
@@ -106,14 +83,14 @@ def _agent_update(policy, replay, wm_batch, seq_len, chunk_config,
     take = min(chunk_config.batch_size, len(data['idx']))
     sel = rng.choice(len(data['idx']), size=take, replace=False)
 
-    to = lambda x: torch.as_tensor(x, device=device).float()
-    obs = to(data['obs'][sel])
-    next_obs = to(data['next_obs'][sel])
-    chunk = to(data['chunk'][sel])
-    real_reward = to(data['reward'][sel])
-    real_mask = to(data['mask'][sel])
-    valid = to(data['valid'][sel])
-    step_valid = to(data['step_valid'][sel])
+    to = lambda x: torch.as_tensor(x[sel], device=device).float()
+    obs = to(data['obs'])
+    next_obs = to(data['next_obs'])
+    chunk = to(data['chunk'])
+    real_reward = to(data['reward'])
+    real_mask = to(data['mask'])
+    valid = to(data['valid'])
+    step_valid = to(data['step_valid'])
 
     with torch.no_grad():
         target = real_reward + gamma_h * real_mask * \
@@ -144,7 +121,7 @@ def _agent_update(policy, replay, wm_batch, seq_len, chunk_config,
 
 def train(config):
     general_config = config.train_sac_chunked_wm.general
-    dreamer_config = config.train_sac_chunked_wm.dreamer
+    tdmpc_config = config.train_sac_chunked_wm.tdmpc
     chunk_config = config.train_sac_chunked_wm.chunk
 
     out_dir = pathlib.Path(general_config.out_dir)
@@ -159,22 +136,24 @@ def train(config):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # TF32 tensor cores for fp32 matmuls; off by default in torch. Large free
-    # speedup on Ampere+, at a precision loss irrelevant beside the RSSM's own
-    # sampling noise.
+    # speedup on Ampere+, at a precision loss irrelevant beside the model's
+    # own prediction error.
     torch.set_float32_matmul_precision('high')
     rng = np.random.default_rng(config.seed)
     set_seed_everywhere(config.seed)
-    print(f'PyTorch device: {device} | JAX devices: {jax.devices()}')
+    print(f'PyTorch device: {device}')
     if select_n > 1:
         print(f'Model-scored chunk selection: best-of-{select_n} at every '
-              f'chunk boundary | training is plain QC-FQL, the model only '
-              f'picks which chunk runs')
+              f'chunk boundary | training is plain QC-FQL, the TD-MPC2 model '
+              f'only picks which chunk runs')
+        print(f'  lookahead {chunk_config.select_rollout_chunks} chunk(s) = '
+              f'{chunk_config.select_rollout_chunks * chunk_len} latent steps, '
+              f'no decode anywhere')
     else:
-        print('select_n<=1: world model NOT used for action selection. This '
-              'run is plain QC-FQL and should track the no-world-model arm.')
-    print(f'wm report: {chunk_config.wm_diag_states} windows x '
-          f'{chunk_config.wm_diag_samples} prior draws at depth '
-          f'{chunk_config.wm_diag_depth}, offline against replay, 0 env steps')
+        print('select_n<=1: latent model NOT used for action selection. This '
+              'run is plain QC-FQL and should track the no-model arm.')
+    print(f'wm report: {tdmpc_config.diag_windows} replay windows at depth '
+          f'{tdmpc_config.diag_depth} chunk(s), offline, 0 env steps')
     wandb.init(project=general_config.wandb_project, mode=general_config.wandb_mode,
                name=(general_config.run_name or None), config=config.flat)
 
@@ -183,24 +162,24 @@ def train(config):
 
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
-    obs_space, act_space = OGBenchMethods.make_spaces(obs_dim, action_dim, OBS_KEY, ACTION_KEY)
 
-    agent_config = build_agent_config(config, wm_batch, seq_len, out_dir / 'wm_ckpts')
-    wm_agent = WorldModelAgent(obs_space, act_space, agent_config)
-    if general_config.wm_ckpt:
-        print(f'Loading world model checkpoint: {general_config.wm_ckpt}')
-        raw = np.load(general_config.wm_ckpt, allow_pickle=True)
-        wm_agent.load({k: unwrap(raw[k]) for k in raw.files})
-    bridge = WorldModelBridge(wm_agent, ACTION_KEY, obs_key=OBS_KEY)
-
-    replay = OnlineReplay(obs_key=OBS_KEY, action_key=ACTION_KEY, max_episodes=dreamer_config.max_episodes)
+    replay = OnlineReplay(obs_key=OBS_KEY, action_key=ACTION_KEY,
+                          max_episodes=tdmpc_config.max_episodes)
     if train_dataset is not None:
         offline_episodes = OGBenchMethods.make_dreamer_episodes(
             train_dataset, min_length=seq_len, obs_key=OBS_KEY, action_key=ACTION_KEY)
         replay.seed_from_offline(offline_episodes, rng=rng)
         print(f'Seeded replay buffer with {len(replay.offline_episodes)} offline episodes')
 
-    # repr_dim is the RAW observation dim. The world model never sits between
+    # TD-MPC2 latent model: encoder -> latent, dynamics in latent, reward head
+    # and Q both reading the latent. Nothing decodes back to observation
+    # space. Scoring only.
+    model = TDMPC2Model(obs_dim, action_dim, device, tdmpc_config, gamma)
+    if general_config.model_ckpt:
+        print(f'Loading latent model checkpoint: {general_config.model_ckpt}')
+        model.load_state_dict_all(torch.load(general_config.model_ckpt, map_location=device))
+
+    # repr_dim is the RAW observation dim. The latent model never sits between
     # the environment and the policy's INPUT; it only scores candidate chunks
     # inside the selector.
     policy = ChunkAgent(
@@ -212,20 +191,18 @@ def train(config):
         compile_nets=chunk_config.compile_nets,
     )
     selector = ChunkSelector(
-        bridge, policy, action_dim, chunk_len, select_n, gamma, device,
-        obs_key=OBS_KEY, reward_shift=chunk_config.reward_shift,
-        rollout_chunks=chunk_config.select_rollout_chunks)
+        model, policy, action_dim, chunk_len, select_n, gamma, device,
+        score_mode='model', rollout_chunks=chunk_config.select_rollout_chunks)
 
-    eval_csv = EvalCSV(out_dir / 'eval_log.csv', arm='world_model_select',
+    eval_csv = EvalCSV(out_dir / 'eval_log.csv', arm='latent_model_select',
                        env_name=general_config.env_name, seed=config.seed, chunk_len=chunk_len)
     eef_slice = tuple(chunk_config.eef_slice)
     start_time = time.time()
 
     def run_eval(step, n_updates):
         results = eval_chunk_in_env(
-            env, None, policy, action_dim, general_config.eval_episodes,
-            device, OBS_KEY, chunk_len, eef_slice=eef_slice, record_video=True,
-            selector=selector)
+            env, policy, general_config.eval_episodes, OBS_KEY, chunk_len,
+            eef_slice=eef_slice, record_video=True, selector=selector)
         print(f'step {step:7d} | return {results["mean_return"]:.2f} | '
               f'success {results["success_rate"]:.2f} | coherence {results["coherence"]:.4f}')
         eval_csv.append(step, n_updates, time.time() - start_time, results)
@@ -235,14 +212,12 @@ def train(config):
             'eval/coherence': results['coherence'],
             'eval/mean_episode_len': results['mean_episode_len'],
         }
-        if chunk_config.wm_diag_states > 0 and select_n > 1:
-            wm_m = wm_report(
-                bridge, replay, chunk_config, chunk_len,
-                chunk_config.wm_diag_depth, gamma, device, rng, wm_batch,
-                seq_len, obs_key=OBS_KEY, action_key=ACTION_KEY,
-                num_states=chunk_config.wm_diag_states,
-                model_samples=chunk_config.wm_diag_samples)
-            print_wm_report(wm_m, chunk_config.wm_diag_depth)
+        if tdmpc_config.diag_windows > 0 and select_n > 1:
+            wm_m = model_report(
+                model, policy, replay, chunk_len, tdmpc_config.diag_depth,
+                gamma, device, rng, wm_batch, seq_len, obs_key=OBS_KEY,
+                action_key=ACTION_KEY, num_windows=tdmpc_config.diag_windows)
+            print_wm_report(wm_m, tdmpc_config.diag_depth)
             # numeric_metrics ONLY on the diagnostics -- it does float(v) and
             # silently drops anything non-numeric, which would throw away the
             # wandb.Video object below. Filter here, never the whole log_dict.
@@ -257,8 +232,10 @@ def train(config):
         if not replay.ready(seq_len):
             continue
         metrics = {}
-        if i % dreamer_config.train_every == 0:
-            metrics.update(_prefixed(_wm_update(wm_agent, replay, wm_batch, seq_len, rng, i), 'wm'))
+        if i % tdmpc_config.train_every == 0:
+            metrics.update(_prefixed(_model_update(
+                model, replay, wm_batch, seq_len, tdmpc_config, device, rng,
+                metrics_on=(i % general_config.log_every == 0)), 'wm'))
         if i % chunk_config.train_every == 0:
             m = _agent_update(policy, replay, wm_batch, seq_len, chunk_config,
                               chunk_len, device, rng, gamma, gamma_h,
@@ -267,7 +244,7 @@ def train(config):
                 metrics.update(m)
                 n_updates += 1
         if metrics and i % general_config.log_every == 0:
-            metrics['diagnosis/wm_param_norm'] = _param_norm(wm_agent.params)
+            metrics['diagnosis/wm_param_norm'] = model.param_norm()
             metrics['diagnosis/gradient_updates'] = n_updates
             metrics['diagnosis/phase'] = 0
             wandb.log(numeric_metrics(metrics), step=i)
@@ -279,7 +256,6 @@ def train(config):
         print(f'Offline phase done: {n_updates} policy updates')
 
     obs, info = env.reset(seed=config.seed)
-    selector.reset()
     chunk_buffer = None
     chunk_pos = chunk_len
     global_step = 0
@@ -287,7 +263,6 @@ def train(config):
 
     while global_step < general_config.num_online_steps:
         state = np.asarray(obs, dtype=np.float32).reshape(-1)
-        selector.observe(state)
 
         if global_step < general_config.num_seed_steps and offline_steps == 0:
             action = env.action_space.sample()
@@ -304,13 +279,11 @@ def train(config):
         env_action = ENV_ACTION_LOW + (action + 1.0) * 0.5 * (ENV_ACTION_HIGH - ENV_ACTION_LOW)
         next_obs, reward, terminated, truncated, info = env.step(env_action)
         replay.add_step(state, action, reward, np.asarray(next_obs, dtype=np.float32), terminated, truncated)
-        selector.record_action(action)
 
         done = bool(terminated or truncated)
         obs = next_obs
         if done:
             obs, info = env.reset()
-            selector.reset()
             chunk_pos = chunk_len
 
         global_step += 1
@@ -318,9 +291,10 @@ def train(config):
         metrics = {}
         ready = replay.ready(seq_len)
 
-        if ready and global_step % dreamer_config.train_every == 0:
-            metrics.update(_prefixed(
-                _wm_update(wm_agent, replay, wm_batch, seq_len, rng, log_step), 'wm'))
+        if ready and global_step % tdmpc_config.train_every == 0:
+            metrics.update(_prefixed(_model_update(
+                model, replay, wm_batch, seq_len, tdmpc_config, device, rng,
+                metrics_on=(global_step % general_config.log_every == 0)), 'wm'))
 
         if (ready and global_step % chunk_config.train_every == 0
                 and global_step >= general_config.start_training):
@@ -332,7 +306,7 @@ def train(config):
                 n_updates += 1
 
         if metrics and global_step % general_config.log_every == 0:
-            metrics['diagnosis/wm_param_norm'] = _param_norm(wm_agent.params)
+            metrics['diagnosis/wm_param_norm'] = model.param_norm()
             metrics['diagnosis/replay_transitions'] = len(replay)
             metrics['diagnosis/gradient_updates'] = n_updates
             metrics['diagnosis/phase'] = 1
@@ -346,16 +320,14 @@ def train(config):
         if global_step % general_config.eval_every == 0:
             run_eval(log_step, n_updates)
             obs, info = env.reset()
-            selector.reset()
             chunk_pos = chunk_len
 
         if global_step % general_config.save_every == 0:
             torch.save(policy.state_dict_all(), out_dir / 'chunk_latest.pt')
-            wm_cp = elements.Checkpoint(out_dir / 'wm_latest.pkl')
-            wm_cp.agent = wm_agent
-            wm_cp.save()
+            torch.save(model.state_dict_all(), out_dir / 'model_latest.pt')
 
     torch.save(policy.state_dict_all(), out_dir / 'chunk_final.pt')
+    torch.save(model.state_dict_all(), out_dir / 'model_final.pt')
     env.close()
     wandb.finish()
     print('Finish training')
@@ -366,5 +338,5 @@ if __name__ == '__main__':
     train(_config)
 
 # python train_sac_chunked_wm.py --train_sac_chunked_wm.general.env_name=cube-triple-play-singletask-v0
-# control run (world model unused for selection)
+# control run (latent model unused for selection)
 # python train_sac_chunked_wm.py --train_sac_chunked_wm.chunk.select_n=1
