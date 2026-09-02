@@ -45,3 +45,15 @@ python train_sac_chunked_optimistic.py --general.run_name=optimistic_s1 --genera
 python toy/race.py --arms critic ranking mve explore optimistic --seeds 0 1 --parallel 3 --threads 1
 # any single arm on the toy task:
 python train_sac_chunked_mve.py --configs toy --seed=0
+
+# ---- HARD TASK, seed 0 only: cube-quadruple ---------------------------------
+# Four cubes, 1000-step episodes, rewards in {-4..0}. QC-FQL gets little
+# online success here and exploration is the bottleneck, which is the
+# regime the model arms are built for. alpha=100 is QC's value for
+# quadruple; it is passed to EVERY arm so the policy stays the controlled
+# variable.
+python train_sac_chunked.py         --general.env_name=cube-quadruple-play-singletask-v0 --chunk.alpha=100 --general.run_name=quad_control_s0 --general.out_dir=runs/quad_control_s0 --seed=0
+python train_sac_chunked_mve.py     --general.env_name=cube-quadruple-play-singletask-v0 --chunk.alpha=100 --general.run_name=quad_mve_s0     --general.out_dir=runs/quad_mve_s0     --mve.weight=0.5 --mve.chunks=1 --seed=0
+python train_sac_chunked_explore.py --general.env_name=cube-quadruple-play-singletask-v0 --chunk.alpha=100 --general.run_name=quad_explore_s0 --general.out_dir=runs/quad_explore_s0 --explore.beta=1.0 --explore.num_dyn=5 --seed=0
+# plain QC-FQL floor (no selection at all), if wanted:
+python train_sac_chunked.py         --general.env_name=cube-quadruple-play-singletask-v0 --chunk.alpha=100 --general.run_name=quad_qcfql_s0 --general.out_dir=runs/quad_qcfql_s0 --chunk.select_n=1 --seed=0
