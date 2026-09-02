@@ -27,8 +27,20 @@ class ChunkTransitionReplay:
         episode ends, which on a cube task is exactly where completions are. """
 
     def __init__(self, obs_dim, action_dim, chunk_len, capacity=1_000_000,
-                 success_reward_thresh=-1.0):
+                 success_reward_thresh=-1.0, online_frac=0.0):
         self.capacity = int(capacity)
+        # Balanced sampling. online_frac of every batch's start indices are
+        # drawn from the ONLINE region of the buffer (indices >= the offline
+        # seed size), the rest uniformly from the whole buffer. 0.0 = plain
+        # uniform, which with a 5M-transition offline seed and ~150k online
+        # transitions means the learners barely see what the arm collected.
+        # Applies to sample_chunks and the model window sampler alike.
+        self.online_frac = float(online_frac)
+        self.offline_size = 0
+        # Fraction of the LAST batch's starts that fell in the online region
+        # (all of them counted, including the uniform share). Logged as
+        # replay/online_batch_frac.
+        self.last_online_frac = 0.0
         self.action_dim = action_dim
         self.chunk_len = chunk_len
         # -1.0 is the sparse "no progress" baseline on the cube tasks; any
@@ -92,6 +104,7 @@ class ChunkTransitionReplay:
         self.mask[sl] = mk[:n]
         self.terminal[sl] = term[:n].astype(np.float32).reshape(-1, 1)
         self.idx = n % self.capacity
+        self.offline_size = n
         if n >= self.capacity:
             self.full = True
 
@@ -105,6 +118,26 @@ class ChunkTransitionReplay:
                 ep_ok = False
         return n
 
+    def _starts(self, batch_size, span, rng, online_frac=None):
+        """ Start indices for `span`-long windows. online_frac of them from
+            the online region [offline_size, size - span], the rest uniform
+            over [0, size - span]. Falls back to uniform when the online
+            region has no room for a window yet. """
+        size = len(self)
+        frac = self.online_frac if online_frac is None else float(online_frac)
+        hi = size - span + 1
+        n_on = int(round(batch_size * frac))
+        lo_on = self.offline_size
+        if n_on > 0 and lo_on < hi:
+            on = rng.integers(lo_on, hi, size=n_on)
+            uni = rng.integers(0, hi, size=batch_size - n_on)
+            starts = np.concatenate([on, uni])
+        else:
+            starts = rng.integers(0, hi, size=batch_size)
+        self.last_online_frac = float((starts >= self.offline_size).mean()) \
+            if self.offline_size < size else 0.0
+        return starts
+
     # ------------------------------------------------------------ QC-FQL rows
 
     def sample_chunks(self, batch_size, device, rng, gamma):
@@ -116,7 +149,7 @@ class ChunkTransitionReplay:
         size = len(self)
         if size <= h:
             return None
-        starts = rng.integers(0, size - h + 1, size=batch_size)
+        starts = self._starts(batch_size, h, rng)
         window = starts[:, None] + np.arange(h)[None, :]
 
         rewards = self.reward[window, 0]
@@ -145,18 +178,20 @@ class ChunkTransitionReplay:
             'valid': to(step_valid_np(terminals))[..., None],  # (B, H, 1)
         }
 
-    def sample_model_windows(self, batch_size, horizon, device, rng):
+    def sample_model_windows(self, batch_size, horizon, device, rng,
+                             online_frac=None):
         """ Consecutive single-step transitions for the latent model:
             obs_t, next_obs_t, a_t, r_t for t in [start, start+horizon).
 
             next_obs is each transition's OWN next observation, so the
             consistency target is right even at an episode boundary (the
-            steps after it are masked by `valid`). Same uniform-start,
-            mask-don't-reject rule as sample_chunks. """
+            steps after it are masked by `valid`). Same start rule and
+            mask-don't-reject rule as sample_chunks; online_frac overrides
+            the buffer's setting (diagnostics pass 0.0 to stay uniform). """
         size = len(self)
         if size < horizon:
             return None
-        starts = rng.integers(0, size - horizon + 1, size=batch_size)
+        starts = self._starts(batch_size, horizon, rng, online_frac)
         return self._windows(starts, horizon, device)
 
     def sample_reward_windows(self, batch_size, horizon, device, rng):

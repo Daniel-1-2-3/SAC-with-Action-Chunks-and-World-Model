@@ -205,7 +205,8 @@ def run(config, arm_cls):
     # offline data is never evicted once online transitions arrive.
     dataset_size = len(train_dataset['observations']) if train_dataset is not None else 0
     capacity = max(chunk.replay_capacity, dataset_size + general.num_online_steps + 1)
-    replay = ChunkTransitionReplay(obs_dim, action_dim, chunk_len, capacity=capacity)
+    replay = ChunkTransitionReplay(obs_dim, action_dim, chunk_len, capacity=capacity,
+                                   online_frac=chunk.online_frac)
     if train_dataset is not None:
         n = replay.seed_from_offline(train_dataset)
         print(f'Seeded replay with {n} offline transitions '
@@ -350,6 +351,7 @@ def run(config, arm_cls):
             metrics['replay/success_frac_total'] = s['total_frac']
             metrics['replay/success_frac_online'] = s['online_frac']
             metrics['replay/success_episodes_online'] = s['online_success']
+            metrics['replay/online_batch_frac'] = replay.last_online_frac
             log(numeric_metrics(metrics), log_step)
 
         if global_step % general.eval_every == 0:

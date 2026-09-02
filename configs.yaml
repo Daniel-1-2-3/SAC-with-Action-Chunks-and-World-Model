@@ -63,6 +63,14 @@ defaults:
     # Floor only -- raised at runtime to max(., offline_size + online + 1)
     # so offline data is never evicted (main.py's max(buffer_size, size+1)).
     replay_capacity: 1000000
+    # Balanced replay sampling, EVERY arm: this fraction of each batch's
+    # start indices (critic/actor chunks AND the model's windows) is drawn
+    # from the online region of the buffer, the rest from the whole buffer.
+    # 0.0 = QC's plain uniform sampling. With a 5M offline seed and ~150k
+    # online transitions at 400k steps, uniform sampling shows the learners
+    # ~3% online data, so two arms' different collections look the same to
+    # them. Logged as replay/online_batch_frac.
+    online_frac: 0.0
     gamma: 0.99
     lr: 3e-4
     hidden_dim: 512
