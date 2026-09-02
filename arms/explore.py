@@ -1,20 +1,24 @@
 """ EXPLORE arm: critic best-of-N with an uncertainty-scaled novelty bonus.
 
-    The CONTROL ranks candidates by the critic. This arm adds, per candidate,
+    The CONTROL ranks candidates by the critic. This arm adds, per candidate
+    (bonus_scale=spread, the default),
 
-        beta * s_i * nu_i
+        beta * g * sigma_Q * s~_i * nu_i
 
-    s_i  = the critic's own uncertainty about candidate i (std across its
-           ensemble heads, in Q units)
-    nu_i = latent-model novelty of candidate i's imagined path, clamped to
-           [0, 1] (dynamics-ensemble disagreement relative to the data's,
-           Pathak et al. 2019)
+    sigma_Q = spread of the critic's values across the n candidates
+    s~_i    = the critic's relative doubt about candidate i (its ensemble
+              std over the mean ensemble std, clamped to [0, 1])
+    nu_i    = latent-model novelty of candidate i's imagined path, clamped
+              to [0, nu_cap] (dynamics-ensemble disagreement relative to the
+              data's, Pathak et al. 2019)
+    g       = learning-progress gate in [0, 1]: 1 while real online returns
+              are flat, -> 0 while they improve, so exploration switches
+              itself off when plain learning is working
 
-    so novelty is measured in units of the critic's error bar and can never
-    move a pick by more than beta of it. When the critic is sure (heads
-    agree), the bonus is zero and this arm IS the control; when it is not
-    (states it has never valued), novelty picks. No threshold, no schedule --
-    the critic's convergence is the anneal. beta=0 is exactly the control.
+    so the bonus is bounded by beta * g * sigma_Q * nu_cap: novelty can
+    reorder candidates the critic rates within about beta spreads of each
+    other and never overrides a clear critic preference. beta=0 is exactly
+    the control. bonus_scale=unc reproduces the earlier beta * s_i * nu_i.
 
     Comparison partner: the CONTROL arm (train_sac_chunked.py). The two
     differ only in beta. The latent model trains as in the ranking arm but is
@@ -43,7 +47,11 @@ class ExploreArm(RankingArm):
                              bonus_beta=self.arm_cfg.beta,
                              novelty='none' if self.arm_cfg.novelty == 'none' else 'model',
                              novelty_at=self.arm_cfg.novelty_at,
-                             nu_cap=self.arm_cfg.nu_cap)
+                             nu_cap=self.arm_cfg.nu_cap,
+                             bonus_scale=self.arm_cfg.bonus_scale,
+                             progress_gate=self.arm_cfg.progress_gate,
+                             progress_window=self.arm_cfg.progress_window,
+                             progress_tau=self.arm_cfg.progress_tau)
 
     def log_extra(self):
         out = super().log_extra()
@@ -54,6 +62,8 @@ class ExploreArm(RankingArm):
 
     def describe(self):
         c = self.arm_cfg
+        gate = (f'progress gate W={c.progress_window} tau={c.progress_tau}'
+                if c.progress_gate else 'no progress gate')
         return (f'{self.name}: critic best-of-{self.chunk.select_n} + '
                 f'{c.num_dyn}-head novelty[{c.novelty}@{c.novelty_at}, cap {c.nu_cap}] '
-                f'scaled by critic uncertainty, beta {c.beta}')
+                f'bonus_scale={c.bonus_scale}, beta {c.beta}, {gate}')

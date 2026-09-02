@@ -53,7 +53,9 @@ class ChunkSelector:
 
     def __init__(self, model, policy, action_dim, chunk_len, n, gamma, device,
                  score_mode='model', rollout_chunks=1, bonus_beta=0.0,
-                 novelty='model', novelty_at='path', nu_cap=1.0):
+                 novelty='model', novelty_at='path', nu_cap=1.0,
+                 bonus_scale='spread', progress_gate=True, progress_window=20,
+                 progress_tau=0.2):
         """ model: a TDMPC2Model, or None in critic mode.
             rollout_chunks (model mode): imagine this many chunks ahead. The
             first is the candidate; each further chunk's actions come from the
@@ -85,11 +87,24 @@ class ChunkSelector:
         #               'end'    disagreement at the final imagined latent
         #                        only (outcome, not motion)
         #   nu_cap      clamp ceiling on nu; bonus <= beta * s_i * nu_cap
+        #   bonus_scale 'unc'    v3: bonus = beta * s_i * nu_i (g ignored)
+        #               'spread' v4: bonus = beta * g * sigma_Q * s~_i * nu_i
+        #   progress_gate / progress_window / progress_tau: the learning-
+        #               progress gate g, see report_episode_return.
         assert novelty in ('model', 'none'), novelty
         assert novelty_at in ('path', 'end'), novelty_at
+        assert bonus_scale in ('unc', 'spread'), bonus_scale
         self.novelty = novelty
         self.novelty_at = novelty_at
         self.nu_cap = float(nu_cap)
+        self.bonus_scale = bonus_scale
+        self.progress_gate = bool(progress_gate)
+        self.progress_window = int(progress_window)
+        self.progress_tau = float(progress_tau)
+        self._returns = []          # real ONLINE episode returns, in order
+        self._g = 1.0               # gate value in use (EMA-smoothed)
+        self._g_raw = 1.0
+        self._frac = 0.5
         self.model = model
         self.policy = policy
         self.action_dim = action_dim
@@ -103,6 +118,36 @@ class ChunkSelector:
     def _acc(self, key, value):
         s, c = self._stats.get(key, (0.0, 0))
         self._stats[key] = (s + float(value), c + 1)
+
+    def report_episode_return(self, ep_return):
+        """ Learning-progress gate. Call once per finished REAL online
+            episode (never for eval episodes). With W = progress_window:
+
+                recent = last W returns, older = the W before those
+                frac   = fraction of recent strictly above median(older)
+                g      = 1 - 2 * max(frac - 0.5, 0)
+
+            Flat or plateaued returns give frac ~ 0.5 -> g = 1 (explore).
+            Improving returns give frac -> 1 -> g -> 0 (become the control).
+            Fewer than 2W episodes -> g = 1. g is EMA-smoothed with
+            progress_tau. With progress_gate off, g is identically 1. """
+        self._returns.append(float(ep_return))
+        if not self.progress_gate:
+            return
+        W = self.progress_window
+        if len(self._returns) < 2 * W:
+            return
+        recent = np.asarray(self._returns[-W:])
+        older = np.asarray(self._returns[-2 * W:-W])
+        frac = float((recent > np.median(older)).mean())
+        g = 1.0 - 2.0 * max(frac - 0.5, 0.0)
+        self._frac = frac
+        self._g_raw = g
+        self._g = (1.0 - self.progress_tau) * self._g + self.progress_tau * g
+
+    @property
+    def gate(self):
+        return self._g if self.progress_gate else 1.0
 
     def pop_stats(self):
         """ Means since the last pop, prefixed select/. Empty when disabled or
@@ -241,7 +286,24 @@ class ChunkSelector:
 
     def _select_uncertainty_scaled(self, feat_n, cands, qs, critic_score):
         """ EXPLORE arm. The critic ranks; novelty may only move the pick by
-            as much as the critic is unsure of its own numbers:
+            a bounded amount.
+
+            bonus_scale 'spread' (v4):
+
+                score_i = Q_i + beta * g * sigma_Q * s~_i * nu_i
+
+            sigma_Q  population std of Q_i across the n candidates (Q units)
+            s~_i     relative critic doubt clamp(s_i / mean_j s_j, 0, 1)
+            g        learning-progress gate in [0, 1], see
+                     report_episode_return; 1 while returns are flat, -> 0
+                     while they improve (the arm becomes the control)
+            nu_i     model novelty in [0, nu_cap] as below
+
+            so bonus_i <= beta * g * sigma_Q * nu_cap: novelty can reorder
+            candidates the critic rates within ~beta spreads of each other and
+            cannot override a clear critic preference.
+
+            bonus_scale 'unc' (v3, kept for reproducibility):
 
                 score_i = Q_i + beta * s_i * nu_i
 
@@ -270,14 +332,21 @@ class ChunkSelector:
             d = self._candidate_disagreement(feat_n, cands)  # (n,)
             ratio = d / max(self.model.data_disagreement, 1e-10)
             nu = torch.clamp(ratio - 1.0, 0.0, self.nu_cap)
-        bonus = self.bonus_beta * s_unc * nu
+        sigma_q = critic_score.std(correction=0)
+        if self.bonus_scale == 'unc':
+            scale = self.bonus_beta * s_unc
+        else:
+            g = self.gate
+            s_rel = torch.clamp(s_unc / (s_unc.mean() + 1e-12), 0.0, 1.0)
+            scale = self.bonus_beta * g * sigma_q * s_rel
+        bonus = scale * nu
         score = critic_score + bonus
 
         idx_t = torch.argmax(score)
         crit_t = torch.argmax(critic_score)
         # Counterfactual: the pick with the model removed (nu = 1). Differs
         # from idx_t exactly when the model, not the critic's doubt, decided.
-        nomodel_t = torch.argmax(critic_score + self.bonus_beta * s_unc)
+        nomodel_t = torch.argmax(critic_score + scale)
         active = (nu > 0).float().mean()
         unc_mean = s_unc.mean()
         gap = critic_score[crit_t] - critic_score.mean()
@@ -299,8 +368,15 @@ class ChunkSelector:
             active, (nu >= self.nu_cap).float().mean(),
             unc_nov_corr, nomodel_t.float(),
             ((active > 0) & (active < 1)).float(),
+            sigma_q,
         ]).cpu().tolist()
         idx, crit_idx = int(v[0]), int(v[1])
+        if self.bonus_scale == 'spread':
+            self._acc('progress_g', self.gate)
+            self._acc('progress_frac', self._frac)
+            self._acc('sigma_q', v[18])
+            # bonus_max / sigma_Q: must stay <= beta * nu_cap by construction
+            self._acc('bonus_over_sigma', v[6] / (abs(v[18]) + 1e-8))
         # -- critic side: is it sure, and how sure relative to its margin
         self._acc('critic_unc', v[2])           # mean s_i, Q units
         self._acc('score_gap', v[3])            # critic's own margin

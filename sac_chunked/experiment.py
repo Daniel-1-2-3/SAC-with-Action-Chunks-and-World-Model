@@ -287,6 +287,7 @@ def run(config, arm_cls):
     chunk_buffer = None
     chunk_pos = chunk_len
     global_step = 0
+    ep_return = 0.0
     print(f'Starting online phase ({arm.describe()})')
 
     while global_step < general.num_online_steps:
@@ -310,7 +311,14 @@ def run(config, arm_cls):
                    terminated, truncated)
 
         obs = next_obs
+        ep_return += float(reward)
         if terminated or truncated:
+            # Real online episode finished: feed its return to the selector's
+            # learning-progress gate (explore arm; a no-op elsewhere). Eval
+            # episodes never come through here.
+            if hasattr(arm.selector, 'report_episode_return'):
+                arm.selector.report_episode_return(ep_return)
+            ep_return = 0.0
             obs, info = env.reset()
             chunk_pos = chunk_len
 
@@ -348,6 +356,7 @@ def run(config, arm_cls):
             run_eval(log_step, n_updates)
             obs, info = env.reset()
             chunk_pos = chunk_len
+            ep_return = 0.0   # the interrupted episode is not a finished one
 
         if global_step % general.save_every == 0:
             arm.save(out_dir, 'latest')

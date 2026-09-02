@@ -187,9 +187,27 @@ defaults:
     # Where along the imagined chunk novelty is measured: path = mean over
     # the steps (motion), end = final imagined latent only (outcome).
     novelty_at: path
-    # Ceiling on nu. bonus <= beta * s_i * nu_cap. 1 = the tested setting;
+    # Ceiling on nu. bonus <= beta * g * sigma_Q * nu_cap. 1 = the tested
+    # setting (picked_novelty rarely exceeds 1.5 and is mostly under 1);
     # 3 lets the model keep ranking candidates that are all past 2x.
     nu_cap: 1.0
+    # How the bonus is scaled:
+    #   spread  beta * g * sigma_Q * s~_i * nu_i  (sigma_Q = critic spread
+    #           across the candidates, s~_i = relative critic doubt in [0,1],
+    #           g = learning-progress gate). Bounded by beta * g * sigma_Q *
+    #           nu_cap, so beta is "how many critic spreads".
+    #   unc     beta * s_i * nu_i, the earlier version, g ignored. Kept so
+    #           existing runs stay reproducible.
+    bonus_scale: spread
+    # Learning-progress gate on the bonus (spread mode only). From the real
+    # online episode returns: recent = last W, older = the W before; frac =
+    # fraction of recent above median(older); g = 1 - 2 * max(frac - 0.5, 0),
+    # EMA-smoothed with tau. Flat returns -> g = 1 (full exploration);
+    # improving returns -> g -> 0 (the arm becomes the control). g = 1 for
+    # the first 2W episodes. false -> g = 1 always.
+    progress_gate: true
+    progress_window: 20
+    progress_tau: 0.2
 
   # train_sac_chunked_optimistic.py  (partner: train_sac_chunked_ranking.py)
   optimistic:
