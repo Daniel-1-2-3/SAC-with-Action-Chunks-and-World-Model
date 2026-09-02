@@ -183,6 +183,12 @@ defaults:
     lam: 0.95
     imag_batch: 64
     horizon: 5
+    # How far the imagined next latent moves from the model's prediction
+    # toward the sampled one-hot class per group. 0 = deterministic rollout
+    # (no RBMLE gradient); 1 = pure one-hot draw, which the reward/value
+    # heads never see in training and extrapolate badly on. 0.5 keeps the
+    # rollout inside each simplex while still depending on the draw.
+    sample_mix: 0.5
 
 # =======================================================================
 # Presets. Layer on top of defaults with --configs NAME. They may only

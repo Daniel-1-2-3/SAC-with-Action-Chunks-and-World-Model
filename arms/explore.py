@@ -26,11 +26,10 @@ class ExploreArm(RankingArm):
     name = 'explore'
     arm_key = 'explore'
 
-    def build_model(self):
-        # The ensemble size is an arm parameter, injected into the model
-        # config for this arm only.
-        self.config = self.config.update({'tdmpc': {'num_dyn': self.arm_cfg.num_dyn}})
-        super().build_model()
+    def model_kwargs(self):
+        # The ensemble size is this arm's own knob; the shared tdmpc block
+        # keeps num_dyn=1 for every other arm.
+        return {'num_dyn': self.arm_cfg.num_dyn}
 
     def build_selector(self):
         return ChunkSelector(self.model, self.policy, self.action_dim,

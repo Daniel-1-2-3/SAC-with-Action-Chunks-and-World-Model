@@ -55,7 +55,7 @@ def eval_chunk_in_env(env, policy, num_episodes, obs_key, chunk_len,
 
             if chunk_pos >= chunk_len:
                 if selector is not None:
-                    chunk = selector.select(state[0])
+                    chunk = selector.select(state[0], eval_mode=True)
                 else:
                     chunk = policy.act(state[0], eval_mode=True)
                 chunk_pos = 0

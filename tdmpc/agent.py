@@ -49,9 +49,11 @@ class TDMPC2Model:
         (encode, rollout_chunk, rollout_pi_chunk, terminal_value,
         chunk_disagreement) is everything the arms call at act time. """
 
-    def __init__(self, obs_dim, action_dim, device, cfg, gamma, optimism=None):
+    def __init__(self, obs_dim, action_dim, device, cfg, gamma, optimism=None,
+                 num_dyn=None):
         """ optimism: None, or a config block {alpha, eta, lam, imag_batch,
-            horizon} enabling the Optimistic-World-Models loss. """
+            horizon, sample_mix} enabling the Optimistic-World-Models loss.
+            num_dyn: dynamics heads; overrides cfg.num_dyn (explore arm). """
         self.device = device
         self.action_dim = action_dim
         self.gamma = gamma
@@ -67,7 +69,12 @@ class TDMPC2Model:
             enc_dim=cfg.enc_dim, enc_layers=cfg.enc_layers,
             simnorm_dim=cfg.simnorm_dim, num_q=cfg.num_q, dropout=cfg.dropout,
             num_bins=cfg.num_bins, vmin=cfg.vmin, vmax=cfg.vmax,
-            num_dyn=getattr(cfg, 'num_dyn', 1)).to(device)
+            num_dyn=(cfg.num_dyn if num_dyn is None else num_dyn)).to(device)
+        # Running mean of ensemble disagreement on REAL transitions, updated
+        # every update(). The explore arm's bonus is measured against this,
+        # so "novel" means "more uncertain than the data", and the bonus
+        # anneals as the heads converge on the data.
+        self.data_disagreement = 1e-8
 
         # tdmpc2.py: the encoder trains at lr * enc_lr_scale, every other
         # module at lr, and the policy prior has its OWN optimizer (eps 1e-5)
@@ -115,10 +122,18 @@ class TDMPC2Model:
         for k in range(n):
             a = chunk_actions[:, k]
             pooled = pooled + disc * self.net.reward_pred(z, a)
-            dis = dis + self.net.disagreement(z, a) / n
-            z = self.net.next(z, a)
+            z, d = self._step(z, a)
+            dis = dis + d / n
             disc = disc * self.gamma
         return z, pooled, disc, dis
+
+    def _step(self, z, a):
+        """ One dynamics step: (mean next latent, ensemble disagreement),
+            from ONE forward of the ensemble. """
+        preds = self.net.next_all(z, a)
+        if preds.shape[0] == 1:
+            return preds[0], torch.zeros(z.shape[0], 1, device=z.device, dtype=z.dtype)
+        return preds.mean(0), preds.var(0, unbiased=False).mean(-1, keepdim=True)
 
     @torch.no_grad()
     def rollout_pi_chunk(self, z, chunk_len, discount0=1.0):
@@ -135,8 +150,8 @@ class TDMPC2Model:
         for _ in range(chunk_len):
             a = self.net.pi(z)[0]
             pooled = pooled + disc * self.net.reward_pred(z, a)
-            dis = dis + self.net.disagreement(z, a) / chunk_len
-            z = self.net.next(z, a)
+            z, d = self._step(z, a)
+            dis = dis + d / chunk_len
             disc = disc * self.gamma
         return z, pooled, disc, dis
 
@@ -205,6 +220,10 @@ class TDMPC2Model:
                     q_logits[i], td_targets[:, t],
                     cfg.vmin, cfg.vmax, cfg.num_bins)).mean() / self.num_q
             preds = self.net.next_all(z, action[:, t])             # (num_dyn, B, latent)
+            if preds.shape[0] > 1 and t == 0:
+                d = preds.detach().var(0, unbiased=False).mean().item()
+                self.data_disagreement = 0.99 * self.data_disagreement + 0.01 * d \
+                    if self.data_disagreement > 1e-8 else d
             for i in range(preds.shape[0]):
                 consistency_loss = consistency_loss + rho * (
                     w * F.mse_loss(preds[i], next_z_real[:, t], reduction='none')
@@ -332,6 +351,7 @@ class TDMPC2Model:
         o = self.optimism
         L = int(o.horizon)
         n = min(int(o.imag_batch), obs0.shape[0])
+        mix = float(o.sample_mix)
         with torch.no_grad():
             z = self.net.encode(obs0[:n])
         logps, ents, rewards, values = [], [], [], []
@@ -342,17 +362,32 @@ class TDMPC2Model:
                 values.append(self.net.q_subset(z, a, reduce='avg'))
             p_next = self.net.next(z, a)
             ents.append(self.net.latent_entropy(p_next))
-            z, logp = self.net.sample_latent(p_next)
+            onehot, logp = self.net.sample_latent(p_next)
+            # The heads only ever train on soft SimNorm latents, so a pure
+            # one-hot draw is off-distribution for them. Continue the rollout
+            # on a convex mix of the draw and the prediction: still inside
+            # each simplex, still dependent on the draw (so the advantage
+            # depends on it and the RBMLE gradient is non-zero in
+            # expectation), with sample_mix setting how far toward the
+            # vertex it goes.
+            z = (1.0 - mix) * p_next + mix * onehot
             logps.append(logp)
         with torch.no_grad():
             v_end = self.terminal_value(z.detach())
-            # lambda-return backwards from the bootstrap.
+            # lambda-return backwards from the bootstrap:
+            #   G_l = r_l + gamma * [(1 - lam) V(z_{l+1}) + lam * G_{l+1}],
+            #   G_{L-1} = r_{L-1} + gamma * V(z_L).
+            # values[l] is V(z_l), so the bootstrap for step l is values[l+1]
+            # and v_end for the last step.
             lam = float(o.lam)
+            next_values = values[1:] + [v_end]
             ret = v_end
             returns = [None] * L
             for l in reversed(range(L)):
-                ret = rewards[l] + self.gamma * ((1 - lam) * values[l] + lam * ret) \
-                    if l + 1 < L else rewards[l] + self.gamma * v_end
+                if l == L - 1:
+                    ret = rewards[l] + self.gamma * v_end
+                else:
+                    ret = rewards[l] + self.gamma * ((1 - lam) * next_values[l] + lam * ret)
                 returns[l] = ret
             returns_t = torch.stack(returns, 0)                    # (L, n, 1)
             values_t = torch.stack(values, 0)

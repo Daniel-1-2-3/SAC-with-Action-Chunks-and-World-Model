@@ -52,7 +52,7 @@ class MVEArm(RankingArm):
                 f'{self.chunk.select_n}')
 
     @torch.no_grad()
-    def critic_target(self, next_obs, reward, mask):
+    def critic_target(self, next_obs, reward, mask, metrics_on=False):
         c = self.arm_cfg
         # The SAME next chunk drives both bootstraps, so the blend compares
         # two estimates of the same quantity rather than two samples.
@@ -71,7 +71,8 @@ class MVEArm(RankingArm):
             v_mve = self.model.terminal_value(z)
 
         v = (1.0 - c.weight) * q_qc + c.weight * v_mve
-        self._acc(q_qc, v_mve)
+        if metrics_on:
+            self._acc(q_qc, v_mve)
         return reward + self.gamma_h * mask * v
 
     def _acc(self, q_qc, v_mve):
@@ -85,12 +86,15 @@ class MVEArm(RankingArm):
         if a.std() > 1e-6 and b.std() > 1e-6:
             corr = ((a - a.mean()) * (b - b.mean())).mean() / (a.std(correction=0) * b.std(correction=0))
             s['corr'] = s.get('corr', 0.0) + corr.item()
+            s['_n_corr'] = s.get('_n_corr', 0) + 1
         s['_n'] = s.get('_n', 0) + 1
 
     def log_extra(self):
         out = super().log_extra()
         n = self._tstats.pop('_n', 0)
+        n_corr = self._tstats.pop('_n_corr', 0)
         if n:
-            out.update({f'mve/{k}': v / n for k, v in self._tstats.items()})
+            out.update({f'mve/{k}': v / (n_corr if k == 'corr' else n)
+                        for k, v in self._tstats.items()})
         self._tstats = {}
         return out

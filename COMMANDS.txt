@@ -1,29 +1,47 @@
-# CONTROL: critic best-of-N (QC's own best-of-N), seeds 0 and 1
-python train_sac_chunked.py --general.run_name=criticN_triple_s0 --general.out_dir=runs/criticN_s0 --seed=0
-python train_sac_chunked.py --general.run_name=criticN_triple_s1 --general.out_dir=runs/criticN_s1 --seed=1
+# Full runs, cube-triple, seeds 0 and 1. Every arm shares the QC-FQL block
+# and the model block in configs.yaml; the flags below are each arm's OWN
+# knobs, so what you pass is exactly what differs from its partner.
+#
+# NOTE on alpha: configs.yaml keeps alpha=300 (QC Table 4 value for
+# cube-double). The QC paper uses 100 for cube-triple. Add --chunk.alpha=100
+# to EVERY arm if you want the paper-faithful triple setting; never to one arm
+# alone.
 
-# Plain QC-FQL (no selection at all)
-python train_sac_chunked.py --general.run_name=qcfql_triple_s0 --general.out_dir=runs/qcfql_s0 --chunk.select_n=1 --seed=0
+# ---- CONTROL: critic best-of-16 (QC's own best-of-N) -----------------------
+python train_sac_chunked.py --general.run_name=control_s0 --general.out_dir=runs/control_s0 --seed=0
+python train_sac_chunked.py --general.run_name=control_s1 --general.out_dir=runs/control_s1 --seed=1
+# plain QC-FQL (no selection), the floor every arm must clear
+python train_sac_chunked.py --general.run_name=qcfql_s0 --general.out_dir=runs/qcfql_s0 --chunk.select_n=1 --seed=0
+python train_sac_chunked.py --general.run_name=qcfql_s1 --general.out_dir=runs/qcfql_s1 --chunk.select_n=1 --seed=1
 
-# RANKING: TD-MPC2 scores the candidates                    (partner: control)
-python train_sac_chunked_ranking.py --general.run_name=ranking_triple_s0 --general.out_dir=runs/ranking_s0 --seed=0
-python train_sac_chunked_ranking.py --general.run_name=ranking_triple_s1 --general.out_dir=runs/ranking_s1 --seed=1
+# ---- MVE: latent value expansion in the critic target   (partner: control) --
+# Acting is the control's critic best-of-16; only the target differs.
+python train_sac_chunked_mve.py --general.run_name=mve_w05_s0 --general.out_dir=runs/mve_w05_s0 --mve.weight=0.5 --mve.chunks=1 --seed=0
+python train_sac_chunked_mve.py --general.run_name=mve_w05_s1 --general.out_dir=runs/mve_w05_s1 --mve.weight=0.5 --mve.chunks=1 --seed=1
+# gentler blend if the model value lags the critic (mve/corr low, mve/abs_gap high)
+python train_sac_chunked_mve.py --general.run_name=mve_w025_s0 --general.out_dir=runs/mve_w025_s0 --mve.weight=0.25 --mve.chunks=1 --seed=0
 
-# MVE: latent value expansion in the critic target          (partner: control)
-python train_sac_chunked_mve.py --general.run_name=mve_triple_s0 --general.out_dir=runs/mve_s0 --seed=0
-#   pure MVE / latent-Q bootstrap only:
-#   --mve.weight=1.0        --mve.chunks=0
+# ---- EXPLORE: ranking + disagreement bonus              (partner: ranking) --
+python train_sac_chunked_explore.py --general.run_name=explore_b1_s0 --general.out_dir=runs/explore_b1_s0 --explore.beta=1.0 --explore.num_dyn=5 --seed=0
+python train_sac_chunked_explore.py --general.run_name=explore_b1_s1 --general.out_dir=runs/explore_b1_s1 --explore.beta=1.0 --explore.num_dyn=5 --seed=1
+# if select/disagreement_ratio sits near 1 (candidates never novel), raise beta:
+python train_sac_chunked_explore.py --general.run_name=explore_b3_s0 --general.out_dir=runs/explore_b3_s0 --explore.beta=3.0 --explore.num_dyn=5 --seed=0
 
-# EXPLORE: ranking + disagreement bonus                    (partner: ranking)
-python train_sac_chunked_explore.py --general.run_name=explore_triple_s0 --general.out_dir=runs/explore_s0 --seed=0
+# ---- RANKING: model scores the candidates               (partner: control) --
+python train_sac_chunked_ranking.py --general.run_name=ranking_s0 --general.out_dir=runs/ranking_s0 --ranking.rollout_chunks=1 --seed=0
+python train_sac_chunked_ranking.py --general.run_name=ranking_s1 --general.out_dir=runs/ranking_s1 --ranking.rollout_chunks=1 --seed=1
 
-# OPTIMISTIC: ranking + RBMLE dynamics loss                (partner: ranking)
-python train_sac_chunked_optimistic.py --general.run_name=optimistic_triple_s0 --general.out_dir=runs/optimistic_s0 --seed=0
+# ---- OPTIMISTIC: ranking + RBMLE dynamics loss          (partner: ranking) --
+python train_sac_chunked_optimistic.py --general.run_name=optimistic_s0 --general.out_dir=runs/optimistic_s0 --optimistic.alpha=1e-4 --optimistic.eta=3e-6 --optimistic.sample_mix=0.5 --seed=0
+python train_sac_chunked_optimistic.py --general.run_name=optimistic_s1 --general.out_dir=runs/optimistic_s1 --optimistic.alpha=1e-4 --optimistic.eta=3e-6 --optimistic.sample_mix=0.5 --seed=1
 
-# Deeper lookahead for any model-scoring arm (no decode; costs dynamics error,
-# watch wm/latent_drift_rel):  --ranking.rollout_chunks=2  (or explore./optimistic.)
+# Common flags for any arm:
+#   --general.env_name=cube-double-play-singletask-v0     (eef_slice is verified on single/double)
+#   --general.wandb_project=NAME   --general.wandb_mode=offline|disabled
+#   --chunk.compile_nets=False     if torch.compile misbehaves (speed only)
+#   --tdmpc.diag_windows=0         to skip the model accuracy report at eval
 
-# Toy sanity race, CPU, minutes:
-python toy/race.py --arms critic ranking mve explore optimistic --seeds 0 1
+# Toy sanity race, CPU, ~40 min for 5 arms x 2 seeds:
+python toy/race.py --arms critic ranking mve explore optimistic --seeds 0 1 --parallel 3 --threads 1
 # any single arm on the toy task:
 python train_sac_chunked_mve.py --configs toy --seed=0

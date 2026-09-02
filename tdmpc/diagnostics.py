@@ -106,7 +106,7 @@ def model_report(model, policy, replay, chunk_len, depth, gamma, device, rng,
 
 def print_wm_report(m, depth):
     if not m:
-        print('  wm report: skipped (no above-baseline reward in replay yet)')
+        print('  wm report: skipped (fewer than 6 windows fully inside one episode; raise diag_windows)')
         return
     print(f'  wm report @ depth {depth} chunk(s), {int(m["wm/windows"])} replay windows')
     print(f'    reward  mae {m["wm/reward_mae"]:.4f}  corr {m["wm/reward_corr"]:.3f}'

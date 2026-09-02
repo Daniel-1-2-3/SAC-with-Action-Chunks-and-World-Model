@@ -236,14 +236,6 @@ class TDMPC2Nets(nn.Module):
             return self.dynamics[0](torch.cat([z, action], dim=-1))
         return self.next_all(z, action).mean(0)
 
-    def disagreement(self, z, action):
-        """ Pathak et al. eq. 1: variance across the ensemble of the predicted
-            next latent, averaged over latent dims. (B, 1). Zero by
-            construction with a single head. """
-        if self.num_dyn == 1:
-            return torch.zeros(z.shape[0], 1, device=z.device, dtype=z.dtype)
-        return self.next_all(z, action).var(0, unbiased=False).mean(-1, keepdim=True)
-
     def reward_logits(self, z, action):
         return self.reward(torch.cat([z, action], dim=-1))
 

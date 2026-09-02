@@ -62,14 +62,18 @@ class ChunkSelector:
             way it did with the previous scorer.
             bonus_beta (model mode): weight of the dynamics-ensemble
             disagreement bonus (explore arm). 0 disables it. The bonus is
-            divided by a running mean of disagreement so beta is in reward
-            units. """
+            beta * relu(d / d_data - 1), where d_data is the model's running
+            mean disagreement on REAL replay transitions: a candidate whose
+            imagined path is no more uncertain than the data gets nothing,
+            one that is twice as uncertain gets beta. Both anneal as the
+            ensemble converges. beta is in reward units. Training-time only:
+            select(..., eval_mode=True) never adds it, so eval measures the
+            learned policy, not the exploration policy. """
         assert score_mode in ('model', 'critic'), score_mode
         assert score_mode == 'critic' or model is not None
         self.score_mode = score_mode
         self.rollout_chunks = max(1, int(rollout_chunks))
         self.bonus_beta = float(bonus_beta)
-        self._dis_scale = None
         self.model = model
         self.policy = policy
         self.action_dim = action_dim
@@ -92,9 +96,10 @@ class ChunkSelector:
         return out
 
     @torch.no_grad()
-    def select(self, state_1d):
+    def select(self, state_1d, eval_mode=False):
         """ state_1d: (obs_dim,) raw observation.
-            Returns (chunk_len, action_dim). """
+            Returns (chunk_len, action_dim). eval_mode disables the
+            exploration bonus; scoring is otherwise identical. """
         if not self.enabled:
             return self.policy.act(np.asarray(state_1d, dtype=np.float32),
                                    eval_mode=False)
@@ -131,20 +136,19 @@ class ChunkSelector:
         r_term = r_term.squeeze(-1)          # (n,) pooled imagined reward
         score = r_term + q_term
 
-        if self.bonus_beta > 0.0:
-            # Disagreement bonus in reward units: beta per typical
-            # disagreement, with "typical" a running mean over decisions.
+        if self.bonus_beta > 0.0 and not eval_mode:
+            # Novelty relative to the data: how much more uncertain the
+            # imagined path is than a typical real transition. In-distribution
+            # candidates get ~0, so the bonus does not add constant noise to
+            # the ranking and vanishes as the ensemble converges.
             d = dis.squeeze(-1)
-            batch_mean = float(d.mean().item())
-            if self._dis_scale is None:
-                self._dis_scale = max(batch_mean, 1e-8)
-            else:
-                self._dis_scale = 0.99 * self._dis_scale + 0.01 * batch_mean
-            bonus = self.bonus_beta * d / max(self._dis_scale, 1e-8)
+            ratio = d / max(self.model.data_disagreement, 1e-10)
+            bonus = self.bonus_beta * torch.relu(ratio - 1.0)
             score = score + bonus
             self._acc('bonus_std', bonus.std().item())
             self._acc('bonus_absmean', bonus.abs().mean().item())
-            self._acc('disagreement_raw', batch_mean)
+            self._acc('disagreement_raw', d.mean().item())
+            self._acc('disagreement_ratio', ratio.mean().item())
             # Would the bonus alone pick the same chunk? Near 1.0 means the
             # bonus, not the value, is driving exploration.
             self._acc('bonus_only_agree',

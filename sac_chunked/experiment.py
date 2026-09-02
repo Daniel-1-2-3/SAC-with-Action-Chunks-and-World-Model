@@ -117,8 +117,10 @@ class Arm:
         return (f'{self.name}: critic best-of-{n}' if n > 1
                 else f'{self.name}: plain QC-FQL (select_n=1)')
 
-    def critic_target(self, next_obs, reward, mask):
-        """ QC eq. 15: R_real + gamma^h * mask * Q_target(s', mu(s', z)). """
+    def critic_target(self, next_obs, reward, mask, metrics_on=False):
+        """ QC eq. 15: R_real + gamma^h * mask * Q_target(s', mu(s', z)).
+            metrics_on lets an override skip its own bookkeeping syncs on
+            steps whose metrics are discarded. """
         with torch.no_grad():
             return reward + self.gamma_h * mask * self.policy.chunk_target_values(next_obs)
 
@@ -151,7 +153,7 @@ def agent_update(arm, replay, metrics_on=True):
         return None
     b_obs, b_chunk, b_rew, b_mask, b_valid, b_step_valid, b_next = batch
 
-    targets = arm.critic_target(b_next, b_rew, b_mask)
+    targets = arm.critic_target(b_next, b_rew, b_mask, metrics_on=metrics_on)
 
     metrics = {}
     metrics.update(prefixed(arm.policy.update_critic(
