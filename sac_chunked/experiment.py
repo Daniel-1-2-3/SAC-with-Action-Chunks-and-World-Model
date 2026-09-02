@@ -222,6 +222,7 @@ def run(config, arm_cls):
     eef_slice = tuple(chunk.eef_slice)
     start_time = time.time()
     history = []
+    last_extra = {}
 
     def run_eval(step, n_updates):
         results = eval_chunk_in_env(
@@ -242,6 +243,13 @@ def run(config, arm_cls):
         rep = arm.report(replay)
         if rep:
             log_dict.update(numeric_metrics(rep))
+        # Selection / target attribution since the last log step, so a run
+        # without wandb still shows whether the model is doing anything.
+        attrib = {k: v for k, v in last_extra.items()
+                  if k.startswith(('select/', 'mve/'))}
+        if attrib:
+            print('  attribution: ' + '  '.join(
+                f'{k.split("/", 1)[1]} {v:.3f}' for k, v in sorted(attrib.items())))
         if results['video'] is not None:
             import wandb
             log_dict['eval/video'] = wandb.Video(results['video'], fps=20, format='mp4')
@@ -262,7 +270,8 @@ def run(config, arm_cls):
         if on:
             metrics['diagnosis/gradient_updates'] = n_updates
             metrics['diagnosis/phase'] = 0
-            metrics.update(arm.log_extra())
+            last_extra = arm.log_extra()
+            metrics.update(last_extra)
             log(numeric_metrics(metrics), i)
         if i % general.eval_every == 0:
             run_eval(i, n_updates)
@@ -325,7 +334,8 @@ def run(config, arm_cls):
             metrics['diagnosis/replay_transitions'] = len(replay)
             metrics['diagnosis/gradient_updates'] = n_updates
             metrics['diagnosis/phase'] = 1
-            metrics.update(arm.log_extra())
+            last_extra = arm.log_extra()
+            metrics.update(last_extra)
             s = replay.success_stats
             metrics['replay/success_frac_total'] = s['total_frac']
             metrics['replay/success_frac_online'] = s['online_frac']
