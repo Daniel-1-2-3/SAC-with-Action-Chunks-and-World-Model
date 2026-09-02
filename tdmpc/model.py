@@ -152,6 +152,69 @@ def mlp(in_dim, hidden_dim, out_dim, num_layers, out_act=None, dropout=0.0):
     return nn.Sequential(*layers)
 
 
+class EnsembleMLP(nn.Module):
+    """ E copies of `mlp(...)` with their weights stacked along a leading
+        member axis, so all E members run in ONE batched matmul per layer
+        (TD-MPC2's own Ensemble/vmap trick). Same architecture as mlp():
+        num_layers NormedLinear blocks (Linear -> dropout on the first only
+        -> LayerNorm -> Mish), then a plain Linear or a NormedLinear with
+        out_act. Same init: trunc-normal 0.02, zero bias, LayerNorm at 1/0.
+
+        forward(x): x is (B, in) (shared input for every member) or
+        (E, B, in). Returns (E, B, out). `idx` restricts the forward to a
+        subset of members, (len(idx), B, out) -- the others cost nothing. """
+
+    def __init__(self, num, in_dim, hidden_dim, out_dim, num_layers,
+                 out_act=None, dropout=0.0):
+        super().__init__()
+        self.num = num
+        self.out_act = out_act
+        self.dropout = dropout
+        dims = [in_dim] + [hidden_dim] * num_layers + [out_dim]
+        self.weights = nn.ParameterList()
+        self.biases = nn.ParameterList()
+        self.ln_w = nn.ParameterList()
+        self.ln_b = nn.ParameterList()
+        self.normed = []
+        for i in range(len(dims) - 1):
+            w = torch.empty(num, dims[i], dims[i + 1])
+            for e in range(num):
+                nn.init.trunc_normal_(w[e], std=0.02)
+            self.weights.append(nn.Parameter(w))
+            self.biases.append(nn.Parameter(torch.zeros(num, 1, dims[i + 1])))
+            normed = (i < num_layers) or (out_act is not None)
+            self.normed.append(normed)
+            if normed:
+                self.ln_w.append(nn.Parameter(torch.ones(num, 1, dims[i + 1])))
+                self.ln_b.append(nn.Parameter(torch.zeros(num, 1, dims[i + 1])))
+        self.num_layers = num_layers
+
+    def zero_output(self):
+        nn.init.zeros_(self.weights[-1])
+
+    def forward(self, x, idx=None):
+        if x.dim() == 2:
+            n = self.num if idx is None else len(idx)
+            x = x.unsqueeze(0).expand(n, -1, -1)
+        j = 0
+        for i, (w, b) in enumerate(zip(self.weights, self.biases)):
+            if idx is not None:
+                w, b = w[idx], b[idx]
+            x = torch.baddbmm(b, x, w)
+            if self.normed[i]:
+                if i == 0 and self.dropout and self.training:
+                    x = F.dropout(x, self.dropout, training=True)
+                lw, lb = self.ln_w[j], self.ln_b[j]
+                if idx is not None:
+                    lw, lb = lw[idx], lb[idx]
+                mu = x.mean(-1, keepdim=True)
+                var = x.var(-1, unbiased=False, keepdim=True)
+                x = (x - mu) * torch.rsqrt(var + 1e-5) * lw + lb
+                x = F.mish(x) if (i < self.num_layers) else self.out_act(x)
+                j += 1
+        return x
+
+
 # --------------------------------------------------------------------------
 # world model (common/world_model.py)
 # --------------------------------------------------------------------------
@@ -183,15 +246,17 @@ class TDMPC2Nets(nn.Module):
         # then a NormedLinear to the latent with SimNorm as its activation.
         self.encoder = mlp(obs_dim, enc_dim, latent_dim, max(enc_layers - 1, 1),
                            out_act=SimNorm(simnorm_dim))
-        self.dynamics = nn.ModuleList([
-            mlp(latent_dim + action_dim, mlp_dim, latent_dim, 2,
-                out_act=SimNorm(simnorm_dim))
-            for _ in range(self.num_dyn)])
+        # Dynamics heads and Q heads are stacked ensembles: one batched
+        # matmul per layer for all members instead of a Python loop of
+        # separate MLPs. Identical math and init; only the launch count
+        # changes.
+        self.dynamics = EnsembleMLP(self.num_dyn, latent_dim + action_dim,
+                                    mlp_dim, latent_dim, 2,
+                                    out_act=SimNorm(simnorm_dim))
         self.reward = mlp(latent_dim + action_dim, mlp_dim, num_bins, 2)
         self.pi_net = mlp(latent_dim, mlp_dim, 2 * action_dim, 2)
-        self.Qs = nn.ModuleList([
-            mlp(latent_dim + action_dim, mlp_dim, num_bins, 2, dropout=dropout)
-            for _ in range(num_q)])
+        self.Qs = EnsembleMLP(num_q, latent_dim + action_dim, mlp_dim,
+                              num_bins, 2, dropout=dropout)
         self.register_buffer(
             'bins', torch.linspace(vmin, vmax, num_bins), persistent=False)
 
@@ -200,8 +265,7 @@ class TDMPC2Nets(nn.Module):
         # predicting the middle bin (0) instead of noise.
         self.apply(weight_init)
         nn.init.zeros_(self.reward[-1].weight)
-        for q in self.Qs:
-            nn.init.zeros_(q[-1].weight)
+        self.Qs.zero_output()
 
         # Target copy lives here rather than on the trainer so it travels with
         # state_dict(). Updated by soft_update_target_q, never by the
@@ -225,16 +289,14 @@ class TDMPC2Nets(nn.Module):
 
     def next_all(self, z, action):
         """ Every dynamics head's prediction, (num_dyn, B, latent_dim). """
-        h = torch.cat([z, action], dim=-1)
-        return torch.stack([d(h) for d in self.dynamics], dim=0)
+        return self.dynamics(torch.cat([z, action], dim=-1))
 
     def next(self, z, action):
         """ Next latent. With one head this is that head; with an ensemble it
             is the mean, which stays on the SimNorm simplices because they
             are convex. """
-        if self.num_dyn == 1:
-            return self.dynamics[0](torch.cat([z, action], dim=-1))
-        return self.next_all(z, action).mean(0)
+        preds = self.next_all(z, action)
+        return preds[0] if self.num_dyn == 1 else preds.mean(0)
 
     def reward_logits(self, z, action):
         return self.reward(torch.cat([z, action], dim=-1))
@@ -259,22 +321,22 @@ class TDMPC2Nets(nn.Module):
         mu, action, log_prob = squash(mu, mu + eps * log_std.exp(), log_prob)
         return mu, action, log_prob
 
-    def q_logits(self, z, action, target=False):
-        """ (num_q, B, num_bins). """
+    def q_logits(self, z, action, target=False, idx=None):
+        """ (num_q, B, num_bins), or (len(idx), B, num_bins) for a subset of
+            heads -- the unselected heads are not computed. """
         heads = self.Qs_target if target else self.Qs
-        h = torch.cat([z, action], dim=-1)
-        return torch.stack([q(h) for q in heads], dim=0)
+        return heads(torch.cat([z, action], dim=-1), idx=idx)
 
-    def q_values(self, z, action, target=False):
+    def q_values(self, z, action, target=False, idx=None):
         """ Raw Q per ensemble member, (num_q, B, 1). """
-        return from_two_hot(self.q_logits(z, action, target), self.bins)
+        return from_two_hot(self.q_logits(z, action, target, idx), self.bins)
 
     def q_subset(self, z, action, reduce='min', target=False):
         """ world_model.py Q(return_type='min'|'avg'): two RANDOM heads,
             reduced. 'min' is the pessimistic TD target; 'avg' is what the
             policy-prior loss and TD-MPC2's own planner use. (B, 1). """
         idx = torch.randperm(self.num_q, device=z.device)[:2]
-        q = self.q_values(z, action, target)[idx]
+        q = self.q_values(z, action, target, idx=idx)
         return q.min(0).values if reduce == 'min' else q.mean(0)
 
     # ------------------------------------------- categorical view of a latent
@@ -303,3 +365,31 @@ class TDMPC2Nets(nn.Module):
         """ Sum over groups of the categorical entropy, (B, 1). """
         p = self.as_categorical(z_probs)
         return -(p * torch.log(p.clamp_min(1e-8))).sum(-1).sum(-1, keepdim=True)
+
+
+def convert_legacy_state_dict(sd, num_q, num_dyn):
+    """ Map a checkpoint saved by the per-head ModuleList layout
+        (Qs.{i}.{layer}.linear.weight, dynamics.{i}...) onto the stacked
+        EnsembleMLP layout. Already-stacked checkpoints pass through. """
+    if not any(k.startswith('Qs.0.') for k in sd):
+        return sd
+    out = {k: v for k, v in sd.items()
+           if not k.startswith(('Qs.', 'Qs_target.', 'dynamics.'))}
+    for name, num in (('Qs', num_q), ('Qs_target', num_q), ('dynamics', num_dyn)):
+        layers = sorted({int(k.split('.')[2]) for k in sd if k.startswith(name + '.0.')})
+        j = 0
+        for li, layer in enumerate(layers):
+            pre = lambda e: f'{name}.{e}.{layer}.'
+            has_ln = pre(0) + 'ln.weight' in sd
+            lin = 'linear.' if has_ln else ''
+            out[f'{name}.weights.{li}'] = torch.stack(
+                [sd[pre(e) + lin + 'weight'].t() for e in range(num)])
+            out[f'{name}.biases.{li}'] = torch.stack(
+                [sd[pre(e) + lin + 'bias'][None] for e in range(num)])
+            if has_ln:
+                out[f'{name}.ln_w.{j}'] = torch.stack(
+                    [sd[pre(e) + 'ln.weight'][None] for e in range(num)])
+                out[f'{name}.ln_b.{j}'] = torch.stack(
+                    [sd[pre(e) + 'ln.bias'][None] for e in range(num)])
+                j += 1
+    return out

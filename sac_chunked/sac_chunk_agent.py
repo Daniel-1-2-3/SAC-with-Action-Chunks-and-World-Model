@@ -226,6 +226,12 @@ class ChunkAgent:
         sq_det = sq.detach()
         metrics['diagnosis/critic_mse_real'] = sq_det[:, :n].mean().item()
         metrics['diagnosis/critic_spread_real'] = spread[:n].mean().item()
+        # Ensemble spread vs actual TD error, both in Q units. Near 0 = the
+        # heads agree with each other but not with the data: overconfident,
+        # and any uncertainty-scaled bonus is being silenced for the wrong
+        # reason.
+        metrics['diagnosis/critic_calibration'] = (
+            spread[:n].mean() / (sq_det[:, :n].mean().sqrt() + 1e-8)).item()
         metrics['diagnosis/critic_q_real'] = q_mean[:n].mean().item()
         metrics['diagnosis/critic_target_q_real'] = target_Q[:n].mean().item()
         if n < feat.shape[0]:

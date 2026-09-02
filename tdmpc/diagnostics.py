@@ -76,12 +76,13 @@ def model_report(model, policy, replay, chunk_len, depth, gamma, device, rng,
     real_pooled = (real_r * discounts[None, :]).sum(axis=1)
 
     z = model.encode(obs[:, 0])
-    pred_pooled = np.zeros(len(keep), dtype=np.float32)
+    pred_pooled = torch.zeros(len(keep), device=device)
     disc = 1.0
     for t in range(span):
-        pred_pooled += disc * model.net.reward_pred(z, act[:, t]).squeeze(-1).cpu().numpy()
+        pred_pooled += disc * model.net.reward_pred(z, act[:, t]).squeeze(-1)
         z = model.net.next(z, act[:, t])
         disc *= gamma
+    pred_pooled = pred_pooled.cpu().numpy()
 
     z_real_end = model.encode(next_obs[:, -1])
     drift = (z - z_real_end).pow(2).sum(-1).sqrt()

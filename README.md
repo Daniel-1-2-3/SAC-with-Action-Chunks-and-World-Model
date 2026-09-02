@@ -14,7 +14,7 @@ exactly that:
 | `train_sac_chunked.py` | **control** | nothing. Critic ranks `select_n` candidate chunks (QC's own best-of-N). `--chunk.select_n=1` = plain QC-FQL | -- |
 | `train_sac_chunked_ranking.py` | **ranking** | ranks the same candidates by `sum gamma^t r_model + gamma^H Q_model` | control |
 | `train_sac_chunked_mve.py` | **mve** | replaces the critic's bootstrap with a latent value expansion (Feinberg et al. 2018). Acting is the control's | control |
-| `train_sac_chunked_explore.py` | **explore** | ranking + dynamics-ensemble disagreement bonus (Pathak et al. 2019) | ranking |
+| `train_sac_chunked_explore.py` | **explore** | critic best-of-N + novelty bonus scaled by the critic's own ensemble uncertainty: `Q_i + beta * std_heads(Q_i) * novelty_i`, novelty in [0,1] from dynamics-ensemble disagreement (Pathak et al. 2019). Zero where the critic is sure, so it converges to the control by itself | control |
 | `train_sac_chunked_optimistic.py` | **optimistic** | ranking with an optimistic (RBMLE) dynamics loss (Mete et al. 2026) | ranking |
 
 The method of each arm is in `arms/<name>.py`; the shared loop is
@@ -35,7 +35,20 @@ Read these before anything else on a model-arm run:
   reduced to the control.
 - `mve/corr`, `mve/abs_gap` (mve arm)  is the expansion informative, or a
   noisier copy of the QC bootstrap.
-- `select/bonus_only_agree` (explore arm)  is the bonus driving the pick.
+- explore arm, critic side: `select/frac_within_unc` (candidates the critic
+  cannot separate from its favourite; 1/n = sure, 1 = no opinion),
+  `select/unc_over_gap` (error bar over its own margin). Both should fall
+  over training; that fall IS the anneal. Cross-check with
+  `diagnosis/critic_calibration` (ensemble spread over real TD error): near
+  0 means the heads agree but are wrong, so the bonus is silenced for the
+  wrong reason.
+- explore arm, bonus side: `select/pick_changed`, `select/bonus_over_gap`
+  (how much of the critic's margin novelty could buy), `select/picked_unc`,
+  `select/picked_novelty`. Novelty side: `select/novelty_frac_active` (~0 =
+  bonus dead), `select/novelty_frac_saturated` (~1 = bonus is a constant),
+  `diagnosis/wm_data_disagreement` (the denominator; drift moves both).
+  `select/unc_novelty_corr` > 0 means critic doubt and model novelty point
+  at the same candidates.
 - `wm/reward_corr`, `wm/latent_drift_rel`, `wm/value_critic_corr`  model
   accuracy against replay at every eval, zero env steps
   (`tdmpc/diagnostics.py`).

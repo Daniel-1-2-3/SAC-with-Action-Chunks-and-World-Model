@@ -21,10 +21,11 @@ python train_sac_chunked_mve.py --general.run_name=mve_w05_s1 --general.out_dir=
 # gentler blend if the model value lags the critic (mve/corr low, mve/abs_gap high)
 python train_sac_chunked_mve.py --general.run_name=mve_w025_s0 --general.out_dir=runs/mve_w025_s0 --mve.weight=0.25 --mve.chunks=1 --seed=0
 
-# ---- EXPLORE: ranking + disagreement bonus              (partner: ranking) --
+# ---- EXPLORE: critic best-of-N + novelty scaled by critic uncertainty (partner: control) --
 python train_sac_chunked_explore.py --general.run_name=explore_b1_s0 --general.out_dir=runs/explore_b1_s0 --explore.beta=1.0 --explore.num_dyn=5 --seed=0
 python train_sac_chunked_explore.py --general.run_name=explore_b1_s1 --general.out_dir=runs/explore_b1_s1 --explore.beta=1.0 --explore.num_dyn=5 --seed=1
-# if select/disagreement_ratio sits near 1 (candidates never novel), raise beta:
+# select/bonus_over_gap near 0 = critic confident, arm == control; raise beta only if
+# pick_changed is ~0 while the critic is still visibly uncertain (critic_unc large):
 python train_sac_chunked_explore.py --general.run_name=explore_b3_s0 --general.out_dir=runs/explore_b3_s0 --explore.beta=3.0 --explore.num_dyn=5 --seed=0
 
 # ---- RANKING: model scores the candidates               (partner: control) --

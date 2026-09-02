@@ -12,7 +12,6 @@
     same assumption inside a chunk, so the arms are not scored under
     different termination models. """
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -26,19 +25,22 @@ class RunningScale:
         optimistic loss, so their coefficients mean the same thing at step 1k
         and step 1M. """
 
-    def __init__(self, tau=0.01):
+    def __init__(self, tau=0.01, device='cpu'):
         self.tau = tau
-        self.value = 1.0
+        # Kept as a 0-d tensor on the device so update() never syncs the
+        # GPU; read it with float() only when logging.
+        self.value = torch.ones((), device=device)
+        self._pct = torch.tensor([0.05, 0.95], device=device)
 
     @torch.no_grad()
     def update(self, x):
         x = x.detach().flatten().float()
         if x.numel() < 2:
             return
-        lo, hi = torch.quantile(x, torch.tensor([0.05, 0.95], device=x.device))
-        span = float(torch.clamp(hi - lo, min=1.0))
-        if np.isfinite(span):
-            self.value = (1 - self.tau) * self.value + self.tau * span
+        lo, hi = torch.quantile(x, self._pct)
+        span = torch.clamp(hi - lo, min=1.0)
+        new = (1 - self.tau) * self.value + self.tau * span
+        self.value = torch.where(torch.isfinite(span), new, self.value)
 
     def __call__(self):
         return self.value
@@ -89,8 +91,28 @@ class TDMPC2Model:
             {'params': rest, 'lr': cfg.lr}])
         self.pi_opt = torch.optim.Adam(self.net.pi_net.parameters(), lr=cfg.lr,
                                        eps=1e-5)
-        self.scale = RunningScale(tau=self.tau)
-        self.ret_scale = RunningScale(tau=0.01)
+        self.scale = RunningScale(tau=self.tau, device=device)
+        self.ret_scale = RunningScale(tau=0.01, device=device)
+        self._target_params = list(self.net.Qs_target.parameters())
+        self._online_q_params = list(self.net.Qs.parameters())
+        self._opt_params = [p for g in self.opt.param_groups for p in g['params']]
+
+        # Same lever as ChunkAgent: the update is a few thousand tiny kernels
+        # and launch-bound, so fuse them. mode='default', no CUDA graphs
+        # (two backward passes per update). Pure speed change.
+        if bool(getattr(cfg, 'compile_nets', False)):
+            try:
+                opts = dict(mode='default', fullgraph=False)
+                self._losses = torch.compile(self._losses, **opts)
+                self._td_target = torch.compile(self._td_target, **opts)
+                self._pi_loss = torch.compile(self._pi_loss, **opts)
+                self.encode = torch.compile(self.encode, **opts)
+                self.rollout_chunk = torch.compile(self.rollout_chunk, **opts)
+                self.rollout_pi_chunk = torch.compile(self.rollout_pi_chunk, **opts)
+                self.terminal_value = torch.compile(self.terminal_value, **opts)
+                print('[compile] torch.compile(default) enabled on latent model')
+            except Exception as e:
+                print(f'[compile] FAILED on latent model, running uncompiled: {e}')
         # Eval mode by default. The Q heads carry dropout, and dropout during
         # SCORING would draw a different mask for every candidate in the
         # batch -- injecting noise into the exact comparison the arms exist to
@@ -169,12 +191,19 @@ class TDMPC2Model:
 
     # --------------------------------------------------------------- training
 
-    def _td_target(self, next_z, reward, mask):
+    @torch.no_grad()
+    def _td_target(self, next_obs, reward, mask):
         """ tdmpc2.py _td_target: reward + gamma * mask * min over two random
-            TARGET Q heads at a SAMPLED prior action. """
-        a = self.net.pi(next_z)[1]
-        return reward + self.gamma * mask * \
-            self.net.q_subset(next_z, a, reduce='min', target=True)
+            TARGET Q heads at a SAMPLED prior action. Runs on the whole
+            (B, H) batch in one pass, as the reference does (one random head
+            pair per batch). Returns (B, H, 1) targets and the encoded
+            next latents (B, H, latent). """
+        B, H = reward.shape[:2]
+        next_z = self.net.encode(next_obs)
+        flat_z = next_z.reshape(B * H, -1)
+        a = self.net.pi(flat_z)[1]
+        q = self.net.q_subset(flat_z, a, reduce='min', target=True)
+        return reward + self.gamma * mask * q.reshape(B, H, 1), next_z
 
     def update(self, obs, next_obs, action, reward, mask, valid, metrics_on=True):
         """ One TD-MPC2 joint update on a batch of consecutive real
@@ -194,52 +223,14 @@ class TDMPC2Model:
             the consistency loss and the rollout continues through the mean.
             With `optimism`, the RBMLE loss is added to the total. """
         cfg = self.cfg
-        B, horizon = action.shape[:2]
         self.net.train()
-
-        with torch.no_grad():
-            next_z_real = self.net.encode(next_obs)                # (B, H, latent)
-            td_targets = torch.stack([
-                self._td_target(next_z_real[:, t], reward[:, t], mask[:, t])
-                for t in range(horizon)], dim=1)                   # (B, H, 1)
-
-        z = self.net.encode(obs[:, 0])
-        zs = [z]
-        consistency_loss = 0.0
-        reward_loss = 0.0
-        value_loss = 0.0
-        rho = 1.0
-        for t in range(horizon):
-            w = valid[:, t]
-            reward_loss = reward_loss + rho * (w * soft_ce(
-                self.net.reward_logits(z, action[:, t]), reward[:, t],
-                cfg.vmin, cfg.vmax, cfg.num_bins)).mean()
-            q_logits = self.net.q_logits(z, action[:, t])          # (num_q, B, bins)
-            for i in range(self.num_q):
-                value_loss = value_loss + rho * (w * soft_ce(
-                    q_logits[i], td_targets[:, t],
-                    cfg.vmin, cfg.vmax, cfg.num_bins)).mean() / self.num_q
-            preds = self.net.next_all(z, action[:, t])             # (num_dyn, B, latent)
-            if preds.shape[0] > 1 and t == 0:
-                d = preds.detach().var(0, unbiased=False).mean().item()
-                self.data_disagreement = 0.99 * self.data_disagreement + 0.01 * d \
-                    if self.data_disagreement > 1e-8 else d
-            for i in range(preds.shape[0]):
-                consistency_loss = consistency_loss + rho * (
-                    w * F.mse_loss(preds[i], next_z_real[:, t], reduction='none')
-                    .mean(-1, keepdim=True)).mean() / preds.shape[0]
-            z = preds.mean(0)
-            zs.append(z)
-            rho *= self.rho
-
-        # tdmpc2.py divides each term by horizon (value_loss also by num_q,
-        # done inside the loop above), not by the sum of rho weights.
-        consistency_loss = consistency_loss / horizon
-        reward_loss = reward_loss / horizon
-        value_loss = value_loss / horizon
-        total = (cfg.consistency_coef * consistency_loss
-                 + cfg.reward_coef * reward_loss
-                 + cfg.value_coef * value_loss)
+        td_targets, next_z_real = self._td_target(next_obs, reward, mask)
+        total, consistency_loss, reward_loss, value_loss, zs, dis0 = self._losses(
+            obs[:, 0], next_z_real, action, reward, valid, td_targets)
+        if dis0 is not None:
+            d = dis0.item()
+            self.data_disagreement = 0.99 * self.data_disagreement + 0.01 * d \
+                if self.data_disagreement > 1e-8 else d
 
         opt_metrics = {}
         if self.optimism is not None:
@@ -248,17 +239,14 @@ class TDMPC2Model:
 
         self.opt.zero_grad(set_to_none=True)
         total.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            [p for g in self.opt.param_groups for p in g['params']],
-            cfg.grad_clip_norm)
+        grad_norm = torch.nn.utils.clip_grad_norm_(self._opt_params, cfg.grad_clip_norm)
         self.opt.step()
 
         # update_pi(zs.detach()) in the reference takes ALL horizon+1 latents,
         # the final rolled one included. Latent t+1 is meaningful when step t
         # was inside the episode; latent 0 always is.
         valid_z = torch.cat([torch.ones_like(valid[:, :1]), valid], dim=1)
-        pi_metrics = self._update_pi(torch.stack(zs, dim=1).detach(),
-                                     valid_z, metrics_on)
+        pi_metrics = self._update_pi(zs.detach(), valid_z, metrics_on)
         self._soft_update_target()
         self.net.eval()
 
@@ -279,6 +267,58 @@ class TDMPC2Model:
         metrics.update(opt_metrics)
         return metrics
 
+    def _losses(self, obs0, next_z_real, action, reward, valid, td_targets):
+        """ The three TD-MPC2 losses on one latent rollout (see update()).
+            Every Q head and every dynamics head is evaluated in one batched
+            call per step; the per-head means are identical to the old
+            per-head loops. Returns the total, the three terms, the rollout
+            latents (B, H+1, latent) and the step-0 dynamics disagreement
+            (None with one head). """
+        cfg = self.cfg
+        horizon = action.shape[1]
+        z = self.net.encode(obs0)
+        zs = [z]
+        consistency_loss = 0.0
+        reward_loss = 0.0
+        value_loss = 0.0
+        rho = 1.0
+        dis0 = None
+        for t in range(horizon):
+            w = valid[:, t]
+            reward_loss = reward_loss + rho * (w * soft_ce(
+                self.net.reward_logits(z, action[:, t]), reward[:, t],
+                cfg.vmin, cfg.vmax, cfg.num_bins)).mean()
+            q_logits = self.net.q_logits(z, action[:, t])          # (num_q, B, bins)
+            # sum_i mean_b(w * ce_i) / num_q == mean over (i, b) of w * ce
+            value_loss = value_loss + rho * (w * soft_ce(
+                q_logits, td_targets[:, t], cfg.vmin, cfg.vmax, cfg.num_bins)).mean()
+            preds = self.net.next_all(z, action[:, t])             # (num_dyn, B, latent)
+            if preds.shape[0] > 1 and t == 0:
+                dis0 = preds.detach().var(0, unbiased=False).mean()
+            consistency_loss = consistency_loss + rho * (
+                w * (preds - next_z_real[:, t]).pow(2).mean(-1, keepdim=True)).mean()
+            z = preds.mean(0)
+            zs.append(z)
+            rho *= self.rho
+
+        # tdmpc2.py divides each term by horizon (value_loss also by num_q,
+        # folded into the mean above), not by the sum of rho weights.
+        consistency_loss = consistency_loss / horizon
+        reward_loss = reward_loss / horizon
+        value_loss = value_loss / horizon
+        total = (cfg.consistency_coef * consistency_loss
+                 + cfg.reward_coef * reward_loss
+                 + cfg.value_coef * value_loss)
+        return total, consistency_loss, reward_loss, value_loss, torch.stack(zs, dim=1), dis0
+
+    def _pi_loss(self, zs):
+        """ Network half of _update_pi (prior action, log-prob, average of
+            two random Q heads), separated so it can be compiled. """
+        _, action, log_prob = self.net.pi(zs)
+        flat = lambda x: x.reshape(-1, x.shape[-1])
+        q = self.net.q_subset(flat(zs), flat(action), reduce='avg')
+        return q.reshape(*zs.shape[:-1], 1), log_prob
+
     def _update_pi(self, zs, valid, metrics_on=True):
         """ tdmpc2.py update_pi: maximum-entropy policy prior on detached
             latents. This prior is never executed in the environment -- it
@@ -293,17 +333,13 @@ class TDMPC2Model:
             through the action input only. scaled_entropy is -log_prob times
             action_dim. Only Q is divided by the running scale. """
         cfg = self.cfg
-        _, action, log_prob = self.net.pi(zs)
-        flat = lambda x: x.reshape(-1, x.shape[-1])
-        q_params = list(self.net.Qs.parameters())
-        for p in q_params:
+        for p in self._online_q_params:
             p.requires_grad_(False)
         try:
-            q = self.net.q_subset(flat(zs), flat(action), reduce='avg')
+            q, log_prob = self._pi_loss(zs)
         finally:
-            for p in q_params:
+            for p in self._online_q_params:
                 p.requires_grad_(True)
-        q = q.reshape(*zs.shape[:-1], 1)
         self.scale.update(q[:, 0])
         q = q / self.scale()
         scaled_entropy = -log_prob * self.action_dim
@@ -326,7 +362,7 @@ class TDMPC2Model:
             'diagnosis/pi_grad_norm': pi_grad.item(),
             'diagnosis/pi_entropy': (-log_prob).mean().item(),
             'diagnosis/pi_q_scaled': q.mean().item(),
-            'diagnosis/q_scale': self.scale(),
+            'diagnosis/q_scale': float(self.scale()),
         }
 
     def _optimistic_loss(self, obs0, metrics_on):
@@ -392,7 +428,7 @@ class TDMPC2Model:
             returns_t = torch.stack(returns, 0)                    # (L, n, 1)
             values_t = torch.stack(values, 0)
             self.ret_scale.update(returns_t)
-            adv = (returns_t - values_t) / max(1.0, self.ret_scale())
+            adv = (returns_t - values_t) / torch.clamp(self.ret_scale(), min=1.0)
         logp_t = torch.stack(logps, 0)
         ent_t = torch.stack(ents, 0)
         loss = -float(o.alpha) * (adv * logp_t).sum(0).mean() \
@@ -405,22 +441,23 @@ class TDMPC2Model:
             'optimism/adv_std': adv.std().item(),
             'optimism/logp_mean': logp_t.mean().item(),
             'optimism/latent_entropy': ent_t.mean().item(),
-            'optimism/return_scale': self.ret_scale(),
+            'optimism/return_scale': float(self.ret_scale()),
         }
 
     @torch.no_grad()
     def _soft_update_target(self):
-        for p, tp in zip(self.net.Qs.parameters(), self.net.Qs_target.parameters()):
-            tp.data.mul_(1.0 - self.tau).add_(self.tau * p.data)
+        # tp <- (1 - tau) tp + tau p, one fused call for all heads.
+        torch._foreach_lerp_(self._target_params, self._online_q_params, self.tau)
 
     def param_norm(self):
         with torch.no_grad():
-            sq = sum(float(p.pow(2).sum()) for p in self.net.parameters()
-                     if p.requires_grad)
-        return sq ** 0.5
+            norms = torch._foreach_norm([p for p in self.net.parameters() if p.requires_grad])
+            return torch.stack(norms).norm().item()
 
     def state_dict_all(self):
         return {'net': self.net.state_dict()}
 
     def load_state_dict_all(self, state):
-        self.net.load_state_dict(state['net'])
+        from tdmpc.model import convert_legacy_state_dict
+        self.net.load_state_dict(convert_legacy_state_dict(
+            state['net'], self.net.num_q, self.net.num_dyn))
