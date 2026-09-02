@@ -52,7 +52,8 @@ class ChunkSelector:
         reduces to QC. """
 
     def __init__(self, model, policy, action_dim, chunk_len, n, gamma, device,
-                 score_mode='model', rollout_chunks=1, bonus_beta=0.0):
+                 score_mode='model', rollout_chunks=1, bonus_beta=0.0,
+                 novelty='model', novelty_at='path', nu_cap=1.0):
         """ model: a TDMPC2Model, or None in critic mode.
             rollout_chunks (model mode): imagine this many chunks ahead. The
             first is the candidate; each further chunk's actions come from the
@@ -75,6 +76,20 @@ class ChunkSelector:
         self.score_mode = score_mode
         self.rollout_chunks = max(1, int(rollout_chunks))
         self.bonus_beta = float(bonus_beta)
+        # explore arm only:
+        #   novelty     'model'  nu from dynamics-ensemble disagreement
+        #               'none'   nu = 1 for every candidate -- the critic's
+        #                        doubt explores alone, no model in the pick
+        #                        (attribution arm)
+        #   novelty_at  'path'   disagreement averaged over the imagined steps
+        #               'end'    disagreement at the final imagined latent
+        #                        only (outcome, not motion)
+        #   nu_cap      clamp ceiling on nu; bonus <= beta * s_i * nu_cap
+        assert novelty in ('model', 'none'), novelty
+        assert novelty_at in ('path', 'end'), novelty_at
+        self.novelty = novelty
+        self.novelty_at = novelty_at
+        self.nu_cap = float(nu_cap)
         self.model = model
         self.policy = policy
         self.action_dim = action_dim
@@ -247,21 +262,23 @@ class ChunkSelector:
             regime) s_i is large and novelty decides. beta is dimensionless:
             beta = 1 means "one critic-std of novelty". """
         s_unc = qs.squeeze(-1).std(0, correction=0)  # (n,)
-        z = self.model.encode(feat_n)
-        chunk_actions = cands.reshape(self.n, self.chunk_len, self.action_dim)
-        z, _, disc, dis = self.model.rollout_chunk(z, chunk_actions)
-        for _ in range(self.rollout_chunks - 1):
-            z, _, disc, dis_j = self.model.rollout_pi_chunk(z, self.chunk_len, disc)
-            dis = dis + dis_j
-        dis = dis / self.rollout_chunks
-        d = dis.squeeze(-1)
-        ratio = d / max(self.model.data_disagreement, 1e-10)
-        nu = torch.clamp(ratio - 1.0, 0.0, 1.0)
+        if self.novelty == 'none':
+            d = torch.ones_like(s_unc)
+            ratio = torch.full_like(s_unc, 2.0)
+            nu = torch.ones_like(s_unc)
+        else:
+            d = self._candidate_disagreement(feat_n, cands)  # (n,)
+            ratio = d / max(self.model.data_disagreement, 1e-10)
+            nu = torch.clamp(ratio - 1.0, 0.0, self.nu_cap)
         bonus = self.bonus_beta * s_unc * nu
         score = critic_score + bonus
 
         idx_t = torch.argmax(score)
         crit_t = torch.argmax(critic_score)
+        # Counterfactual: the pick with the model removed (nu = 1). Differs
+        # from idx_t exactly when the model, not the critic's doubt, decided.
+        nomodel_t = torch.argmax(critic_score + self.bonus_beta * s_unc)
+        active = (nu > 0).float().mean()
         unc_mean = s_unc.mean()
         gap = critic_score[crit_t] - critic_score.mean()
         # IS THE CRITIC SURE? Number of candidates the critic cannot tell
@@ -279,8 +296,9 @@ class ChunkSelector:
             bonus.abs().mean(), bonus.max(),
             nu.mean(), ratio.mean(), torch.argmax(nu).float(),
             within, s_unc[idx_t], nu[idx_t],
-            (nu > 0).float().mean(), (nu >= 1).float().mean(),
-            unc_nov_corr,
+            active, (nu >= self.nu_cap).float().mean(),
+            unc_nov_corr, nomodel_t.float(),
+            ((active > 0) & (active < 1)).float(),
         ]).cpu().tolist()
         idx, crit_idx = int(v[0]), int(v[1])
         # -- critic side: is it sure, and how sure relative to its margin
@@ -299,7 +317,7 @@ class ChunkSelector:
         self._acc('bonus_only_agree', float(int(v[9]) == idx))
         self._acc('picked_unc', v[11])          # s_i of the executed chunk
         self._acc('picked_novelty', v[12])      # nu_i of the executed chunk
-        # -- novelty side: alive (some nu > 0), or saturated (nu == 1)
+        # -- novelty side: alive (some nu > 0), or saturated (nu == cap)
         self._acc('novelty_mean', v[7])
         self._acc('disagreement_ratio', v[8])
         self._acc('novelty_frac_active', v[13])
@@ -307,5 +325,38 @@ class ChunkSelector:
         # Do the critic's doubt and the model's novelty point at the same
         # candidates? Positive = the bonus fires where the critic is unsure.
         self._acc('unc_novelty_corr', v[15])
+        # Did the MODEL change the pick, relative to critic doubt alone?
+        self._acc('model_changed', float(idx != int(v[16])))
+        # Per decision: did the model separate siblings at this state
+        # (some novel, some not), rather than flag the whole state?
+        self._acc('novelty_mixed', v[17])
         return cands[idx].detach().cpu().numpy().reshape(
             self.chunk_len, self.action_dim)
+
+    @torch.no_grad()
+    def _candidate_disagreement(self, feat_n, cands):
+        """ Dynamics-ensemble disagreement of each candidate's imagined path,
+            reduced per the model's `novelty` rule (mean over dims, or
+            reward-weighted) and taken either along the path or at its end.
+            Uncompiled on purpose: the reward-weighted rule needs a gradient
+            through the reward head. (n,) """
+        m = self.model
+        z = m.encode(feat_n)
+        acts = cands.reshape(self.n, self.chunk_len, self.action_dim)
+        steps = []
+        for k in range(self.chunk_len):
+            a = acts[:, k]
+            preds = m.net.next_all(z, a)
+            var = preds.var(0, unbiased=False)
+            steps.append(m.reduce_disagreement(var, z, a))
+            z = preds.mean(0)
+        for _ in range(self.rollout_chunks - 1):
+            for _ in range(self.chunk_len):
+                a = m.net.pi(z)[0]
+                preds = m.net.next_all(z, a)
+                var = preds.var(0, unbiased=False)
+                steps.append(m.reduce_disagreement(var, z, a))
+                z = preds.mean(0)
+        if self.novelty_at == 'end':
+            return steps[-1].squeeze(-1)
+        return torch.stack(steps, 0).mean(0).squeeze(-1)

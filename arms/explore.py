@@ -31,14 +31,19 @@ class ExploreArm(RankingArm):
     def model_kwargs(self):
         # The ensemble size is this arm's own knob; the shared tdmpc block
         # keeps num_dyn=1 for every other arm.
-        return {'num_dyn': self.arm_cfg.num_dyn}
+        c = self.arm_cfg
+        return {'num_dyn': c.num_dyn,
+                'novelty': 'reward' if c.novelty == 'reward' else 'mean'}
 
     def build_selector(self):
         return ChunkSelector(self.model, self.policy, self.action_dim,
                              self.chunk_len, self.chunk.select_n, self.gamma,
                              self.device, score_mode='critic',
                              rollout_chunks=self.arm_cfg.rollout_chunks,
-                             bonus_beta=self.arm_cfg.beta)
+                             bonus_beta=self.arm_cfg.beta,
+                             novelty='none' if self.arm_cfg.novelty == 'none' else 'model',
+                             novelty_at=self.arm_cfg.novelty_at,
+                             nu_cap=self.arm_cfg.nu_cap)
 
     def log_extra(self):
         out = super().log_extra()
@@ -50,5 +55,5 @@ class ExploreArm(RankingArm):
     def describe(self):
         c = self.arm_cfg
         return (f'{self.name}: critic best-of-{self.chunk.select_n} + '
-                f'{c.num_dyn}-head novelty scaled by critic uncertainty, '
-                f'beta {c.beta}')
+                f'{c.num_dyn}-head novelty[{c.novelty}@{c.novelty_at}, cap {c.nu_cap}] '
+                f'scaled by critic uncertainty, beta {c.beta}')

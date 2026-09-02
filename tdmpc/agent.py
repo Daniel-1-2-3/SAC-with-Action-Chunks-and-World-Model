@@ -52,10 +52,19 @@ class TDMPC2Model:
         chunk_disagreement) is everything the arms call at act time. """
 
     def __init__(self, obs_dim, action_dim, device, cfg, gamma, optimism=None,
-                 num_dyn=None):
+                 num_dyn=None, novelty='mean'):
         """ optimism: None, or a config block {alpha, eta, lam, imag_batch,
             horizon, sample_mix} enabling the Optimistic-World-Models loss.
-            num_dyn: dynamics heads; overrides cfg.num_dyn (explore arm). """
+            num_dyn: dynamics heads; overrides cfg.num_dyn (explore arm).
+            novelty: how ensemble disagreement over the latent dims is
+            reduced to one number, for BOTH the data reference and the
+            explore arm's candidates so the ratio stays meaningful:
+              'mean'    plain mean over latent dims (Pathak et al.)
+              'reward'  weighted by |d reward_head / d z| -- disagreement in
+                        dims the reward head reads counts, disagreement in
+                        dims it ignores (arm pose) does not. Early, when the
+                        reward head is untrained, the weights are ~uniform
+                        and this equals 'mean'. """
         self.device = device
         self.action_dim = action_dim
         self.gamma = gamma
@@ -65,6 +74,7 @@ class TDMPC2Model:
         self.tau = float(cfg.tau)
         self.num_q = int(cfg.num_q)
         self.optimism = optimism
+        self.novelty = novelty
 
         self.net = TDMPC2Nets(
             obs_dim, action_dim, latent_dim=cfg.latent_dim, mlp_dim=cfg.mlp_dim,
@@ -157,6 +167,31 @@ class TDMPC2Model:
             return preds[0], torch.zeros(z.shape[0], 1, device=z.device, dtype=z.dtype)
         return preds.mean(0), preds.var(0, unbiased=False).mean(-1, keepdim=True)
 
+    def reward_weights(self, z, a):
+        """ |d reward_pred / d z| at (z, a), scaled to MEAN 1 per row: how
+            much the reward head reads each latent dim, in units where the
+            plain mean is weight 1 everywhere. A row with no gradient at all
+            (the head's output layer is zero-initialised, so this is exactly
+            the untrained case) falls back to uniform weights, i.e. 'mean'
+            mode. (B, latent). """
+        with torch.enable_grad():
+            zg = z.detach().requires_grad_(True)
+            r = self.net.reward_pred(zg, a).sum()
+            g, = torch.autograd.grad(r, zg)
+        w = g.abs()
+        mean = w.mean(-1, keepdim=True)
+        return torch.where(mean > 0, w / (mean + 1e-12), torch.ones_like(w))
+
+    @torch.no_grad()
+    def reduce_disagreement(self, var, z, a):
+        """ Per-dim ensemble variance (B, latent) -> one number per row
+            (B, 1), by the configured `novelty` rule. Same function for the
+            data reference and for candidates. 'reward' is a weighted mean
+            with mean-1 weights, so its scale matches 'mean'. """
+        if self.novelty == 'reward':
+            return (var * self.reward_weights(z, a)).mean(-1, keepdim=True)
+        return var.mean(-1, keepdim=True)
+
     @torch.no_grad()
     def rollout_pi_chunk(self, z, chunk_len, discount0=1.0):
         """ Same, with actions from the policy prior at each imagined latent.
@@ -225,10 +260,10 @@ class TDMPC2Model:
         cfg = self.cfg
         self.net.train()
         td_targets, next_z_real = self._td_target(next_obs, reward, mask)
-        total, consistency_loss, reward_loss, value_loss, zs, dis0 = self._losses(
+        total, consistency_loss, reward_loss, value_loss, zs, var0 = self._losses(
             obs[:, 0], next_z_real, action, reward, valid, td_targets)
-        if dis0 is not None:
-            d = dis0.item()
+        if var0 is not None:
+            d = self.reduce_disagreement(var0, zs[:, 0].detach(), action[:, 0]).mean().item()
             self.data_disagreement = 0.99 * self.data_disagreement + 0.01 * d \
                 if self.data_disagreement > 1e-8 else d
 
@@ -272,8 +307,8 @@ class TDMPC2Model:
             Every Q head and every dynamics head is evaluated in one batched
             call per step; the per-head means are identical to the old
             per-head loops. Returns the total, the three terms, the rollout
-            latents (B, H+1, latent) and the step-0 dynamics disagreement
-            (None with one head). """
+            latents (B, H+1, latent) and the step-0 per-dim dynamics
+            disagreement (B, latent) (None with one head). """
         cfg = self.cfg
         horizon = action.shape[1]
         z = self.net.encode(obs0)
@@ -294,7 +329,7 @@ class TDMPC2Model:
                 q_logits, td_targets[:, t], cfg.vmin, cfg.vmax, cfg.num_bins)).mean()
             preds = self.net.next_all(z, action[:, t])             # (num_dyn, B, latent)
             if preds.shape[0] > 1 and t == 0:
-                dis0 = preds.detach().var(0, unbiased=False).mean()
+                dis0 = preds.detach().var(0, unbiased=False)         # (B, latent)
             consistency_loss = consistency_loss + rho * (
                 w * (preds - next_z_real[:, t]).pow(2).mean(-1, keepdim=True)).mean()
             z = preds.mean(0)

@@ -28,6 +28,12 @@ python train_sac_chunked_explore.py --general.run_name=explore_b1_s1 --general.o
 # pick_changed is ~0 while the critic is still visibly uncertain (critic_unc large):
 python train_sac_chunked_explore.py --general.run_name=explore_b3_s0 --general.out_dir=runs/explore_b3_s0 --explore.beta=3.0 --explore.num_dyn=5 --seed=0
 
+# explore arm variants (change ONE knob vs explore_b1):
+#   attribution, no model in the pick (critic doubt only):
+python train_sac_chunked_explore.py --general.run_name=explore_nomodel_s0 --general.out_dir=runs/explore_nomodel_s0 --explore.beta=1.0 --explore.num_dyn=5 --explore.novelty=none --seed=0
+#   reward-weighted, end-latent novelty with a looser cap:
+python train_sac_chunked_explore.py --general.run_name=explore_rw_s0 --general.out_dir=runs/explore_rw_s0 --explore.beta=1.0 --explore.num_dyn=5 --explore.novelty=reward --explore.novelty_at=end --explore.nu_cap=3 --seed=0
+
 # ---- RANKING: model scores the candidates               (partner: control) --
 python train_sac_chunked_ranking.py --general.run_name=ranking_s0 --general.out_dir=runs/ranking_s0 --ranking.rollout_chunks=1 --seed=0
 python train_sac_chunked_ranking.py --general.run_name=ranking_s1 --general.out_dir=runs/ranking_s1 --ranking.rollout_chunks=1 --seed=1

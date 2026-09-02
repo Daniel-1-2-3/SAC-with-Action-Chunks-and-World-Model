@@ -177,6 +177,19 @@ defaults:
     # critic-std. 0 = exactly the control. Vanishes as the critic's heads
     # converge, so there is nothing to schedule.
     beta: 1.0
+    # What "novelty" means:
+    #   model   dynamics-ensemble disagreement, mean over latent dims
+    #   reward  same disagreement, weighted by |d reward_head / d z| -- only
+    #           dims the reward head reads count (object-centric, no decoder)
+    #   none    nu = 1 everywhere: the critic's doubt explores alone, no model
+    #           in the pick. ATTRIBUTION arm.
+    novelty: model
+    # Where along the imagined chunk novelty is measured: path = mean over
+    # the steps (motion), end = final imagined latent only (outcome).
+    novelty_at: path
+    # Ceiling on nu. bonus <= beta * s_i * nu_cap. 1 = the tested setting;
+    # 3 lets the model keep ranking candidates that are all past 2x.
+    nu_cap: 1.0
 
   # train_sac_chunked_optimistic.py  (partner: train_sac_chunked_ranking.py)
   optimistic:
