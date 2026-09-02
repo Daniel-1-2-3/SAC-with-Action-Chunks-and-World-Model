@@ -1,233 +1,223 @@
+# One config for every arm. Each train_sac_chunked_*.py reads `defaults`,
+# then any preset named with --configs (e.g. `--configs toy`), then dotted
+# CLI overrides such as --chunk.select_n=16 or --general.run_name=foo.
+#
+# The QC-FQL block (`chunk`) and the latent-model block (`tdmpc`) are SHARED
+# by every arm by construction -- there is one copy, so no arm can drift
+# from another. An arm's own knobs live in its own block (ranking / mve /
+# explore / optimistic) and are the ONLY thing that differs between it and
+# its comparison partner.
+
 defaults:
 
   seed: 0
-  # Replay sequence sampling: batch_size sequences of batch_length steps per
-  # draw. Both the QC-FQL chunk sampler and the TD-MPC2 window sampler cut
-  # their own training rows out of the same draw, so both arms see the same
-  # data distribution.
-  batch_size: 32
-  batch_length: 64
+
+  general:
+    env_name: cube-triple-play-singletask-v0
+    run_name: ''
+    out_dir: runs/default
+    wandb_project: beat-qc-fql
+    wandb_mode: online          # 'disabled' skips wandb entirely
+    # Latent-model checkpoint to load (model arms only). '' = train from
+    # scratch alongside the policy.
+    model_ckpt: ''
+    seed_from_offline: True
+    # QC main.py protocol: offline gradient updates on the static dataset,
+    # then online interaction. Every number in the QC paper uses this.
+    num_offline_steps: 250000
+    num_online_steps: 1000000
+    num_seed_steps: 4000        # random actions, only when there is no offline data
+    start_training: 5000        # main.py `if i >= FLAGS.start_training`
+    log_every: 100
+    save_every: 10000
+    eval_every: 10000
+    eval_episodes: 20
+    # Only read when env_name is toy-point-push.
+    toy_offline_episodes: 300
 
   # ---------------------------------------------------------------------
-  # Action-chunked arms: QC-FQL, ported from github.com/ColinQiyangLi/qc
-  # (agents/acfql.py, actor_type=distill-ddpg). Every key that appears in
-  # BOTH train_sac_chunked_wm.chunk and train_sac_chunked.chunk must hold the
-  # same value -- the policy is the controlled variable and the only thing
-  # allowed to differ between arms is whether a world model exists.
-  # train_every and batch_size are the exceptions, since the arms genuinely
-  # draw their training data differently.
+  # QC-FQL, ported from github.com/ColinQiyangLi/qc (agents/acfql.py,
+  # actor_type=distill-ddpg). Shared by EVERY arm.
   #
   # VALUES TAKEN FROM THE REFERENCE, don't re-litigate:
   #   hidden_dim 512 / num_layers 4   actor_hidden_dims = value_hidden_dims
-  #                                   = (512, 512, 512, 512)
   #   ensemble 2                      num_qs for FQL-based agents
   #   q_agg mean                      never min, for any agent in the repo
   #   alpha 300                       Table 4, cube-double (100 for triple
   #                                   and quadruple, 10000 for robomimic)
   #   flow_steps 10, lr 3e-4, tau 0.005, batch_size 256, utd_ratio 1
-  #   chunk_len 5                     h=10 scored higher on cube-triple in the
-  #                                   h ablation; 5 is the paper's default
-  #                                   because it is cheaper
+  #   chunk_len 5                     the paper's default
   #
-  # There is no gradient clipping and no (1 + alpha) divisor in the actor
-  # loss. Those two were cancelling each other; the reference has neither.
-  #
-  # Rewards are fed through RAW, as QC does with its {-n..0} rewards. The
-  # reward_shift that used to sit here was a local addition and is what made
-  # alpha untransferable between cube-single and cube-double, since it turns
-  # "one cube placed" into a sustained +1/step on multi-cube tasks and
-  # inflates Q by ~65x. It is gone from both arms and from the scorer.
-  #
-  # eef_slice [12,15] measured on both cube-single and cube-double.
+  # No gradient clipping and no (1 + alpha) divisor in the actor loss. Rewards
+  # are fed through RAW, as QC does with its {-n..0} rewards; a reward shift
+  # would turn "one cube placed" into a sustained +1/step on multi-cube tasks.
+  # ---------------------------------------------------------------------
+  chunk:
+    chunk_len: 5
+    # Candidate chunks per decision, in every arm that selects. QC's own
+    # best-of-N analysis bounds the KL from the sampling policy by
+    # log N - (N-1)/N; the paper used N=32 on cube-*. 1 = plain QC-FQL.
+    select_n: 16
+    utd_ratio: 1
+    batch_size: 256
+    # Floor only -- raised at runtime to max(., offline_size + online + 1)
+    # so offline data is never evicted (main.py's max(buffer_size, size+1)).
+    replay_capacity: 1000000
+    gamma: 0.99
+    lr: 3e-4
+    hidden_dim: 512
+    num_layers: 4
+    critic_target_tau: 0.005
+    ensemble: 2
+    q_agg: mean
+    alpha: 300.0
+    flow_steps: 10
+    # Observation slice holding the end-effector xyz, for eval/coherence.
+    # Measured on cube-single and cube-double.
+    eef_slice: [12, 15]
+    # torch.compile on the actor/critic: the per-step cost is ~400 tiny
+    # kernel launches, so fusing them is the lever. A minute or two at
+    # startup; pure speed change, alters no results.
+    compile_nets: True
+
+  # ---------------------------------------------------------------------
+  # TD-MPC2 latent model (nicklashansen/tdmpc2, state variant). Shared by
+  # every model arm. Encoder -> latent, dynamics in latent, reward head and
+  # Q both read the latent. Nothing decodes to observation space.
+  # ---------------------------------------------------------------------
+  tdmpc:
+    # Env steps per model update. No counterpart in QC, so a free choice;
+    # the offline phase costs no env steps, so this is cheap where it counts.
+    train_every: 2
+    batch_size: 256
+    # Latent rollout length per update. 5 = chunk_len, so the model is
+    # trained on exactly the depth a single-chunk scorer consumes (TD-MPC2's
+    # own default is 3). Raise with rollout_chunks if scoring deeper.
+    horizon: 5
+
+    # --- architecture, TD-MPC2 defaults for state observations
+    latent_dim: 512
+    mlp_dim: 512
+    # Encoder hidden width (TD-MPC2 enc_dim): enc_layers-1 hidden layers of
+    # this width, then the latent. Narrower than the heads, as in the ref.
+    enc_dim: 256
+    enc_layers: 2
+    # SimNorm group size. The latent is softmaxed in groups of this many,
+    # which keeps it bounded WITHOUT a reconstruction loss -- the reason this
+    # model needs no decoder. Each group is also a categorical distribution,
+    # which the optimistic arm's loss reads literally.
+    simnorm_dim: 8
+    num_q: 5
+    dropout: 0.01
+    # Dynamics heads. 1 = TD-MPC2. The explore arm sets its own value.
+    num_dyn: 1
+
+    # --- symlog two-hot for BOTH reward and value, matching the Dreamer
+    # config this replaced. Both terms of a chunk score come out in raw
+    # units, so pooled imagined reward and terminal Q are directly addable
+    # and comparable to the QC critic's own Q.
+    num_bins: 101
+    vmin: -10.0
+    vmax: 10.0
+
+    # --- optimization, TD-MPC2 defaults
+    lr: 3e-4
+    enc_lr_scale: 0.3
+    tau: 0.01
+    rho: 0.5
+    consistency_coef: 20.0
+    reward_coef: 0.1
+    value_coef: 0.1
+    entropy_coef: 1e-4
+    grad_clip_norm: 20.0
+
+    # --- accuracy checks at every eval (tdmpc/diagnostics.py). Offline
+    # against replay windows that contain an above-baseline reward, ZERO env
+    # steps. 0 disables. depth is in chunks; 1 = what a single-chunk scorer
+    # consumes.
+    diag_windows: 256
+    diag_depth: 1
+
+  # ---------------------------------------------------------------------
+  # Per-arm knobs. Each arm differs from its comparison partner ONLY in
+  # its own block.
   # ---------------------------------------------------------------------
 
-  train_sac_chunked_wm:
-    # QC-FQL training + TD-MPC2-scored chunk selection at act time.
-    #
-    # TRAINING is plain QC-FQL on raw observations -- the target, critic,
-    # actor and batch are identical to the critic-selection arm, and
-    # _agent_update takes no model argument at all.
-    #
-    # The latent model is used in ONE place: at every chunk boundary the
-    # ChunkSelector samples select_n candidate chunks from the one-step
-    # policy, encodes the current observation once, imagines each candidate in
-    # LATENT space, scores it as
-    #
-    #   sum_t gamma^t * r_model(z_t, a_t) + gamma^H * Q_model(z_H, pi(z_H))
-    #
-    # and executes the argmax. Nothing decodes back to observation space at
-    # any point: the encoder produces a latent, the dynamics stay in it, and
-    # the reward head and Q both read it directly. That removes the decoder
-    # error the previous (Dreamer) scorer carried on every candidate, and the
-    # latent policy prior lets the horizon extend without a decode.
-    #
-    # This targets the observed bottleneck directly: the previous runs never
-    # found a single online success, and selection changes WHICH chunks get
-    # executed, i.e. whether success data ever appears. It also degrades
-    # gracefully -- if the scores are uninformative noise, the argmax over
-    # i.i.d. policy samples is distributed like a single policy sample, so the
-    # worst case is QC-FQL, not below it.
-    #
-    # select_n: 1 disables the selector entirely (select() is policy.act), so
-    # the run reduces to QC-FQL exactly. That is the control.
-    #
-    # Execution stays at chunk_len. The selector chooses which chunk runs;
-    # the open-loop commitment length is unchanged.
+  # train_sac_chunked_ranking.py  (partner: train_sac_chunked.py)
+  ranking:
+    # Chunks imagined per candidate. 1 = the candidate only, then the latent
+    # Q. More = continue with the policy prior's actions at the imagined
+    # latent -- no decode, so depth costs dynamics error (wm/latent_drift),
+    # never decoder error.
+    rollout_chunks: 1
 
-    general:
-      env_name: cube-triple-play-singletask-v0
-      run_name: ''
-      model_ckpt: ''
-      seed_from_offline: True
-      num_offline_steps: 250000
-      num_online_steps: 1000000
-      num_seed_steps: 4000
-      start_training: 5000
-      log_every: 100
-      save_every: 10000
-      eval_every: 10000
-      eval_episodes: 20
-      out_dir: train_sac_chunked_wm_out
-      wandb_project: beat-qc-fql
-      wandb_mode: online
+  # train_sac_chunked_mve.py  (partner: train_sac_chunked.py)
+  mve:
+    # Chunks of latent expansion after the real chunk. 1 = the QC actor's
+    # own next chunk through the model, then the latent Q. 0 = latent Q at
+    # s' with no rollout. More = continue with the policy prior.
+    chunks: 1
+    # Blend: target bootstrap = (1-w) * Q_qc(s', a') + w * V_mve(s').
+    # 0 recovers QC exactly; 1 is pure MVE. Start in the middle -- the
+    # model's value is trained on single-step TD and is noisier early.
+    weight: 0.5
 
-    tdmpc:
-      # TD-MPC2 latent model (nicklashansen/tdmpc2, state-observation variant).
-      # It has no counterpart in QC, so this cadence is a free choice. The
-      # model gets an update every 2 env steps -- it is the component the
-      # scorer depends on, and the offline phase costs no env steps, so this
-      # is cheap where it matters.
-      train_every: 2
-      max_episodes: 2000
-      # Rows per update, cut from the same replay draw QC-FQL uses.
-      batch_size: 256
-      # Latent rollout length per update. TD-MPC2's default. This is the
-      # TRAINING horizon; the scoring horizon is chunk_len *
-      # select_rollout_chunks and is independent of it.
-      horizon: 3
+  # train_sac_chunked_explore.py  (partner: train_sac_chunked_ranking.py)
+  explore:
+    rollout_chunks: 1
+    # Dynamics heads for the disagreement bonus (Pathak et al. use 5).
+    num_dyn: 5
+    # Bonus weight in REWARD units: reward is -1 per step until success, so
+    # beta 1.0 means "worth one step" per typical disagreement.
+    beta: 1.0
 
-      # --- architecture, TD-MPC2 defaults for state observations
-      latent_dim: 512
-      mlp_dim: 512
-      enc_layers: 2
-      # SimNorm group size. The latent is softmaxed in groups of this many,
-      # which is what keeps it bounded WITHOUT a reconstruction loss -- the
-      # reason this model needs no decoder at all.
-      simnorm_dim: 8
-      num_q: 5
-      dropout: 0.01
+  # train_sac_chunked_optimistic.py  (partner: train_sac_chunked_ranking.py)
+  optimistic:
+    rollout_chunks: 1
+    # Paper's O-DreamerV3 values. alpha 0.1 collapses learning there;
+    # keep it tiny.
+    alpha: 1.0e-4
+    eta: 3.0e-6
+    # lambda-return mixing for the advantage, and how many real starts per
+    # update are rolled with the prior for `horizon` imagined steps.
+    lam: 0.95
+    imag_batch: 64
+    horizon: 5
 
-      # --- symlog two-hot for BOTH reward and value, matching the Dreamer
-      # config this replaces. Both terms of a chunk score come out in raw
-      # units, so pooled imagined reward and the terminal Q are directly
-      # addable and comparable to the QC critic's own Q.
-      num_bins: 101
-      vmin: -10.0
-      vmax: 10.0
+# =======================================================================
+# Presets. Layer on top of defaults with --configs NAME. They may only
+# override keys that exist above.
+# =======================================================================
 
-      # --- optimization, TD-MPC2 defaults
-      lr: 3e-4
-      # The encoder trains slower than the heads: every loss backs through it,
-      # so full-speed updates make the reward and value targets non-stationary
-      # for reasons unrelated to the data.
-      enc_lr_scale: 0.3
-      tau: 0.01
-      # Per-step discount on the rollout losses.
-      rho: 0.5
-      consistency_coef: 20.0
-      reward_coef: 0.1
-      value_coef: 0.1
-      entropy_coef: 1e-4
-      grad_clip_norm: 20.0
-
-      # --- accuracy checks, run at every eval (tdmpc/diagnostics.py)
-      # OFFLINE against replay windows, ZERO env steps. Windows are sampled
-      # with bias_start_to_reward so they are guaranteed to contain reward
-      # variation -- without that every ground-truth reward is identical and
-      # every correlation is undefined. 0 disables.
-      diag_windows: 256
-      # Rollout depth of the report, in CHUNKS. The selector only looks
-      # select_rollout_chunks ahead, so 1 measures exactly what it consumes.
-      # The model is deterministic (dynamics and the prior's mean action), so
-      # unlike the RSSM there is no multi-draw averaging to configure.
-      diag_depth: 1
-
-    chunk:
-      chunk_len: 5
-      # Candidate chunks sampled and model-scored per decision. This is the
-      # exploitation knob: QC's best-of-N analysis bounds the KL from the
-      # sampling policy by log N - (N-1)/N, and the paper used N=32 on
-      # cube-*. 16 halves the per-decision model cost; raise it if
-      # select/score_std says the scores separate candidates cleanly.
-      # 1 disables the selector -> exact QC-FQL (the control run).
-      select_n: 16
-      # Chunks imagined per candidate. 1 = imagine the candidate chunk only
-      # (chunk_len latent steps), then the terminal latent Q. Raising it
-      # continues the rollout with actions from the model's own policy prior
-      # at the imagined latent -- pure latent steps, no decode, so unlike the
-      # previous scorer depth does not compound decoder error. It does
-      # compound DYNAMICS error, which wm/latent_drift measures.
-      # Keep at 1 unless testing depth deliberately.
-      select_rollout_chunks: 1
-      # Real chunk transitions per critic/actor update -- QC's batch_size.
-      batch_size: 256
-      train_every: 1
-      gamma: 0.99
-      lr: 3e-4
-      hidden_dim: 512
-      num_layers: 4
-      critic_target_tau: 0.005
-      ensemble: 2
-      q_agg: mean
-      alpha: 300.0
-      flow_steps: 10
-      eef_slice: [12, 15]
-      # torch.compile(mode='default') on the actor/critic. The per-step cost is
-      # ~400 tiny kernel launches rather than arithmetic, so fusing them is the
-      # lever. Costs a minute or two at startup; set False if it misbehaves --
-      # it is a pure speed change and alters no results.
-      compile_nets: True
-
-  train_sac_chunked:
-
-    general:
-      env_name: cube-triple-play-singletask-v0
-      run_name: ''
-      seed_from_offline: True
-      num_offline_steps: 250000
-      num_online_steps: 1000000
-      num_seed_steps: 4000
-      start_training: 5000 # see the note under train_sac_chunked_wm.general
-      log_every: 100
-      save_every: 10000
-      eval_every: 10000
-      eval_episodes: 20
-      out_dir: train_sac_chunked_out
-      wandb_project: beat-qc-fql
-      wandb_mode: online
-
-    chunk:
-      chunk_len: 5
-      # Candidate chunks per decision, scored by the ONLINE CRITIC
-      # Q(s, chunk) -- QC's own best-of-N. Same N as the model arm so the two
-      # arms differ only in what does the scoring. 1 = plain QC-FQL.
-      select_n: 16
-      train_every: 1
-      utd_ratio: 1
-      batch_size: 256
-      # Floor only -- train_sac_chunked.py raises this at runtime to
-      # max(replay_capacity, offline_dataset_size + num_online_steps + 1),
-      # matching main.py's `max(buffer_size, train_dataset.size + 1)`. A
-      # fixed 1M would already be full from the offline seed alone on
-      # cube-double, so the first online transition would evict offline data.
-      replay_capacity: 1000000
-      gamma: 0.99
-      lr: 3e-4
-      hidden_dim: 512
-      num_layers: 4
-      critic_target_tau: 0.005
-      ensemble: 2
-      q_agg: mean
-      alpha: 300.0
-      flow_steps: 10
-      eef_slice: [12, 15]
+# Fast CPU sanity run on the toy pusher (toy/point_push.py). Small nets,
+# short phases, no wandb. Enough to see whether an arm beats the control
+# in minutes -- NOT a substitute for cube runs.
+toy:
+  general:
+    env_name: toy-point-push
+    out_dir: runs/toy
+    wandb_mode: disabled
+    num_offline_steps: 6000
+    num_online_steps: 10000
+    start_training: 500
+    log_every: 200
+    save_every: 100000
+    eval_every: 2000
+    eval_episodes: 20
+    toy_offline_episodes: 300
+  chunk:
+    hidden_dim: 256
+    num_layers: 3
+    alpha: 30.0
+    eef_slice: [0, 2]
+    compile_nets: False
+    replay_capacity: 100000
+  tdmpc:
+    latent_dim: 64
+    mlp_dim: 128
+    enc_dim: 64
+    num_q: 3
+    batch_size: 128
+    diag_windows: 128
+  optimistic:
+    imag_batch: 32

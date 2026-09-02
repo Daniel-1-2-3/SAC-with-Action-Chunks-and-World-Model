@@ -1,18 +1,26 @@
 """ TD-MPC2 networks and the symlog two-hot machinery, in PyTorch.
 
     Ported from github.com/nicklashansen/tdmpc2 (common/layers.py,
-    common/math.py, common/world_model.py), state-observation variant.
+    common/math.py, common/init.py, common/world_model.py), state-observation
+    variant, checked module by module against that source.
 
     NOTHING here decodes back to observation space. The encoder maps a raw
     observation to a latent, the dynamics stay in that latent, and the reward
     head, the Q ensemble and the policy prior all read the latent directly.
-    That is the whole reason for the swap: the previous scorer had to decode
-    an imagined latent before the observation-space critic could look at it,
-    so every score carried decoder error on top of dynamics error.
 
     Reward and value are predicted as two-hot distributions over symlog-spaced
-    bins, matching the Dreamer configuration this replaces, so the reward term
-    and the value term of a chunk score stay in comparable units. """
+    bins, matching the Dreamer configuration this replaced, so the reward term
+    and the value term of a chunk score stay in comparable units.
+
+    Two additions over the reference, both off by default:
+      num_dyn > 1   an ENSEMBLE of dynamics heads. The rollout uses their mean;
+                    their spread is the disagreement bonus of the explore arm
+                    (Pathak et al. 2019, "Self-Supervised Exploration via
+                    Disagreement").
+      categorical   the SimNorm latent read as G independent categoricals, so
+                    a next-latent has a log-likelihood. The optimistic arm's
+                    RBMLE loss needs that (Mete et al. 2026, "Optimistic World
+                    Models"). """
 
 from copy import deepcopy
 
@@ -81,15 +89,25 @@ def squash(mu, pi, log_pi):
 
 
 # --------------------------------------------------------------------------
-# layers (common/layers.py)
+# layers (common/layers.py, common/init.py)
 # --------------------------------------------------------------------------
+
+def weight_init(m):
+    """ TD-MPC2's init: truncated normal (std 0.02) on every Linear, zero
+        bias. """
+    if isinstance(m, nn.Linear):
+        nn.init.trunc_normal_(m.weight, std=0.02)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+
 
 class SimNorm(nn.Module):
     """ Simplicial normalization: split the latent into groups of `dim` and
         softmax each group. This is what keeps TD-MPC2's latent bounded
         without a reconstruction loss -- the latent cannot blow up or collapse
         to a constant scale, so the consistency loss alone is enough to keep
-        it meaningful. """
+        it meaningful. Each group is also, read literally, a categorical
+        distribution over `dim` classes; the optimistic loss uses that. """
 
     def __init__(self, dim=8):
         super().__init__()
@@ -103,7 +121,7 @@ class SimNorm(nn.Module):
 
 
 class NormedLinear(nn.Module):
-    """ Linear -> LayerNorm -> activation, TD-MPC2's basic block. """
+    """ Linear -> (dropout) -> LayerNorm -> activation, TD-MPC2's block. """
 
     def __init__(self, in_dim, out_dim, act=None, dropout=0.0):
         super().__init__()
@@ -120,6 +138,9 @@ class NormedLinear(nn.Module):
 
 
 def mlp(in_dim, hidden_dim, out_dim, num_layers, out_act=None, dropout=0.0):
+    """ layers.mlp: num_layers NormedLinear hidden layers (dropout on the
+        first only), then either a plain Linear or a NormedLinear with the
+        given output activation. """
     layers, d = [], in_dim
     for i in range(num_layers):
         layers.append(NormedLinear(d, hidden_dim, dropout=dropout if i == 0 else 0.0))
@@ -138,58 +159,106 @@ def mlp(in_dim, hidden_dim, out_dim, num_layers, out_act=None, dropout=0.0):
 class TDMPC2Nets(nn.Module):
     """ Encoder, latent dynamics, reward head, Q ensemble and policy prior.
 
-        Every head takes a LATENT. The policy prior is what lets the score
-        look past the candidate chunk: the follow-on actions are sampled at
-        the imagined latent, so extending the horizon costs one dynamics step
-        per action and no decode at all. """
+        Every head takes a LATENT. The policy prior is what lets a score look
+        past the candidate chunk: the follow-on actions are sampled at the
+        imagined latent, so extending the horizon costs one dynamics step per
+        action and no decode at all. """
 
     def __init__(self, obs_dim, action_dim, latent_dim=512, mlp_dim=512,
-                 enc_layers=2, simnorm_dim=8, num_q=5, dropout=0.01,
-                 num_bins=101, vmin=-10.0, vmax=10.0):
+                 enc_dim=256, enc_layers=2, simnorm_dim=8, num_q=5,
+                 dropout=0.01, num_bins=101, vmin=-10.0, vmax=10.0, num_dyn=1):
         super().__init__()
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.latent_dim = latent_dim
+        self.simnorm_dim = simnorm_dim
         self.num_q = num_q
+        self.num_dyn = max(1, int(num_dyn))
         self.num_bins = num_bins
         self.vmin = vmin
         self.vmax = vmax
         self.log_std_min, self.log_std_max = -10.0, 2.0
 
-        self.encoder = mlp(obs_dim, mlp_dim, latent_dim, enc_layers,
+        # layers.enc: max(num_enc_layers - 1, 1) hidden layers of enc_dim,
+        # then a NormedLinear to the latent with SimNorm as its activation.
+        self.encoder = mlp(obs_dim, enc_dim, latent_dim, max(enc_layers - 1, 1),
                            out_act=SimNorm(simnorm_dim))
-        self.dynamics = mlp(latent_dim + action_dim, mlp_dim, latent_dim, 2,
-                            out_act=SimNorm(simnorm_dim))
+        self.dynamics = nn.ModuleList([
+            mlp(latent_dim + action_dim, mlp_dim, latent_dim, 2,
+                out_act=SimNorm(simnorm_dim))
+            for _ in range(self.num_dyn)])
         self.reward = mlp(latent_dim + action_dim, mlp_dim, num_bins, 2)
         self.pi_net = mlp(latent_dim, mlp_dim, 2 * action_dim, 2)
         self.Qs = nn.ModuleList([
             mlp(latent_dim + action_dim, mlp_dim, num_bins, 2, dropout=dropout)
             for _ in range(num_q)])
+        self.register_buffer(
+            'bins', torch.linspace(vmin, vmax, num_bins), persistent=False)
+
+        # world_model.py: trunc-normal init everywhere, then the OUTPUT layer
+        # of the reward head and of every Q head is zeroed, so both start out
+        # predicting the middle bin (0) instead of noise.
+        self.apply(weight_init)
+        nn.init.zeros_(self.reward[-1].weight)
+        for q in self.Qs:
+            nn.init.zeros_(q[-1].weight)
+
         # Target copy lives here rather than on the trainer so it travels with
         # state_dict(). Updated by soft_update_target_q, never by the
-        # optimizer.
+        # optimizer. Created AFTER init so it inherits the zeroed outputs.
         self.Qs_target = deepcopy(self.Qs)
         for p in self.Qs_target.parameters():
             p.requires_grad_(False)
-        self.register_buffer(
-            'bins', torch.linspace(vmin, vmax, num_bins), persistent=False)
+
+    def train(self, mode=True):
+        """ world_model.py overrides train() so the TARGET Q heads stay in
+            eval mode -- their dropout must never be active, even mid-update,
+            or the TD target picks up dropout noise. """
+        super().train(mode)
+        self.Qs_target.train(False)
+        return self
+
+    # --------------------------------------------------------------- heads
 
     def encode(self, obs):
         return self.encoder(obs)
 
+    def next_all(self, z, action):
+        """ Every dynamics head's prediction, (num_dyn, B, latent_dim). """
+        h = torch.cat([z, action], dim=-1)
+        return torch.stack([d(h) for d in self.dynamics], dim=0)
+
     def next(self, z, action):
-        return self.dynamics(torch.cat([z, action], dim=-1))
+        """ Next latent. With one head this is that head; with an ensemble it
+            is the mean, which stays on the SimNorm simplices because they
+            are convex. """
+        if self.num_dyn == 1:
+            return self.dynamics[0](torch.cat([z, action], dim=-1))
+        return self.next_all(z, action).mean(0)
+
+    def disagreement(self, z, action):
+        """ Pathak et al. eq. 1: variance across the ensemble of the predicted
+            next latent, averaged over latent dims. (B, 1). Zero by
+            construction with a single head. """
+        if self.num_dyn == 1:
+            return torch.zeros(z.shape[0], 1, device=z.device, dtype=z.dtype)
+        return self.next_all(z, action).var(0, unbiased=False).mean(-1, keepdim=True)
+
+    def reward_logits(self, z, action):
+        return self.reward(torch.cat([z, action], dim=-1))
 
     def reward_pred(self, z, action):
         """ Raw predicted reward, (B, 1). """
         return from_two_hot(self.reward_logits(z, action), self.bins)
 
-    def reward_logits(self, z, action):
-        return self.reward(torch.cat([z, action], dim=-1))
-
     def pi(self, z):
         """ Returns (mu, action, log_prob), all tanh-squashed to [-1, 1].
-            `mu` is the deterministic mean action. """
+            `mu` is the deterministic mean action.
+
+            world_model.py additionally reports a "scaled entropy", which is
+            -log_prob multiplied by action_dim (its entropy_scale reduces to
+            exactly that outside the multitask path). pi_loss uses the scaled
+            one; it is recoverable here as -log_prob * action_dim. """
         mu, log_std = self.pi_net(z).chunk(2, dim=-1)
         log_std = self.log_std_min + 0.5 * (self.log_std_max - self.log_std_min) * \
             (torch.tanh(log_std) + 1)
@@ -207,3 +276,38 @@ class TDMPC2Nets(nn.Module):
     def q_values(self, z, action, target=False):
         """ Raw Q per ensemble member, (num_q, B, 1). """
         return from_two_hot(self.q_logits(z, action, target), self.bins)
+
+    def q_subset(self, z, action, reduce='min', target=False):
+        """ world_model.py Q(return_type='min'|'avg'): two RANDOM heads,
+            reduced. 'min' is the pessimistic TD target; 'avg' is what the
+            policy-prior loss and TD-MPC2's own planner use. (B, 1). """
+        idx = torch.randperm(self.num_q, device=z.device)[:2]
+        q = self.q_values(z, action, target)[idx]
+        return q.min(0).values if reduce == 'min' else q.mean(0)
+
+    # ------------------------------------------- categorical view of a latent
+
+    def as_categorical(self, z):
+        """ (B, latent_dim) on the SimNorm simplices -> (B, G, simnorm_dim)
+            per-group class probabilities. No computation: it is a reshape. """
+        return z.view(*z.shape[:-1], -1, self.simnorm_dim)
+
+    def sample_latent(self, z_probs):
+        """ Draw one class per group and return the one-hot latent with a
+            straight-through gradient to the probabilities (Dreamer's trick),
+            plus the log-likelihood of the draw, summed over groups.
+
+            Used only by the optimistic loss, which needs a SAMPLED next
+            latent whose likelihood the dynamics can be pushed on. Scoring
+            and the consistency loss stay deterministic. """
+        p = self.as_categorical(z_probs)
+        idx = torch.multinomial(p.reshape(-1, self.simnorm_dim), 1).view(*p.shape[:-1])
+        onehot = F.one_hot(idx, self.simnorm_dim).to(p.dtype)
+        sample = onehot + p - p.detach()
+        logp = torch.log(p.clamp_min(1e-8)).gather(-1, idx.unsqueeze(-1)).squeeze(-1).sum(-1, keepdim=True)
+        return sample.view(*z_probs.shape), logp
+
+    def latent_entropy(self, z_probs):
+        """ Sum over groups of the categorical entropy, (B, 1). """
+        p = self.as_categorical(z_probs)
+        return -(p * torch.log(p.clamp_min(1e-8))).sum(-1).sum(-1, keepdim=True)

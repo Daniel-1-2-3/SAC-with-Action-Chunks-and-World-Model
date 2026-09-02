@@ -1,51 +1,53 @@
-# Critic best-of-N vs TD-MPC2 best-of-N, cube-triple
+# World models for action-chunked RL (QC-FQL), cube-triple
 
-Two arms, seeds 0 and 1 each. Both pretrain 250k offline then run 1M
-online. Both sample select_n=16 candidate chunks per decision from the
-same QC-FQL policy. The ONLY difference is what scores the candidates:
+Five arms. Every arm trains the SAME policy: QC-FQL (chunked flow
+Q-learning, ported from ColinQiyangLi/qc), observation-space actor and
+critic, real chunk transitions from one shared replay buffer. Four of them
+also train a TD-MPC2 latent model on that same replay (encoder -> latent,
+dynamics in latent, reward head and Q both reading the latent, latent
+policy prior; nothing decodes to observation space). Each arm uses the
+model in exactly ONE way, and differs from its comparison partner in
+exactly that:
 
-- Arm 1 (`train_sac_chunked.py`): the online critic, Q(s, chunk).
-  This is QC's own best-of-N. No learned model anywhere. CONTROL.
-- Arm 2 (`train_sac_chunked_wm.py`): a TD-MPC2 latent model, trained
-  alongside on the same replay and used for scoring only:
+| script | arm | what the model does | partner |
+|---|---|---|---|
+| `train_sac_chunked.py` | **control** | nothing. Critic ranks `select_n` candidate chunks (QC's own best-of-N). `--chunk.select_n=1` = plain QC-FQL | -- |
+| `train_sac_chunked_ranking.py` | **ranking** | ranks the same candidates by `sum gamma^t r_model + gamma^H Q_model` | control |
+| `train_sac_chunked_mve.py` | **mve** | replaces the critic's bootstrap with a latent value expansion (Feinberg et al. 2018). Acting is the control's | control |
+| `train_sac_chunked_explore.py` | **explore** | ranking + dynamics-ensemble disagreement bonus (Pathak et al. 2019) | ranking |
+| `train_sac_chunked_optimistic.py` | **optimistic** | ranking with an optimistic (RBMLE) dynamics loss (Mete et al. 2026) | ranking |
 
-      sum_t gamma^t * r_model(z_t, a_t) + gamma^H * Q_model(z_H, pi(z_H))
+The method of each arm is in `arms/<name>.py`; the shared loop is
+`sac_chunked/experiment.py`; the model is `tdmpc/`; the buffer is
+`sac_chunked/replay.py`; the selector is `wm/chunk_selector.py`. One
+`configs.yaml` holds the QC block and the model block ONCE, so arms cannot
+drift apart; each arm's own knobs sit in its own block.
 
-  Nothing decodes back to observation space. The encoder produces a
-  latent, the dynamics stay in it, and the reward head and Q both read
-  the latent directly. Reward and value are symlog two-hot, so both
-  terms of the score are in the same units as each other and as the QC
-  critic. select_rollout_chunks stays 1.
+## Is the model contributing anything?
 
-QC-FQL training is IDENTICAL in both arms: observation-space actor and
-critic, real chunk transitions from replay, target
-R_real + gamma^h * mask * Q(s_next). `_agent_update` takes no model
-argument by signature, so the model cannot touch training. Its entire
-effect flows through which chunks get executed, i.e. through the data.
+Read these before anything else on a model-arm run:
 
-Because both arms sample the same 16 candidates from the same policy and
-differ only in the scorer, any gap is attributable to the model.
+- `select/term_r_share`  reward term's share of the score's spread across
+  candidates. Near 0: the reward head is irrelevant to the ranking.
+- `select/term_q_std`  spread of the terminal latent value.
+- `select/pick_agreement`, `select/model_critic_corr`  how often / how
+  closely the model picks what the critic would. Near 1: the arm has
+  reduced to the control.
+- `mve/corr`, `mve/abs_gap` (mve arm)  is the expansion informative, or a
+  noisier copy of the QC bootstrap.
+- `select/bonus_only_agree` (explore arm)  is the bonus driving the pick.
+- `wm/reward_corr`, `wm/latent_drift_rel`, `wm/value_critic_corr`  model
+  accuracy against replay at every eval, zero env steps
+  (`tdmpc/diagnostics.py`).
 
-Is the model contributing anything? Four selection metrics answer that
-directly, and they are the first thing to read on any run:
+## Running
 
-- `select/term_r_share`   reward term's share of the score's spread
-                          across candidates. Near 0 means the reward head
-                          is irrelevant to the ranking.
-- `select/term_q_std`     spread of the terminal latent value.
-- `select/pick_agreement` how often the model picks the same chunk the
-                          critic would. Near 1.0 means this arm has
-                          reduced to the control.
-- `select/model_critic_corr` the same question as a correlation.
+Commands in COMMANDS.txt. Always pass `--general.run_name`.
 
-Model accuracy is checked offline against replay at every eval
-(`tdmpc/diagnostics.py`, zero env steps): pooled imagined chunk reward
-vs real, latent drift relative to the spread between encoded states, and
-the model value's correlation with the QC critic.
+Fast sanity race on the toy pusher (`toy/point_push.py`, CPU, minutes):
 
-Metric decided in advance: steps until eval/mean_return first crosses a
-fixed threshold both arms clearly pass. Log the 2/3-cube crossing and the
-3/3 crossing separately -- the previous single-seed run reached 2/3
-earlier than the critic arm but never got the third cube.
+    python toy/race.py --arms critic ranking mve explore optimistic --seeds 0 1
 
-Commands in COMMANDS.txt. Always pass run_name.
+Metric decided in advance for cube: steps until eval/mean_return first
+crosses a fixed threshold both arms clearly pass. Log the 2/3-cube crossing
+and the 3/3 crossing separately.

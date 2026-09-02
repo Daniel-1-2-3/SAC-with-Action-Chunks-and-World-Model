@@ -1,18 +1,16 @@
 """ The TD-MPC2 latent model as this repo uses it: trained on real replay
-    sequences alongside QC-FQL, consumed ONLY by the ChunkSelector.
+    windows alongside QC-FQL, consumed by the arms in whatever way each arm
+    defines (chunk scoring, value expansion, exploration bonus).
 
-    It has no influence on QC-FQL training. The actor and critic still live in
-    observation space, still update on real chunk transitions from replay, and
-    still use the target R_real + gamma^h * mask * Q(s_next). This model only
-    decides WHICH of the policy's candidate chunks gets executed, so its
-    entire effect on the run flows through the data that selection collects.
+    Port of tdmpc2.py `_update` / `update_pi` / `_td_target`, checked against
+    github.com/nicklashansen/tdmpc2. Deviations are marked DEVIATION.
 
-    Note on termination: TD-MPC2 has no continue head, so imagined rollouts
-    are discounted but never truncated. The TD targets DO respect real
-    terminations through the replay mask; it is only the imagined score that
-    treats the episode as ongoing. On these cube tasks that is the same
-    assumption QC's own best-of-N makes, so the two arms are not being
-    scored under different termination models. """
+    Note on termination: TD-MPC2 (non-episodic config) has no termination
+    head, so imagined rollouts are discounted but never truncated. The TD
+    targets DO respect real terminations through the replay mask; only
+    imagination treats the episode as ongoing. QC's own bootstrap makes the
+    same assumption inside a chunk, so the arms are not scored under
+    different termination models. """
 
 import numpy as np
 import torch
@@ -22,30 +20,38 @@ from tdmpc.model import TDMPC2Nets, soft_ce
 
 
 class RunningScale:
-    """ TD-MPC2's running scale for the policy-prior loss. Q magnitudes drift
-        by orders of magnitude over training; dividing by this keeps the
-        prior's gradient scale roughly constant so entropy_coef means the same
-        thing at step 1k and step 1M. """
+    """ common/scale.py: running trimmed scale. Tracks the 5th-95th percentile
+        range of a batch of values (clamped to at least 1) with an EMA at rate
+        tau. Used to normalise Q in the policy-prior loss and returns in the
+        optimistic loss, so their coefficients mean the same thing at step 1k
+        and step 1M. """
 
     def __init__(self, tau=0.01):
         self.tau = tau
         self.value = 1.0
 
+    @torch.no_grad()
     def update(self, x):
-        x = float(x)
-        if not np.isfinite(x) or x <= 0:
+        x = x.detach().flatten().float()
+        if x.numel() < 2:
             return
-        self.value = (1 - self.tau) * self.value + self.tau * x
+        lo, hi = torch.quantile(x, torch.tensor([0.05, 0.95], device=x.device))
+        span = float(torch.clamp(hi - lo, min=1.0))
+        if np.isfinite(span):
+            self.value = (1 - self.tau) * self.value + self.tau * span
 
     def __call__(self):
-        return max(self.value, 1e-6)
+        return self.value
 
 
 class TDMPC2Model:
-    """ Owns the nets, the optimizers and the update. Everything the selector
-        needs is here: encode, rollout_chunk, rollout_pi_chunk, terminal_value. """
+    """ Owns the nets, the optimizers and the update. The scoring-side API
+        (encode, rollout_chunk, rollout_pi_chunk, terminal_value,
+        chunk_disagreement) is everything the arms call at act time. """
 
-    def __init__(self, obs_dim, action_dim, device, cfg, gamma):
+    def __init__(self, obs_dim, action_dim, device, cfg, gamma, optimism=None):
+        """ optimism: None, or a config block {alpha, eta, lam, imag_batch,
+            horizon} enabling the Optimistic-World-Models loss. """
         self.device = device
         self.action_dim = action_dim
         self.gamma = gamma
@@ -54,20 +60,19 @@ class TDMPC2Model:
         self.rho = float(cfg.rho)
         self.tau = float(cfg.tau)
         self.num_q = int(cfg.num_q)
+        self.optimism = optimism
 
         self.net = TDMPC2Nets(
             obs_dim, action_dim, latent_dim=cfg.latent_dim, mlp_dim=cfg.mlp_dim,
-            enc_layers=cfg.enc_layers, simnorm_dim=cfg.simnorm_dim,
-            num_q=cfg.num_q, dropout=cfg.dropout, num_bins=cfg.num_bins,
-            vmin=cfg.vmin, vmax=cfg.vmax).to(device)
+            enc_dim=cfg.enc_dim, enc_layers=cfg.enc_layers,
+            simnorm_dim=cfg.simnorm_dim, num_q=cfg.num_q, dropout=cfg.dropout,
+            num_bins=cfg.num_bins, vmin=cfg.vmin, vmax=cfg.vmax,
+            num_dyn=getattr(cfg, 'num_dyn', 1)).to(device)
 
-        # The encoder trains at a lower rate than the heads (TD-MPC2's
-        # enc_lr_scale). It is the one module every other loss backs through,
-        # so letting it move at full speed makes the reward and value targets
-        # non-stationary for reasons unrelated to the data.
+        # tdmpc2.py: the encoder trains at lr * enc_lr_scale, every other
+        # module at lr, and the policy prior has its OWN optimizer (eps 1e-5)
+        # and is not in this one.
         enc_params = list(self.net.encoder.parameters())
-        # The policy prior has its own optimizer and its own loss, so it must
-        # NOT also sit in the main one -- TD-MPC2 keeps the two disjoint.
         held = {id(p) for p in enc_params}
         held |= {id(p) for p in self.net.pi_net.parameters()}
         rest = [p for p in self.net.parameters()
@@ -75,106 +80,113 @@ class TDMPC2Model:
         self.opt = torch.optim.Adam([
             {'params': enc_params, 'lr': cfg.lr * cfg.enc_lr_scale},
             {'params': rest, 'lr': cfg.lr}])
-        self.pi_opt = torch.optim.Adam(self.net.pi_net.parameters(), lr=cfg.lr)
-        self.scale = RunningScale()
+        self.pi_opt = torch.optim.Adam(self.net.pi_net.parameters(), lr=cfg.lr,
+                                       eps=1e-5)
+        self.scale = RunningScale(tau=self.tau)
+        self.ret_scale = RunningScale(tau=0.01)
         # Eval mode by default. The Q heads carry dropout, and dropout during
         # SCORING would draw a different mask for every candidate in the
-        # batch -- injecting noise into the exact comparison the arm exists to
-        # make. update() turns it on for the duration of the update only, the
-        # same way TD-MPC2 does.
+        # batch -- injecting noise into the exact comparison the arms exist to
+        # make. update() turns it on for its own duration only, as tdmpc2.py
+        # does.
         self.net.eval()
 
     # ---------------------------------------------------------------- scoring
 
     @torch.no_grad()
     def encode(self, obs):
-        """ obs: (B, obs_dim) torch tensor -> latent (B, latent_dim).
-
-            No carry, no history: the encoder is Markov, so there is nothing
-            to keep filtered between steps. This is why the selector no longer
-            needs an observe/record_action pass on every environment step. """
+        """ obs: (B, obs_dim) -> latent (B, latent_dim). No carry, no history:
+            the encoder is Markov, so nothing is kept between steps. """
         return self.net.encode(obs)
 
     @torch.no_grad()
     def rollout_chunk(self, z, chunk_actions, discount0=1.0):
-        """ Imagine one chunk of given actions.
+        """ Imagine one chunk of GIVEN actions.
 
             z: (B, latent_dim). chunk_actions: (B, chunk_len, action_dim).
-            Returns (z_end, pooled_reward, discount_end) where pooled_reward is
-            sum_k discount0 * gamma^k * r_k and discount_end is
-            discount0 * gamma^chunk_len. """
+            Returns (z_end, pooled_reward, discount_end, disagreement) where
+            pooled_reward = sum_k discount0 * gamma^k * r_k, discount_end =
+            discount0 * gamma^chunk_len, and disagreement is the mean ensemble
+            variance along the rollout (zero with one dynamics head). """
         pooled = torch.zeros(z.shape[0], 1, device=z.device, dtype=z.dtype)
+        dis = torch.zeros_like(pooled)
         disc = discount0
-        for k in range(chunk_actions.shape[1]):
+        n = chunk_actions.shape[1]
+        for k in range(n):
             a = chunk_actions[:, k]
             pooled = pooled + disc * self.net.reward_pred(z, a)
+            dis = dis + self.net.disagreement(z, a) / n
             z = self.net.next(z, a)
             disc = disc * self.gamma
-        return z, pooled, disc
+        return z, pooled, disc, dis
 
     @torch.no_grad()
     def rollout_pi_chunk(self, z, chunk_len, discount0=1.0):
-        """ Same, but the actions come from the policy prior at each imagined
-            latent. This is how the score looks more than one chunk ahead
-            without ever leaving latent space. Uses the prior's MEAN action:
-            sampling would inject per-candidate noise into a comparison whose
+        """ Same, with actions from the policy prior at each imagined latent.
+            This is how a score looks more than one chunk ahead without
+            leaving latent space.
+
+            DEVIATION: uses the prior's MEAN action. TD-MPC2's planner samples,
+            but sampling injects per-candidate noise into a comparison whose
             whole point is ranking candidates against each other. """
         pooled = torch.zeros(z.shape[0], 1, device=z.device, dtype=z.dtype)
+        dis = torch.zeros_like(pooled)
         disc = discount0
         for _ in range(chunk_len):
             a = self.net.pi(z)[0]
             pooled = pooled + disc * self.net.reward_pred(z, a)
+            dis = dis + self.net.disagreement(z, a) / chunk_len
             z = self.net.next(z, a)
             disc = disc * self.gamma
-        return z, pooled, disc
+        return z, pooled, disc, dis
 
     @torch.no_grad()
     def terminal_value(self, z):
         """ Q(z, pi(z)) at the end of the imagined horizon, (B, 1).
 
-            Mean over the whole ensemble, not TD-MPC2's two random members:
-            the members are re-sampled per call there, and here every
-            candidate in one decision must be scored by the same function or
-            the ranking picks up ensemble noise instead of value. """
+            DEVIATION from _estimate_value, which uses a sampled prior action
+            and the average of two random Q heads: both are fresh noise per
+            call, and every candidate in one decision must be scored by the
+            same function. So: the prior's mean action, mean over the whole
+            ensemble. """
         a = self.net.pi(z)[0]
         return self.net.q_values(z, a).mean(0)
 
     # --------------------------------------------------------------- training
 
     def _td_target(self, next_z, reward, mask):
-        """ reward + gamma * mask * min over two random target Q members.
-            mask is 0 where the real transition terminated, so the bootstrap
-            respects real terminations even though imagination does not. """
+        """ tdmpc2.py _td_target: reward + gamma * mask * min over two random
+            TARGET Q heads at a SAMPLED prior action. """
         a = self.net.pi(next_z)[1]
-        idx = torch.randperm(self.num_q, device=next_z.device)[:2]
-        q = self.net.q_values(next_z, a, target=True)[idx].min(0).values
-        return reward + self.gamma * mask * q
+        return reward + self.gamma * mask * \
+            self.net.q_subset(next_z, a, reduce='min', target=True)
 
-    def update(self, obs, action, reward, mask, valid, metrics_on=True):
-        """ One TD-MPC2 joint update on a batch of short real windows.
+    def update(self, obs, next_obs, action, reward, mask, valid, metrics_on=True):
+        """ One TD-MPC2 joint update on a batch of consecutive real
+            transitions (see ChunkTransitionReplay.sample_model_windows).
 
-            obs:    (B, H+1, obs_dim)   real observations
-            action: (B, H, action_dim)  actions taken
-            reward: (B, H, 1)           reward attributable to each action
-            mask:   (B, H, 1)           0 where the transition terminated
-            valid:  (B, H, 1)           0 once the window ran past episode end
+            obs, next_obs: (B, H, obs_dim)     action: (B, H, action_dim)
+            reward, mask, valid: (B, H, 1)     mask 0 at a real termination,
+                                               valid 0 once past episode end
 
-            Three losses on one latent rollout, exactly as TD-MPC2:
-              consistency  the rolled latent must match the encoding of the
-                           real next observation (this is what makes the
-                           latent predictive without any reconstruction)
+            Three losses on one latent rollout, exactly as tdmpc2.py _update:
+              consistency  rolled latent vs sg(enc(next_obs)) -- what makes
+                           the latent predictive without reconstruction
               reward       two-hot CE against the real reward
               value        two-hot CE against the TD target
-            The policy prior is then updated on the detached rollout latents. """
+            then the policy prior on the detached rollout latents, then the
+            target-Q soft update. With a dynamics ensemble, every head gets
+            the consistency loss and the rollout continues through the mean.
+            With `optimism`, the RBMLE loss is added to the total. """
         cfg = self.cfg
-        horizon = action.shape[1]
+        B, horizon = action.shape[:2]
         self.net.train()
 
         with torch.no_grad():
-            next_z_real = self.net.encode(obs[:, 1:])          # (B, H, latent)
+            next_z_real = self.net.encode(next_obs)                # (B, H, latent)
             td_targets = torch.stack([
                 self._td_target(next_z_real[:, t], reward[:, t], mask[:, t])
-                for t in range(horizon)], dim=1)                # (B, H, 1)
+                for t in range(horizon)], dim=1)                   # (B, H, 1)
 
         z = self.net.encode(obs[:, 0])
         zs = [z]
@@ -182,28 +194,38 @@ class TDMPC2Model:
         reward_loss = 0.0
         value_loss = 0.0
         rho = 1.0
-        denom = 0.0
         for t in range(horizon):
             w = valid[:, t]
             reward_loss = reward_loss + rho * (w * soft_ce(
                 self.net.reward_logits(z, action[:, t]), reward[:, t],
                 cfg.vmin, cfg.vmax, cfg.num_bins)).mean()
-            q_logits = self.net.q_logits(z, action[:, t])       # (num_q, B, bins)
+            q_logits = self.net.q_logits(z, action[:, t])          # (num_q, B, bins)
             for i in range(self.num_q):
                 value_loss = value_loss + rho * (w * soft_ce(
                     q_logits[i], td_targets[:, t],
                     cfg.vmin, cfg.vmax, cfg.num_bins)).mean() / self.num_q
-            z = self.net.next(z, action[:, t])
-            consistency_loss = consistency_loss + rho * (
-                w * F.mse_loss(z, next_z_real[:, t], reduction='none')
-                .mean(-1, keepdim=True)).mean()
+            preds = self.net.next_all(z, action[:, t])             # (num_dyn, B, latent)
+            for i in range(preds.shape[0]):
+                consistency_loss = consistency_loss + rho * (
+                    w * F.mse_loss(preds[i], next_z_real[:, t], reduction='none')
+                    .mean(-1, keepdim=True)).mean() / preds.shape[0]
+            z = preds.mean(0)
             zs.append(z)
-            denom += rho
             rho *= self.rho
 
+        # tdmpc2.py divides each term by horizon (value_loss also by num_q,
+        # done inside the loop above), not by the sum of rho weights.
+        consistency_loss = consistency_loss / horizon
+        reward_loss = reward_loss / horizon
+        value_loss = value_loss / horizon
         total = (cfg.consistency_coef * consistency_loss
                  + cfg.reward_coef * reward_loss
-                 + cfg.value_coef * value_loss) / max(denom, 1e-8)
+                 + cfg.value_coef * value_loss)
+
+        opt_metrics = {}
+        if self.optimism is not None:
+            opt_loss, opt_metrics = self._optimistic_loss(obs[:, 0], metrics_on)
+            total = total + opt_loss
 
         self.opt.zero_grad(set_to_none=True)
         total.backward()
@@ -212,44 +234,65 @@ class TDMPC2Model:
             cfg.grad_clip_norm)
         self.opt.step()
 
-        pi_metrics = self._update_pi(torch.stack(zs[:-1], dim=1).detach(),
-                                     valid, metrics_on)
+        # update_pi(zs.detach()) in the reference takes ALL horizon+1 latents,
+        # the final rolled one included. Latent t+1 is meaningful when step t
+        # was inside the episode; latent 0 always is.
+        valid_z = torch.cat([torch.ones_like(valid[:, :1]), valid], dim=1)
+        pi_metrics = self._update_pi(torch.stack(zs, dim=1).detach(),
+                                     valid_z, metrics_on)
         self._soft_update_target()
         self.net.eval()
 
         if not metrics_on:
             return {}
-        norm = max(denom, 1e-8)
         item = lambda x: (x.detach().item() if torch.is_tensor(x) else float(x))
         metrics = {
             'loss_total': total.item(),
-            'loss_consistency': item(consistency_loss) / norm,
-            'loss_reward': item(reward_loss) / norm,
-            'loss_value': item(value_loss) / norm,
+            'loss_consistency': item(consistency_loss),
+            'loss_reward': item(reward_loss),
+            'loss_value': item(value_loss),
             'grad_norm': grad_norm.item(),
             'diagnosis/td_target_mean': td_targets.mean().item(),
             'diagnosis/td_target_std': td_targets.std().item(),
             'diagnosis/reward_batch_std': reward.std().item(),
         }
         metrics.update(pi_metrics)
+        metrics.update(opt_metrics)
         return metrics
 
     def _update_pi(self, zs, valid, metrics_on=True):
-        """ Maximum-entropy policy prior on detached latents. This prior is
-            never executed in the environment -- it exists so the score can
-            continue past the candidate chunk and so the TD target has an
-            action to bootstrap with. """
+        """ tdmpc2.py update_pi: maximum-entropy policy prior on detached
+            latents. This prior is never executed in the environment -- it
+            exists so a score can continue past the candidate chunk and so
+            the TD target has an action to bootstrap with.
+
+              pi_loss = mean_t rho^t * mean_b [ -(entropy_coef * scaled_entropy
+                                                  + Q_avg / scale) ]
+
+            Q is the average of two random heads with its PARAMETERS
+            detached (the reference's _detach_Qs): gradient reaches the prior
+            through the action input only. scaled_entropy is -log_prob times
+            action_dim. Only Q is divided by the running scale. """
         cfg = self.cfg
         _, action, log_prob = self.net.pi(zs)
-        q = self.net.q_values(zs.reshape(-1, zs.shape[-1]),
-                              action.reshape(-1, action.shape[-1]))
-        q = q.mean(0).reshape(*zs.shape[:-1], 1)
-        self.scale.update(q.abs().mean().detach())
+        flat = lambda x: x.reshape(-1, x.shape[-1])
+        q_params = list(self.net.Qs.parameters())
+        for p in q_params:
+            p.requires_grad_(False)
+        try:
+            q = self.net.q_subset(flat(zs), flat(action), reduce='avg')
+        finally:
+            for p in q_params:
+                p.requires_grad_(True)
+        q = q.reshape(*zs.shape[:-1], 1)
+        self.scale.update(q[:, 0])
+        q = q / self.scale()
+        scaled_entropy = -log_prob * self.action_dim
         rho = torch.tensor(
             [self.rho ** t for t in range(zs.shape[1])],
-            device=zs.device, dtype=zs.dtype).view(1, -1, 1)
-        w = rho * valid
-        pi_loss = ((cfg.entropy_coef * log_prob - q) * w).mean() / self.scale()
+            device=zs.device, dtype=zs.dtype)
+        per_step = -(cfg.entropy_coef * scaled_entropy + q) * valid      # (B, T, 1)
+        pi_loss = (per_step.mean(dim=(0, 2)) * rho).mean()
 
         self.pi_opt.zero_grad(set_to_none=True)
         pi_loss.backward()
@@ -263,8 +306,71 @@ class TDMPC2Model:
             'loss_pi': pi_loss.item(),
             'diagnosis/pi_grad_norm': pi_grad.item(),
             'diagnosis/pi_entropy': (-log_prob).mean().item(),
-            'diagnosis/pi_q': q.mean().item(),
+            'diagnosis/pi_q_scaled': q.mean().item(),
             'diagnosis/q_scale': self.scale(),
+        }
+
+    def _optimistic_loss(self, obs0, metrics_on):
+        """ Optimistic World Models (Mete et al. 2026), eq. 10, on the SimNorm
+            latent read as G categoricals:
+
+              L_opt = -alpha * sum_l A_l * log p(z_{l+1} | z_l, a_l)
+                      - eta  * sum_l H(p(. | z_l, a_l))
+
+            An imagined trajectory is rolled from real encoded starts with
+            the policy prior, SAMPLING each next latent from the dynamics'
+            categoricals (straight-through) so the draw has a likelihood.
+            A_l = (G^lam_l - V(z_l)) / max(1, S), the lambda-return over
+            imagined rewards bootstrapped by Q(z, pi(z)), S the running
+            5-95 percentile range of those returns. Gradient reaches the
+            DYNAMICS only: starts are detached, advantages are detached.
+
+            The effect is RBMLE's: transitions that turned out better than
+            the value expected get their likelihood raised, so imagination
+            drifts optimistic, and the scorer that reads it prefers chunks
+            the optimistic model likes. alpha must be tiny (paper: 1e-4). """
+        o = self.optimism
+        L = int(o.horizon)
+        n = min(int(o.imag_batch), obs0.shape[0])
+        with torch.no_grad():
+            z = self.net.encode(obs0[:n])
+        logps, ents, rewards, values = [], [], [], []
+        for _ in range(L):
+            with torch.no_grad():
+                a = self.net.pi(z)[1]
+                rewards.append(self.net.reward_pred(z, a))
+                values.append(self.net.q_subset(z, a, reduce='avg'))
+            p_next = self.net.next(z, a)
+            ents.append(self.net.latent_entropy(p_next))
+            z, logp = self.net.sample_latent(p_next)
+            logps.append(logp)
+        with torch.no_grad():
+            v_end = self.terminal_value(z.detach())
+            # lambda-return backwards from the bootstrap.
+            lam = float(o.lam)
+            ret = v_end
+            returns = [None] * L
+            for l in reversed(range(L)):
+                ret = rewards[l] + self.gamma * ((1 - lam) * values[l] + lam * ret) \
+                    if l + 1 < L else rewards[l] + self.gamma * v_end
+                returns[l] = ret
+            returns_t = torch.stack(returns, 0)                    # (L, n, 1)
+            values_t = torch.stack(values, 0)
+            self.ret_scale.update(returns_t)
+            adv = (returns_t - values_t) / max(1.0, self.ret_scale())
+        logp_t = torch.stack(logps, 0)
+        ent_t = torch.stack(ents, 0)
+        loss = -float(o.alpha) * (adv * logp_t).sum(0).mean() \
+               - float(o.eta) * ent_t.sum(0).mean()
+        if not metrics_on:
+            return loss, {}
+        return loss, {
+            'optimism/loss': loss.item(),
+            'optimism/adv_mean': adv.mean().item(),
+            'optimism/adv_std': adv.std().item(),
+            'optimism/logp_mean': logp_t.mean().item(),
+            'optimism/latent_entropy': ent_t.mean().item(),
+            'optimism/return_scale': self.ret_scale(),
         }
 
     @torch.no_grad()

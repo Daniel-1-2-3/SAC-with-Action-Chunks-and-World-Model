@@ -1,16 +1,29 @@
-# Arm 1 (CONTROL): critic best-of-N (QC's own best-of-N), seeds 0 and 1
-python train_sac_chunked.py --train_sac_chunked.general.run_name=criticN_triple_s0 --train_sac_chunked.general.out_dir=runs/criticN_s0 --seed=0
-python train_sac_chunked.py --train_sac_chunked.general.run_name=criticN_triple_s1 --train_sac_chunked.general.out_dir=runs/criticN_s1 --seed=1
+# CONTROL: critic best-of-N (QC's own best-of-N), seeds 0 and 1
+python train_sac_chunked.py --general.run_name=criticN_triple_s0 --general.out_dir=runs/criticN_s0 --seed=0
+python train_sac_chunked.py --general.run_name=criticN_triple_s1 --general.out_dir=runs/criticN_s1 --seed=1
 
-# Arm 2: TD-MPC2 latent-model best-of-N, single-chunk scoring, seeds 0 and 1
-python train_sac_chunked_wm.py --train_sac_chunked_wm.general.run_name=tdmpcN_triple_s0 --train_sac_chunked_wm.general.out_dir=runs/tdmpcN_s0 --seed=0
-python train_sac_chunked_wm.py --train_sac_chunked_wm.general.run_name=tdmpcN_triple_s1 --train_sac_chunked_wm.general.out_dir=runs/tdmpcN_s1 --seed=1
+# Plain QC-FQL (no selection at all)
+python train_sac_chunked.py --general.run_name=qcfql_triple_s0 --general.out_dir=runs/qcfql_s0 --chunk.select_n=1 --seed=0
 
-# Optional control: plain QC-FQL, no selection at all, seeds 0 and 1
-python train_sac_chunked.py --train_sac_chunked.general.run_name=qcfql_triple_s0 --train_sac_chunked.general.out_dir=runs/qcfql_s0 --train_sac_chunked.chunk.select_n=1 --seed=0
-python train_sac_chunked.py --train_sac_chunked.general.run_name=qcfql_triple_s1 --train_sac_chunked.general.out_dir=runs/qcfql_s1 --train_sac_chunked.chunk.select_n=1 --seed=1
+# RANKING: TD-MPC2 scores the candidates                    (partner: control)
+python train_sac_chunked_ranking.py --general.run_name=ranking_triple_s0 --general.out_dir=runs/ranking_s0 --seed=0
+python train_sac_chunked_ranking.py --general.run_name=ranking_triple_s1 --general.out_dir=runs/ranking_s1 --seed=1
 
-# Deeper lookahead (follow-on actions come from the model's policy prior at
-# the imagined latent -- still no decode). Costs dynamics error, not decoder
-# error; watch wm/latent_drift_rel.
-# python train_sac_chunked_wm.py --train_sac_chunked_wm.chunk.select_rollout_chunks=2 --train_sac_chunked_wm.general.run_name=tdmpcN_depth2_s0 --seed=0
+# MVE: latent value expansion in the critic target          (partner: control)
+python train_sac_chunked_mve.py --general.run_name=mve_triple_s0 --general.out_dir=runs/mve_s0 --seed=0
+#   pure MVE / latent-Q bootstrap only:
+#   --mve.weight=1.0        --mve.chunks=0
+
+# EXPLORE: ranking + disagreement bonus                    (partner: ranking)
+python train_sac_chunked_explore.py --general.run_name=explore_triple_s0 --general.out_dir=runs/explore_s0 --seed=0
+
+# OPTIMISTIC: ranking + RBMLE dynamics loss                (partner: ranking)
+python train_sac_chunked_optimistic.py --general.run_name=optimistic_triple_s0 --general.out_dir=runs/optimistic_s0 --seed=0
+
+# Deeper lookahead for any model-scoring arm (no decode; costs dynamics error,
+# watch wm/latent_drift_rel):  --ranking.rollout_chunks=2  (or explore./optimistic.)
+
+# Toy sanity race, CPU, minutes:
+python toy/race.py --arms critic ranking mve explore optimistic --seeds 0 1
+# any single arm on the toy task:
+python train_sac_chunked_mve.py --configs toy --seed=0

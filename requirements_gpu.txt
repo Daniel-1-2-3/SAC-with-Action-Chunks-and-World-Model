@@ -1,7 +1,8 @@
 numpy<2
 
-# Config loading only (elements.Config / elements.Flags).
+# Config loading only (elements.Config / elements.Flags) and configs.yaml.
 elements>=3.17.0
+ruamel.yaml
 
 # JAX stack. NOT needed by training any more -- the world model is TD-MPC2 in
 # PyTorch and nothing in the active code imports jax. These are here only for
@@ -21,9 +22,6 @@ torch
 # environment
 ogbench
 mujoco
-
-# config loading
-ruamel.yaml
 
 # rendering and plots
 opencv-python
