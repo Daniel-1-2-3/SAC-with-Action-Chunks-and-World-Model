@@ -38,7 +38,7 @@ class ChunkSelector:
                  novelty='model', novelty_at='path', nu_cap=1.0,
                  bonus_scale='spread', progress_gate=True, progress_window=20,
                  progress_tau=0.2, use_rel_unc=True, controller='gate',
-                 bandit_window=20, bandit_c=1.0):
+                 bandit_window=20, bandit_c=1.0, candidate_source='actor'):
         """ model: a TDMPC2Model (explore arm), or None (control).
             rollout_chunks (explore arm): imagine this many chunks ahead when
             measuring novelty. The first is the candidate; each further
@@ -74,6 +74,12 @@ class ChunkSelector:
         #                         over the two arms' real episode returns
         #   bandit_window / bandit_c: the window (episodes) and the UCB
         #               exploration constant.
+        #   candidate_source  'actor'  candidates from the one-step actor
+        #                              (policy.sample_chunk)
+        #                     'bc'     candidates from the flow BC policy
+        #                              (policy.compute_flow_actions on
+        #                              policy.noise(n): Euler, flow_steps,
+        #                              clipped). Scoring is unchanged.
         assert novelty in ('model', 'none'), novelty
         assert novelty_at in ('path', 'end'), novelty_at
         assert bonus_scale in ('unc', 'spread'), bonus_scale
@@ -90,6 +96,8 @@ class ChunkSelector:
         self.bandit_window = int(bandit_window)
         self.bandit_c = float(bandit_c)
         self._pulls = []            # (arm, return) of the last finished episodes
+        assert candidate_source in ('actor', 'bc'), candidate_source
+        self.candidate_source = candidate_source
         self.bandit_arm = 1         # arm in force: 0 exploit (g=0), 1 explore (g=1)
         self._returns = []          # real ONLINE episode returns, in order
         self._g = 1.0               # gate value in use (EMA-smoothed)
@@ -213,7 +221,11 @@ class ChunkSelector:
         feat = torch.as_tensor(np.asarray(state_1d, dtype=np.float32),
                                device=self.device).reshape(1, -1)
         feat_n = feat.repeat(self.n, 1)
-        cands = self.policy.sample_chunk(feat_n)  # (n, chunk_len * action_dim)
+        if self.candidate_source == 'bc':
+            noises = self.policy.noise(self.n)
+            cands = self.policy.compute_flow_actions(feat_n, noises)  # (n, chunk_len * action_dim)
+        else:
+            cands = self.policy.sample_chunk(feat_n)  # (n, chunk_len * action_dim)
 
         # QC's own best-of-N: the online critic scores every candidate.
         qs = self.policy.critic(feat_n, cands)          # (ensemble, n, 1)

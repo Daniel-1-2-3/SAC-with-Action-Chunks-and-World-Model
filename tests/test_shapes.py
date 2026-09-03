@@ -185,3 +185,29 @@ def test_qc_act_target_and_updates():
     ag.update_target()
     assert ag.chunk_diversity(obs) >= 0.0
     assert sorted(ag.state_dict_all()) == ['actor_bc_flow', 'critic', 'critic_target']
+
+
+# ------------------------------------------------------- candidate source
+
+def test_candidate_source_bc_and_actor():
+    from sac_chunked.sac_chunk_agent import ChunkAgent
+    torch.manual_seed(0)
+    pol = ChunkAgent(repr_dim=OBS, action_dim=ACT, chunk_len=CHUNK, device=DEV, lr=3e-4,
+                     hidden_dim=32, num_layers=2, critic_target_tau=0.005, flow_steps=3)
+    state = np.random.randn(OBS).astype(np.float32)
+    feat_n = torch.as_tensor(state).reshape(1, -1).repeat(16, 1)
+    for source in ('actor', 'bc'):
+        sel = ChunkSelector(None, pol, ACT, CHUNK, n=16, gamma=0.99, device=DEV,
+                            candidate_source=source)
+        torch.manual_seed(7); out = sel.select(state)
+        assert out.shape == (CHUNK, ACT) and np.abs(out).max() <= 1.0
+        # the same draw by hand: this is exactly what select() must compute
+        torch.manual_seed(7)
+        if source == 'bc':
+            cands = pol.compute_flow_actions(feat_n, pol.noise(16))
+        else:
+            cands = pol.sample_chunk(feat_n)
+        idx = pol._agg(pol.critic(feat_n, cands)).squeeze(-1).argmax()
+        assert np.array_equal(out, cands[idx].detach().numpy().reshape(CHUNK, ACT))
+    with pytest.raises(AssertionError):
+        ChunkSelector(None, pol, ACT, CHUNK, n=16, gamma=0.99, device=DEV, candidate_source='x')
