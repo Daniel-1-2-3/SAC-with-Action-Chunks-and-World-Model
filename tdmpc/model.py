@@ -12,15 +12,11 @@
     bins, matching the Dreamer configuration this replaced, so the reward term
     and the value term of a chunk score stay in comparable units.
 
-    Two additions over the reference, both off by default:
+    One addition over the reference, off by default:
       num_dyn > 1   an ENSEMBLE of dynamics heads. The rollout uses their mean;
                     their spread is the disagreement bonus of the explore arm
                     (Pathak et al. 2019, "Self-Supervised Exploration via
-                    Disagreement").
-      categorical   the SimNorm latent read as G independent categoricals, so
-                    a next-latent has a log-likelihood. The optimistic arm's
-                    RBMLE loss needs that (Mete et al. 2026, "Optimistic World
-                    Models"). """
+                    Disagreement"). """
 
 from copy import deepcopy
 
@@ -106,8 +102,7 @@ class SimNorm(nn.Module):
         softmax each group. This is what keeps TD-MPC2's latent bounded
         without a reconstruction loss -- the latent cannot blow up or collapse
         to a constant scale, so the consistency loss alone is enough to keep
-        it meaningful. Each group is also, read literally, a categorical
-        distribution over `dim` classes; the optimistic loss uses that. """
+        it meaningful. """
 
     def __init__(self, dim=8):
         super().__init__()
@@ -338,33 +333,6 @@ class TDMPC2Nets(nn.Module):
         idx = torch.randperm(self.num_q, device=z.device)[:2]
         q = self.q_values(z, action, target, idx=idx)
         return q.min(0).values if reduce == 'min' else q.mean(0)
-
-    # ------------------------------------------- categorical view of a latent
-
-    def as_categorical(self, z):
-        """ (B, latent_dim) on the SimNorm simplices -> (B, G, simnorm_dim)
-            per-group class probabilities. No computation: it is a reshape. """
-        return z.view(*z.shape[:-1], -1, self.simnorm_dim)
-
-    def sample_latent(self, z_probs):
-        """ Draw one class per group and return the one-hot latent with a
-            straight-through gradient to the probabilities (Dreamer's trick),
-            plus the log-likelihood of the draw, summed over groups.
-
-            Used only by the optimistic loss, which needs a SAMPLED next
-            latent whose likelihood the dynamics can be pushed on. Scoring
-            and the consistency loss stay deterministic. """
-        p = self.as_categorical(z_probs)
-        idx = torch.multinomial(p.reshape(-1, self.simnorm_dim), 1).view(*p.shape[:-1])
-        onehot = F.one_hot(idx, self.simnorm_dim).to(p.dtype)
-        sample = onehot + p - p.detach()
-        logp = torch.log(p.clamp_min(1e-8)).gather(-1, idx.unsqueeze(-1)).squeeze(-1).sum(-1, keepdim=True)
-        return sample.view(*z_probs.shape), logp
-
-    def latent_entropy(self, z_probs):
-        """ Sum over groups of the categorical entropy, (B, 1). """
-        p = self.as_categorical(z_probs)
-        return -(p * torch.log(p.clamp_min(1e-8))).sum(-1).sum(-1, keepdim=True)
 
 
 def convert_legacy_state_dict(sd, num_q, num_dyn):

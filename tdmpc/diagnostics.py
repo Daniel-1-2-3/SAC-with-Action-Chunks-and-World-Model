@@ -34,7 +34,7 @@ has both kinds, so the correlation is defined.
 
 Stated plainly: rollouts here are teacher-forced with the actions in replay,
 so this measures accuracy on the data distribution, not on the current
-policy's. When the policy is far from the data these numbers are optimistic.
+policy's. When the policy is far from the data these numbers flatter the model.
 They are still the right gate: a model that cannot predict rewards on data it
 was trained on will not predict them on-policy either.
 

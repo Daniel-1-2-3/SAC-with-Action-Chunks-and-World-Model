@@ -1,65 +1,57 @@
 # World models for action-chunked RL (QC-FQL), cube-triple
 
-Five arms. Every arm trains the SAME policy: QC-FQL (chunked flow
+Three arms. Every arm trains the SAME policy: QC-FQL (chunked flow
 Q-learning, ported from ColinQiyangLi/qc), observation-space actor and
-critic, real chunk transitions from one shared replay buffer. Four of them
-also train a TD-MPC2 latent model on that same replay (encoder -> latent,
-dynamics in latent, reward head and Q both reading the latent, latent
-policy prior; nothing decodes to observation space). Each arm uses the
-model in exactly ONE way, and differs from its comparison partner in
-exactly that:
+critic, real chunk transitions from one shared replay buffer. The explore
+arm also trains a TD-MPC2 latent model on that same replay (encoder ->
+latent, dynamics in latent, reward head and Q both reading the latent,
+latent policy prior; nothing decodes to observation space) and uses it in
+exactly ONE way:
 
-| script | arm | what the model does | partner |
+| script | arm | what happens at a chunk boundary | partner |
 |---|---|---|---|
-| `train_sac_chunked.py` | **control** | nothing. Critic ranks `select_n` candidate chunks (QC's own best-of-N). `--chunk.select_n=1` = plain QC-FQL | -- |
-| `train_sac_chunked_ranking.py` | **ranking** | ranks the same candidates by `sum gamma^t r_model + gamma^H Q_model` | control |
-| `train_sac_chunked_mve.py` | **mve** | replaces the critic's bootstrap with a latent value expansion (Feinberg et al. 2018). Acting is the control's | control |
-| `train_sac_chunked_explore.py` | **explore** | critic best-of-N + novelty bonus scaled by the critic's own ensemble uncertainty: `Q_i + beta * std_heads(Q_i) * novelty_i`, novelty in [0,1] from dynamics-ensemble disagreement (Pathak et al. 2019). Zero where the critic is sure, so it converges to the control by itself | control |
-| `train_sac_chunked_optimistic.py` | **optimistic** | ranking with an optimistic (RBMLE) dynamics loss (Mete et al. 2026) | ranking |
+| `train_qcfql_bon.py` | **qcfql_bon** | QC-FQL (Li et al. 2025, Alg. 2) with the online critic picking the best of `select_n` chunks from the distilled one-step actor, at act and eval time. `--chunk.select_n=1` is plain QC-FQL. The paper's control | -- |
+| `train_explore.py` | **explore** | the same critic best-of-N, plus a novelty bonus scaled by the critic's own doubt: `Q_i + beta * g * sigma_Q * s~_i * nu_i`, novelty `nu` in `[0, nu_cap]` from dynamics-ensemble disagreement (Pathak et al. 2019), gate `g` from learning progress. Zero where the critic is sure, so it converges to the control by itself | qcfql_bon |
 
 The method of each arm is in `arms/<name>.py`; the shared loop is
-`sac_chunked/experiment.py`; the model is `tdmpc/`; the buffer is
+`sac_chunked/experiment.py`; the model is `tdmpc/` with its training and
+diagnostics plumbing in `arms/model_arm.py`; the buffer is
 `sac_chunked/replay.py`; the selector is `wm/chunk_selector.py`. One
 `configs.yaml` holds the QC block and the model block ONCE, so arms cannot
-drift apart; each arm's own knobs sit in its own block.
+drift apart; the explore arm's own knobs sit in its `explore` block.
 
 ## Is the model contributing anything?
 
-Read these before anything else on a model-arm run:
+Read these before anything else on an explore run:
 
-- `select/term_r_share`  reward term's share of the score's spread across
-  candidates. Near 0: the reward head is irrelevant to the ranking.
-- `select/term_q_std`  spread of the terminal latent value.
-- `select/pick_agreement`, `select/model_critic_corr`  how often / how
-  closely the model picks what the critic would. Near 1: the arm has
-  reduced to the control.
-- `mve/corr`, `mve/abs_gap` (mve arm)  is the expansion informative, or a
-  noisier copy of the QC bootstrap.
-- explore arm, critic side: `select/frac_within_unc` (candidates the critic
-  cannot separate from its favourite; 1/n = sure, 1 = no opinion),
+- critic side: `select/frac_within_unc` (candidates the critic cannot
+  separate from its favourite; 1/n = sure, 1 = no opinion),
   `select/unc_over_gap` (error bar over its own margin). Both should fall
   over training; that fall IS the anneal. Cross-check with
   `diagnosis/critic_calibration` (ensemble spread over real TD error): near
   0 means the heads agree but are wrong, so the bonus is silenced for the
   wrong reason.
-- explore arm, bonus side: `select/pick_changed`, `select/bonus_over_gap`
-  (how much of the critic's margin novelty could buy), `select/picked_unc`,
-  `select/picked_novelty`. Novelty side: `select/novelty_frac_active` (~0 =
+- bonus side: `select/pick_changed`, `select/bonus_over_gap` (how much of
+  the critic's margin novelty could buy), `select/picked_unc`,
+  `select/picked_novelty`, `select/progress_g` (the gate).
+- novelty side: `select/novelty_mean`, `select/novelty_frac_active` (~0 =
   bonus dead), `select/novelty_frac_saturated` (~1 = bonus is a constant),
   `diagnosis/wm_data_disagreement` (the denominator; drift moves both).
   `select/unc_novelty_corr` > 0 means critic doubt and model novelty point
-  at the same candidates.
+  at the same candidates. `select/model_changed` is the pick changing
+  because of the model, over and above the critic's own doubt.
 - `wm/reward_corr`, `wm/latent_drift_rel`, `wm/value_critic_corr`  model
   accuracy against replay at every eval, zero env steps
   (`tdmpc/diagnostics.py`).
 
+With wandb disabled, every eval prints the `select/` means since the last
+log step as an `attribution:` line.
+
 ## Running
 
-Commands in COMMANDS.txt. Always pass `--general.run_name`.
-
-Fast sanity race on the toy pusher (`toy/point_push.py`, CPU, minutes):
-
-    python toy/race.py --arms critic ranking mve explore optimistic --seeds 0 1
+Commands in COMMANDS.txt. Always pass `--general.run_name`. Static
+checks, no training: `python -m pyflakes .` (outside `embodied/`) and
+`python -m pytest tests/`.
 
 Metric decided in advance for cube: steps until eval/mean_return first
 crosses a fixed threshold both arms clearly pass. Log the 2/3-cube crossing

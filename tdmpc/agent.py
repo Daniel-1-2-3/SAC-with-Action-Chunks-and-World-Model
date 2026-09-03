@@ -13,7 +13,6 @@
     different termination models. """
 
 import torch
-import torch.nn.functional as F
 
 from tdmpc.model import TDMPC2Nets, soft_ce
 
@@ -21,9 +20,8 @@ from tdmpc.model import TDMPC2Nets, soft_ce
 class RunningScale:
     """ common/scale.py: running trimmed scale. Tracks the 5th-95th percentile
         range of a batch of values (clamped to at least 1) with an EMA at rate
-        tau. Used to normalise Q in the policy-prior loss and returns in the
-        optimistic loss, so their coefficients mean the same thing at step 1k
-        and step 1M. """
+        tau. Used to normalise Q in the policy-prior loss, so its coefficient
+        means the same thing at step 1k and step 1M. """
 
     def __init__(self, tau=0.01, device='cpu'):
         self.tau = tau
@@ -51,11 +49,9 @@ class TDMPC2Model:
         (encode, rollout_chunk, rollout_pi_chunk, terminal_value,
         chunk_disagreement) is everything the arms call at act time. """
 
-    def __init__(self, obs_dim, action_dim, device, cfg, gamma, optimism=None,
+    def __init__(self, obs_dim, action_dim, device, cfg, gamma,
                  num_dyn=None, novelty='mean'):
-        """ optimism: None, or a config block {alpha, eta, lam, imag_batch,
-            horizon, sample_mix} enabling the Optimistic-World-Models loss.
-            num_dyn: dynamics heads; overrides cfg.num_dyn (explore arm).
+        """ num_dyn: dynamics heads; overrides cfg.num_dyn (explore arm).
             novelty: how ensemble disagreement over the latent dims is
             reduced to one number, for BOTH the data reference and the
             explore arm's candidates so the ratio stays meaningful:
@@ -73,7 +69,6 @@ class TDMPC2Model:
         self.rho = float(cfg.rho)
         self.tau = float(cfg.tau)
         self.num_q = int(cfg.num_q)
-        self.optimism = optimism
         self.novelty = novelty
 
         self.net = TDMPC2Nets(
@@ -102,7 +97,6 @@ class TDMPC2Model:
         self.pi_opt = torch.optim.Adam(self.net.pi_net.parameters(), lr=cfg.lr,
                                        eps=1e-5)
         self.scale = RunningScale(tau=self.tau, device=device)
-        self.ret_scale = RunningScale(tau=0.01, device=device)
         self._target_params = list(self.net.Qs_target.parameters())
         self._online_q_params = list(self.net.Qs.parameters())
         self._opt_params = [p for g in self.opt.param_groups for p in g['params']]
@@ -200,7 +194,7 @@ class TDMPC2Model:
 
             DEVIATION: uses the prior's MEAN action. TD-MPC2's planner samples,
             but sampling injects per-candidate noise into a comparison whose
-            whole point is ranking candidates against each other. """
+            whole point is ordering candidates against each other. """
         pooled = torch.zeros(z.shape[0], 1, device=z.device, dtype=z.dtype)
         dis = torch.zeros_like(pooled)
         disc = discount0
@@ -255,8 +249,7 @@ class TDMPC2Model:
               value        two-hot CE against the TD target
             then the policy prior on the detached rollout latents, then the
             target-Q soft update. With a dynamics ensemble, every head gets
-            the consistency loss and the rollout continues through the mean.
-            With `optimism`, the RBMLE loss is added to the total. """
+            the consistency loss and the rollout continues through the mean. """
         cfg = self.cfg
         self.net.train()
         td_targets, next_z_real = self._td_target(next_obs, reward, mask)
@@ -266,11 +259,6 @@ class TDMPC2Model:
             d = self.reduce_disagreement(var0, zs[:, 0].detach(), action[:, 0]).mean().item()
             self.data_disagreement = 0.99 * self.data_disagreement + 0.01 * d \
                 if self.data_disagreement > 1e-8 else d
-
-        opt_metrics = {}
-        if self.optimism is not None:
-            opt_loss, opt_metrics = self._optimistic_loss(obs[:, 0], metrics_on)
-            total = total + opt_loss
 
         self.opt.zero_grad(set_to_none=True)
         total.backward()
@@ -299,7 +287,6 @@ class TDMPC2Model:
             'diagnosis/reward_batch_std': reward.std().item(),
         }
         metrics.update(pi_metrics)
-        metrics.update(opt_metrics)
         return metrics
 
     def _losses(self, obs0, next_z_real, action, reward, valid, td_targets):
@@ -398,85 +385,6 @@ class TDMPC2Model:
             'diagnosis/pi_entropy': (-log_prob).mean().item(),
             'diagnosis/pi_q_scaled': q.mean().item(),
             'diagnosis/q_scale': float(self.scale()),
-        }
-
-    def _optimistic_loss(self, obs0, metrics_on):
-        """ Optimistic World Models (Mete et al. 2026), eq. 10, on the SimNorm
-            latent read as G categoricals:
-
-              L_opt = -alpha * sum_l A_l * log p(z_{l+1} | z_l, a_l)
-                      - eta  * sum_l H(p(. | z_l, a_l))
-
-            An imagined trajectory is rolled from real encoded starts with
-            the policy prior, SAMPLING each next latent from the dynamics'
-            categoricals (straight-through) so the draw has a likelihood.
-            A_l = (G^lam_l - V(z_l)) / max(1, S), the lambda-return over
-            imagined rewards bootstrapped by Q(z, pi(z)), S the running
-            5-95 percentile range of those returns. Gradient reaches the
-            DYNAMICS only: starts are detached, advantages are detached.
-
-            The effect is RBMLE's: transitions that turned out better than
-            the value expected get their likelihood raised, so imagination
-            drifts optimistic, and the scorer that reads it prefers chunks
-            the optimistic model likes. alpha must be tiny (paper: 1e-4). """
-        o = self.optimism
-        L = int(o.horizon)
-        n = min(int(o.imag_batch), obs0.shape[0])
-        mix = float(o.sample_mix)
-        with torch.no_grad():
-            z = self.net.encode(obs0[:n])
-        logps, ents, rewards, values = [], [], [], []
-        for _ in range(L):
-            with torch.no_grad():
-                a = self.net.pi(z)[1]
-                rewards.append(self.net.reward_pred(z, a))
-                values.append(self.net.q_subset(z, a, reduce='avg'))
-            p_next = self.net.next(z, a)
-            ents.append(self.net.latent_entropy(p_next))
-            onehot, logp = self.net.sample_latent(p_next)
-            # The heads only ever train on soft SimNorm latents, so a pure
-            # one-hot draw is off-distribution for them. Continue the rollout
-            # on a convex mix of the draw and the prediction: still inside
-            # each simplex, still dependent on the draw (so the advantage
-            # depends on it and the RBMLE gradient is non-zero in
-            # expectation), with sample_mix setting how far toward the
-            # vertex it goes.
-            z = (1.0 - mix) * p_next + mix * onehot
-            logps.append(logp)
-        with torch.no_grad():
-            v_end = self.terminal_value(z.detach())
-            # lambda-return backwards from the bootstrap:
-            #   G_l = r_l + gamma * [(1 - lam) V(z_{l+1}) + lam * G_{l+1}],
-            #   G_{L-1} = r_{L-1} + gamma * V(z_L).
-            # values[l] is V(z_l), so the bootstrap for step l is values[l+1]
-            # and v_end for the last step.
-            lam = float(o.lam)
-            next_values = values[1:] + [v_end]
-            ret = v_end
-            returns = [None] * L
-            for l in reversed(range(L)):
-                if l == L - 1:
-                    ret = rewards[l] + self.gamma * v_end
-                else:
-                    ret = rewards[l] + self.gamma * ((1 - lam) * next_values[l] + lam * ret)
-                returns[l] = ret
-            returns_t = torch.stack(returns, 0)                    # (L, n, 1)
-            values_t = torch.stack(values, 0)
-            self.ret_scale.update(returns_t)
-            adv = (returns_t - values_t) / torch.clamp(self.ret_scale(), min=1.0)
-        logp_t = torch.stack(logps, 0)
-        ent_t = torch.stack(ents, 0)
-        loss = -float(o.alpha) * (adv * logp_t).sum(0).mean() \
-               - float(o.eta) * ent_t.sum(0).mean()
-        if not metrics_on:
-            return loss, {}
-        return loss, {
-            'optimism/loss': loss.item(),
-            'optimism/adv_mean': adv.mean().item(),
-            'optimism/adv_std': adv.std().item(),
-            'optimism/logp_mean': logp_t.mean().item(),
-            'optimism/latent_entropy': ent_t.mean().item(),
-            'optimism/return_scale': float(self.ret_scale()),
         }
 
     @torch.no_grad()

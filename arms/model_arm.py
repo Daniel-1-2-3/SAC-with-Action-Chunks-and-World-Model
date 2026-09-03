@@ -1,27 +1,18 @@
-""" RANKING arm: TD-MPC2-scored best-of-N.
+""" Base for every arm that trains a TD-MPC2 latent model next to QC-FQL.
 
-    QC-FQL training is untouched. At every chunk boundary the latent model
-    imagines each of the select_n candidate chunks and the argmax of
-
-        sum_t gamma^t * r_model(z_t, a_t) + gamma^H * Q_model(z_H, pi(z_H))
-
-    is executed. Its comparison partner is the control (critic best-of-N with
-    the same select_n): the two differ only in what ranks the candidates.
-
-    Every other model-based arm subclasses this one, so the model, its
-    training and its diagnostics are defined here once. """
-
-import torch
+    QC-FQL training is untouched; the model trains on the same replay
+    windows and is consumed however the subclass decides (today: only the
+    explore arm, which reads its dynamics ensemble). The model, its update
+    and its diagnostics are defined here once so no arm can drift. """
 
 from sac_chunked.experiment import Arm
 from tdmpc.agent import TDMPC2Model
 from tdmpc.diagnostics import model_report, print_wm_report
-from wm.chunk_selector import ChunkSelector
 
 
-class RankingArm(Arm):
-    name = 'ranking'
-    arm_key = 'ranking'
+class ModelArm(Arm):
+    name = 'model'
+    arm_key = 'explore'
 
     @property
     def arm_cfg(self):
@@ -33,17 +24,6 @@ class RankingArm(Arm):
     def build_model(self):
         self.model = TDMPC2Model(self.obs_dim, self.action_dim, self.device,
                                  self.config.tdmpc, self.gamma, **self.model_kwargs())
-
-    def build_selector(self):
-        return ChunkSelector(self.model, self.policy, self.action_dim,
-                             self.chunk_len, self.chunk.select_n, self.gamma,
-                             self.device, score_mode='model',
-                             rollout_chunks=self.arm_cfg.rollout_chunks)
-
-    def describe(self):
-        n, k = self.chunk.select_n, self.arm_cfg.rollout_chunks
-        return (f'{self.name}: TD-MPC2 best-of-{n}, {k} chunk(s) = '
-                f'{k * self.chunk_len} latent steps, no decode')
 
     def model_update(self, replay, metrics_on):
         t = self.config.tdmpc

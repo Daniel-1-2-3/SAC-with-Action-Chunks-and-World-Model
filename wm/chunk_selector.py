@@ -3,79 +3,52 @@ import torch
 
 
 class ChunkSelector:
-    """ Best-of-N chunk selection. The ONLY place the latent model influences
-        behavior.
+    """ Best-of-N chunk selection at act time.
 
         At every chunk boundary: sample n candidate chunks from the QC-FQL
-        one-step policy at the raw observation, then rank them. What does the
-        ranking is the experiment:
+        one-step policy at the raw observation and execute the argmax of
+        Q(s, chunk) under the online QC critic (mean over the ensemble). This
+        is QC's own best-of-N and needs no model at all: it is the control
+        arm (train_qcfql_bon.py).
 
-          score_mode 'model'   TD-MPC2 latent model. Encode the observation
-                               once, imagine each candidate chunk in latent
-                               space, score it as
-
-                                 sum_t gamma^t * r_model(z_t, a_t)
-                                   + gamma^H * Q_model(z_H, pi(z_H))
-
-                               Nothing decodes back to observation space at
-                               any point -- the reward head and the Q both
-                               read the latent directly. Both terms are
-                               symlog two-hot predictions, so they are in the
-                               same units as each other and as the QC critic.
-
-          score_mode 'critic'  Q(s, chunk) from the online QC critic. This is
-                               the QC paper's own best-of-N and needs no model
-                               at all. It is the control arm.
+        The explore arm adds a bounded novelty bonus on top of the critic's
+        score, read from a TD-MPC2 dynamics ensemble; see
+        _select_uncertainty_scaled. That is the ONLY place the latent model
+        influences behavior.
 
         Training never sees any of this. The critic and actor update on real
-        replay chunks with the plain QC-FQL target, so the model's entire
+        replay chunks with the plain QC-FQL target, so selection's entire
         effect on the run is through WHICH chunks get executed -- i.e. through
         the data that selection collects.
 
         Failure containment: candidates are i.i.d. samples from the policy, so
         if the scores are uninformative noise the argmax is distributed like a
         single policy sample and the agent degrades to QC-FQL rather than
-        below it. The exception is a model that SYSTEMATICALLY prefers chunks
-        it predicts well (do-nothing chunks are the usual case); watch
-        select/score_gap together with eval/coherence for that.
+        below it.
 
         n <= 1 disables everything here -- select() is exactly policy.act.
-        That is the QC-FQL control run.
+        That is the plain QC-FQL run.
 
         The TD-MPC2 encoder is Markov, so there is no posterior to keep
         filtered between steps and no per-step encode. The selector is
-        stateless.
-
-        Attribution: in model mode every decision ALSO scores the same
-        candidates with the online critic alone. select/pick_agreement near
-        1.0 means the model adds nothing beyond the critic and this run
-        reduces to QC. """
+        stateless apart from the explore arm's learning-progress gate. """
 
     def __init__(self, model, policy, action_dim, chunk_len, n, gamma, device,
-                 score_mode='model', rollout_chunks=1, bonus_beta=0.0,
+                 rollout_chunks=1, bonus_beta=0.0,
                  novelty='model', novelty_at='path', nu_cap=1.0,
                  bonus_scale='spread', progress_gate=True, progress_window=20,
                  progress_tau=0.2):
-        """ model: a TDMPC2Model, or None in critic mode.
-            rollout_chunks (model mode): imagine this many chunks ahead. The
-            first is the candidate; each further chunk's actions come from the
-            model's policy prior at the imagined latent. Lookahead depth is
-            rollout_chunks * chunk_len steps and costs nothing but dynamics
-            steps -- no decode, so depth does not compound decoder error the
-            way it did with the previous scorer.
-            bonus_beta (model mode): weight of the dynamics-ensemble
-            disagreement bonus (explore arm). 0 disables it. The bonus is
-            beta * relu(d / d_data - 1), where d_data is the model's running
-            mean disagreement on REAL replay transitions: a candidate whose
-            imagined path is no more uncertain than the data gets nothing,
-            one that is twice as uncertain gets beta. Both anneal as the
-            ensemble converges. beta is in reward units. Training-time only:
+        """ model: a TDMPC2Model (explore arm), or None (control).
+            rollout_chunks (explore arm): imagine this many chunks ahead when
+            measuring novelty. The first is the candidate; each further
+            chunk's actions come from the model's policy prior at the
+            imagined latent. Lookahead depth is rollout_chunks * chunk_len
+            steps and costs nothing but dynamics steps -- no decode.
+            bonus_beta (explore arm): weight of the novelty bonus. 0 disables
+            it and gives exactly the control. Training-time only:
             select(..., eval_mode=True) never adds it, so eval measures the
             learned policy, not the exploration policy. """
-        assert score_mode in ('model', 'critic'), score_mode
-        assert score_mode == 'critic' or model is not None
         assert bonus_beta == 0.0 or model is not None
-        self.score_mode = score_mode
         self.rollout_chunks = max(1, int(rollout_chunks))
         self.bonus_beta = float(bonus_beta)
         # explore arm only:
@@ -170,123 +143,29 @@ class ChunkSelector:
         feat_n = feat.repeat(self.n, 1)
         cands = self.policy.sample_chunk(feat_n)  # (n, chunk_len * action_dim)
 
-        # Critic score of the SAME candidates -- QC's own best-of-N ranking.
-        # In critic mode it picks; in model mode it is logged for attribution.
+        # QC's own best-of-N: the online critic scores every candidate.
         qs = self.policy.critic(feat_n, cands)          # (ensemble, n, 1)
         critic_score = self.policy._agg(qs).squeeze(-1)  # (n,)
 
-        if self.score_mode == 'critic':
-            if self.bonus_beta > 0.0 and not eval_mode and self.model is not None:
-                return self._select_uncertainty_scaled(feat_n, cands, qs, critic_score)
-            idx_t = torch.argmax(critic_score)
-            # One GPU->CPU transfer for everything this decision needs.
-            stats = torch.stack([
-                idx_t.float(),
-                critic_score[idx_t] - critic_score.mean(),
-                critic_score.std(),
-            ]).cpu().tolist()
-            idx = int(stats[0])
-            if not eval_mode:
-                self._acc('score_gap', stats[1])
-                self._acc('score_std', stats[2])
-            return cands[idx].detach().cpu().numpy().reshape(
-                self.chunk_len, self.action_dim)
-
-        z = self.model.encode(feat_n)
-        chunk_actions = cands.reshape(self.n, self.chunk_len, self.action_dim)
-        z, r_term, disc, dis = self.model.rollout_chunk(z, chunk_actions)
-        for _ in range(self.rollout_chunks - 1):
-            z, r_j, disc, dis_j = self.model.rollout_pi_chunk(z, self.chunk_len, disc)
-            r_term = r_term + r_j
-            dis = dis + dis_j
-        dis = dis / self.rollout_chunks
-
-        end_v = self.model.terminal_value(z)
-        q_term = (disc * end_v).squeeze(-1)  # (n,)
-        r_term = r_term.squeeze(-1)          # (n,) pooled imagined reward
-        score = r_term + q_term
-
-        use_bonus = self.bonus_beta > 0.0 and not eval_mode
-        if use_bonus:
-            # Novelty relative to the data: how much more uncertain the
-            # imagined path is than a typical real transition. In-distribution
-            # candidates get ~0, so the bonus does not add constant noise to
-            # the ranking and vanishes as the ensemble converges.
-            d = dis.squeeze(-1)
-            ratio = d / max(self.model.data_disagreement, 1e-10)
-            bonus = self.bonus_beta * torch.relu(ratio - 1.0)
-            score = score + bonus
-
-        # Every scalar below is computed on the device and moved to the CPU
-        # in ONE transfer, instead of one blocking .item() per statistic.
-        idx_t = torch.argmax(score)
-        s_std = score.std(correction=0)
-        c_std = critic_score.std(correction=0)
-        sn = (score - score.mean()) / (s_std + 1e-12)
-        cn = (critic_score - critic_score.mean()) / (c_std + 1e-12)
-        keys = ['idx', 'term_r_std', 'term_q_std', 'term_r_absmean',
-                'term_q_absmean', 'r_argmax', 'q_argmax', 'score_gap',
-                'score_std', 'end_v_std', 'critic_argmax', 'corr',
-                's_std', 'c_std']
-        vals = [idx_t.float(), r_term.std(), q_term.std(), r_term.abs().mean(),
-                q_term.abs().mean(), torch.argmax(r_term).float(),
-                torch.argmax(q_term).float(), score[idx_t] - score.mean(),
-                score.std(), end_v.squeeze(-1).std(),
-                torch.argmax(critic_score).float(), (sn * cn).mean(),
-                s_std, c_std]
-        if use_bonus:
-            keys += ['bonus_std', 'bonus_absmean', 'disagreement_raw',
-                     'disagreement_ratio', 'bonus_argmax']
-            vals += [bonus.std(), bonus.abs().mean(), d.mean(), ratio.mean(),
-                     torch.argmax(bonus).float()]
-        v = dict(zip(keys, torch.stack(vals).cpu().tolist()))
-        idx = int(v['idx'])
-
-        if use_bonus:
-            self._acc('bonus_std', v['bonus_std'])
-            self._acc('bonus_absmean', v['bonus_absmean'])
-            self._acc('disagreement_raw', v['disagreement_raw'])
-            self._acc('disagreement_ratio', v['disagreement_ratio'])
-            # Would the bonus alone pick the same chunk? Near 1.0 means the
-            # bonus, not the value, is driving exploration.
-            self._acc('bonus_only_agree', float(int(v['bonus_argmax']) == idx))
-
-        # TERM ATTRIBUTION. The ranking is decided by whichever term VARIES
-        # across the n candidates, not by whichever is larger. If r_term_std
-        # is ~0 while q_term_std is large, this arm is not "model reward
-        # scoring" at all -- it is a latent value function, and the reward
-        # head contributes nothing to the ordering. term_r_share is the
-        # reward term's share of the total spread; near 0 means model reward
-        # is irrelevant to the pick.
-        r_std, q_std = v['term_r_std'], v['term_q_std']
-        self._acc('term_r_std', r_std)
-        self._acc('term_q_std', q_std)
-        self._acc('term_r_share', r_std / (r_std + q_std + 1e-8))
-        self._acc('term_r_absmean', v['term_r_absmean'])
-        self._acc('term_q_absmean', v['term_q_absmean'])
-        # Would ranking by imagined reward ALONE pick the same chunk as the
-        # full score? Near 1.0 means the reward term drives the pick.
-        self._acc('term_r_only_agree', float(int(v['r_argmax']) == idx))
-        # Would ranking by the Q term ALONE pick the same chunk? Near 1.0
-        # means the pick is entirely the latent value.
-        self._acc('term_q_only_agree', float(int(v['q_argmax']) == idx))
-
-        self._acc('score_gap', v['score_gap'])
-        self._acc('score_std', v['score_std'])
-        self._acc('end_v_std', v['end_v_std'])
-        self._acc('pick_agreement', float(idx == int(v['critic_argmax'])))
-        # Pearson over the n candidates. correction=0 (population std)
-        # because the products are averaged over n -- the default sample std
-        # would scale the result by (n-1)/n.
-        if v['s_std'] > 1e-8 and v['c_std'] > 1e-8:
-            self._acc('model_critic_corr', v['corr'])
-
+        if self.bonus_beta > 0.0 and not eval_mode and self.model is not None:
+            return self._select_uncertainty_scaled(feat_n, cands, qs, critic_score)
+        idx_t = torch.argmax(critic_score)
+        # One GPU->CPU transfer for everything this decision needs.
+        stats = torch.stack([
+            idx_t.float(),
+            critic_score[idx_t] - critic_score.mean(),
+            critic_score.std(),
+        ]).cpu().tolist()
+        idx = int(stats[0])
+        if not eval_mode:
+            self._acc('score_gap', stats[1])
+            self._acc('score_std', stats[2])
         return cands[idx].detach().cpu().numpy().reshape(
             self.chunk_len, self.action_dim)
 
     def _select_uncertainty_scaled(self, feat_n, cands, qs, critic_score):
-        """ EXPLORE arm. The critic ranks; novelty may only move the pick by
-            a bounded amount.
+        """ EXPLORE arm. The critic orders the candidates; novelty may only
+            move the pick by a bounded amount.
 
             bonus_scale 'spread' (v4):
 

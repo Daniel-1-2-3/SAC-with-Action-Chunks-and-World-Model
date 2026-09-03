@@ -27,14 +27,13 @@ from helpers.interop import numeric_metrics
 OBS_KEY = 'state'
 ENV_ACTION_LOW = -1.0
 ENV_ACTION_HIGH = 1.0
-TOY_ENV = 'toy-point-push'
 
 
 # ------------------------------------------------------------------ config
 
 def load_config(folder, argv=None):
-    """ configs.yaml `defaults`, plus any presets named with --configs (e.g.
-        --configs toy), plus dotted CLI overrides (--chunk.select_n=16). """
+    """ configs.yaml `defaults`, plus any presets named with --configs (none
+        are defined today), plus dotted CLI overrides (--chunk.select_n=16). """
     configs_txt = elements.Path(pathlib.Path(folder) / 'configs.yaml').read()
     configs = yaml.YAML(typ='safe').load(configs_txt)
     parsed, other = elements.Flags(configs=['defaults']).parse_known(argv)
@@ -52,13 +51,7 @@ def prefixed(d, default_prefix):
 # --------------------------------------------------------------------- env
 
 def build_env(general, seed):
-    """ (env, offline_dataset). OGBench for the real tasks; the toy pusher
-        when env_name is 'toy-point-push'. """
-    if general.env_name == TOY_ENV:
-        from toy.point_push import make_toy_env_and_dataset
-        env, dataset = make_toy_env_and_dataset(
-            num_episodes=general.toy_offline_episodes, seed=seed)
-        return env, (dataset if general.seed_from_offline else None)
+    """ (env, offline_dataset), OGBench. """
     from helpers.ogbench_methods import OGBenchMethods
     import ogbench
     if general.seed_from_offline:
@@ -71,15 +64,16 @@ def build_env(general, seed):
 
 class Arm:
     """ What an arm must provide. The base class IS the control: QC-FQL with
-        the critic ranking select_n candidate chunks, no model anywhere.
+        the critic picking the best of select_n candidate chunks, no model
+        anywhere.
 
         Subclasses override exactly the hook their idea changes:
-          build_selector   what ranks candidate chunks at act time
+          build_selector   what picks the candidate chunk at act time
           critic_target    what the QC critic regresses onto
           model_update     how the latent model (if any) trains
           report           model diagnostics at eval, zero env steps """
 
-    name = 'critic_best_of_n'
+    name = 'qcfql_bon'
 
     def __init__(self, config, obs_dim, action_dim, device, rng):
         self.config = config
@@ -109,8 +103,7 @@ class Arm:
     def build_selector(self):
         from wm.chunk_selector import ChunkSelector
         return ChunkSelector(None, self.policy, self.action_dim, self.chunk_len,
-                             self.chunk.select_n, self.gamma, self.device,
-                             score_mode='critic')
+                             self.chunk.select_n, self.gamma, self.device)
 
     def describe(self):
         n = self.chunk.select_n
@@ -246,10 +239,10 @@ def run(config, arm_cls):
         rep = arm.report(replay)
         if rep:
             log_dict.update(numeric_metrics(rep))
-        # Selection / target attribution since the last log step, so a run
-        # without wandb still shows whether the model is doing anything.
+        # Selection attribution since the last log step, so a run without
+        # wandb still shows whether the model is doing anything.
         attrib = {k: v for k, v in last_extra.items()
-                  if k.startswith(('select/', 'mve/'))}
+                  if k.startswith('select/')}
         if attrib:
             print('  attribution: ' + '  '.join(
                 f'{k.split("/", 1)[1]} {v:.3f}' for k, v in sorted(attrib.items())))
@@ -315,7 +308,7 @@ def run(config, arm_cls):
         ep_return += float(reward)
         if terminated or truncated:
             # Real online episode finished: feed its return to the selector's
-            # learning-progress gate (explore arm; a no-op elsewhere). Eval
+            # learning-progress gate (explore arm; absent elsewhere). Eval
             # episodes never come through here.
             if hasattr(arm.selector, 'report_episode_return'):
                 arm.selector.report_episode_return(ep_return)

@@ -1,4 +1,4 @@
-# Full runs, cube-triple, seeds 0 and 1. Every arm shares the QC-FQL block
+# Full runs, cube-triple task4, seed 0. Every arm shares the QC-FQL block
 # and the model block in configs.yaml; the flags below are each arm's OWN
 # knobs, so what you pass is exactly what differs from its partner.
 #
@@ -7,60 +7,20 @@
 # to EVERY arm if you want the paper-faithful triple setting; never to one arm
 # alone.
 
-# ---- CONTROL: critic best-of-16 (QC's own best-of-N) -----------------------
-python train_sac_chunked.py --general.run_name=control_s0 --general.out_dir=runs/control_s0 --seed=0
-python train_sac_chunked.py --general.run_name=control_s1 --general.out_dir=runs/control_s1 --seed=1
-# plain QC-FQL (no selection), the floor every arm must clear
-python train_sac_chunked.py --general.run_name=qcfql_s0 --general.out_dir=runs/qcfql_s0 --chunk.select_n=1 --seed=0
-python train_sac_chunked.py --general.run_name=qcfql_s1 --general.out_dir=runs/qcfql_s1 --chunk.select_n=1 --seed=1
+# QC-FQL + critic best-of-16 over the distilled actor (our control)
+python train_qcfql_bon.py  --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.eval_episodes=50 --general.run_name=t4_qcfql_bon_s0  --general.out_dir=runs/t4_qcfql_bon_s0  --seed=0
+# plain QC-FQL (same file, N=1)
+python train_qcfql_bon.py  --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.eval_episodes=50 --chunk.select_n=1 --general.run_name=t4_qcfql_s0 --general.out_dir=runs/t4_qcfql_s0 --seed=0
+# world-model explore (v5)
+python train_explore.py    --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.eval_episodes=50 --general.run_name=t4_explore_s0    --general.out_dir=runs/t4_explore_s0    --explore.beta=1.0 --explore.num_dyn=5 --explore.novelty=reward --explore.novelty_at=end --explore.nu_cap=1 --seed=0
+# explore, attribution (nu = 1)
+python train_explore.py    --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.eval_episodes=50 --general.run_name=t4_explore_nomodel_s0 --general.out_dir=runs/t4_explore_nomodel_s0 --explore.beta=1.0 --explore.num_dyn=5 --explore.novelty=none --explore.nu_cap=1 --seed=0
 
-# ---- MVE: latent value expansion in the critic target   (partner: control) --
-# Acting is the control's critic best-of-16; only the target differs.
-python train_sac_chunked_mve.py --general.run_name=mve_w05_s0 --general.out_dir=runs/mve_w05_s0 --mve.weight=0.5 --mve.chunks=1 --seed=0
-python train_sac_chunked_mve.py --general.run_name=mve_w05_s1 --general.out_dir=runs/mve_w05_s1 --mve.weight=0.5 --mve.chunks=1 --seed=1
-# gentler blend if the model value lags the critic (mve/corr low, mve/abs_gap high)
-python train_sac_chunked_mve.py --general.run_name=mve_w025_s0 --general.out_dir=runs/mve_w025_s0 --mve.weight=0.25 --mve.chunks=1 --seed=0
-
-# ---- EXPLORE: critic best-of-N + novelty scaled by critic uncertainty (partner: control) --
-python train_sac_chunked_explore.py --general.run_name=explore_b1_s0 --general.out_dir=runs/explore_b1_s0 --explore.beta=1.0 --explore.num_dyn=5 --seed=0
-python train_sac_chunked_explore.py --general.run_name=explore_b1_s1 --general.out_dir=runs/explore_b1_s1 --explore.beta=1.0 --explore.num_dyn=5 --seed=1
-# select/bonus_over_gap near 0 = critic confident, arm == control; raise beta only if
-# pick_changed is ~0 while the critic is still visibly uncertain (critic_unc large):
-python train_sac_chunked_explore.py --general.run_name=explore_b3_s0 --general.out_dir=runs/explore_b3_s0 --explore.beta=3.0 --explore.num_dyn=5 --seed=0
-
-# explore arm variants (change ONE knob vs explore_b1):
-#   attribution, no model in the pick (critic doubt only):
-python train_sac_chunked_explore.py --general.run_name=explore_nomodel_s0 --general.out_dir=runs/explore_nomodel_s0 --explore.beta=1.0 --explore.num_dyn=5 --explore.novelty=none --seed=0
-#   reward-weighted, end-latent novelty with a looser cap:
-python train_sac_chunked_explore.py --general.run_name=explore_rw_s0 --general.out_dir=runs/explore_rw_s0 --explore.beta=1.0 --explore.num_dyn=5 --explore.novelty=reward --explore.novelty_at=end --explore.nu_cap=3 --seed=0
-
-# ---- RANKING: model scores the candidates               (partner: control) --
-python train_sac_chunked_ranking.py --general.run_name=ranking_s0 --general.out_dir=runs/ranking_s0 --ranking.rollout_chunks=1 --seed=0
-python train_sac_chunked_ranking.py --general.run_name=ranking_s1 --general.out_dir=runs/ranking_s1 --ranking.rollout_chunks=1 --seed=1
-
-# ---- OPTIMISTIC: ranking + RBMLE dynamics loss          (partner: ranking) --
-python train_sac_chunked_optimistic.py --general.run_name=optimistic_s0 --general.out_dir=runs/optimistic_s0 --optimistic.alpha=1e-4 --optimistic.eta=3e-6 --optimistic.sample_mix=0.5 --seed=0
-python train_sac_chunked_optimistic.py --general.run_name=optimistic_s1 --general.out_dir=runs/optimistic_s1 --optimistic.alpha=1e-4 --optimistic.eta=3e-6 --optimistic.sample_mix=0.5 --seed=1
+# Quadruple: swap the env and add --chunk.alpha=100 (QC's value for
+# quadruple) to EVERY arm, so the policy stays the controlled variable.
+#   --general.env_name=cube-quadruple-play-singletask-v0 --chunk.alpha=100
 
 # Common flags for any arm:
-#   --general.env_name=cube-double-play-singletask-v0     (eef_slice is verified on single/double)
 #   --general.wandb_project=NAME   --general.wandb_mode=offline|disabled
 #   --chunk.compile_nets=False     if torch.compile misbehaves (speed only)
 #   --tdmpc.diag_windows=0         to skip the model accuracy report at eval
-
-# Toy sanity race, CPU, ~40 min for 5 arms x 2 seeds:
-python toy/race.py --arms critic ranking mve explore optimistic --seeds 0 1 --parallel 3 --threads 1
-# any single arm on the toy task:
-python train_sac_chunked_mve.py --configs toy --seed=0
-
-# ---- HARD TASK, seed 0 only: cube-quadruple ---------------------------------
-# Four cubes, 1000-step episodes, rewards in {-4..0}. QC-FQL gets little
-# online success here and exploration is the bottleneck, which is the
-# regime the model arms are built for. alpha=100 is QC's value for
-# quadruple; it is passed to EVERY arm so the policy stays the controlled
-# variable.
-python train_sac_chunked.py         --general.env_name=cube-quadruple-play-singletask-v0 --chunk.alpha=100 --general.run_name=quad_control_s0 --general.out_dir=runs/quad_control_s0 --seed=0
-python train_sac_chunked_mve.py     --general.env_name=cube-quadruple-play-singletask-v0 --chunk.alpha=100 --general.run_name=quad_mve_s0     --general.out_dir=runs/quad_mve_s0     --mve.weight=0.5 --mve.chunks=1 --seed=0
-python train_sac_chunked_explore.py --general.env_name=cube-quadruple-play-singletask-v0 --chunk.alpha=100 --general.run_name=quad_explore_s0 --general.out_dir=runs/quad_explore_s0 --explore.beta=1.0 --explore.num_dyn=5 --seed=0
-# plain QC-FQL floor (no selection at all), if wanted:
-python train_sac_chunked.py         --general.env_name=cube-quadruple-play-singletask-v0 --chunk.alpha=100 --general.run_name=quad_qcfql_s0 --general.out_dir=runs/quad_qcfql_s0 --chunk.select_n=1 --seed=0

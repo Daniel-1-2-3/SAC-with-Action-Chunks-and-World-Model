@@ -20,15 +20,15 @@
     other and never overrides a clear critic preference. beta=0 is exactly
     the control. bonus_scale=unc reproduces the earlier beta * s_i * nu_i.
 
-    Comparison partner: the CONTROL arm (train_sac_chunked.py). The two
-    differ only in beta. The latent model trains as in the ranking arm but is
-    never used to score value -- only its dynamics ensemble is read. """
+    Comparison partner: the CONTROL arm (train_qcfql_bon.py). The two
+    differ only in beta. The latent model (arms/model_arm.py) is never used
+    to score value -- only its dynamics ensemble is read. """
 
-from arms.ranking import RankingArm
+from arms.model_arm import ModelArm
 from wm.chunk_selector import ChunkSelector
 
 
-class ExploreArm(RankingArm):
+class ExploreArm(ModelArm):
     name = 'explore'
     arm_key = 'explore'
 
@@ -42,7 +42,7 @@ class ExploreArm(RankingArm):
     def build_selector(self):
         return ChunkSelector(self.model, self.policy, self.action_dim,
                              self.chunk_len, self.chunk.select_n, self.gamma,
-                             self.device, score_mode='critic',
+                             self.device,
                              rollout_chunks=self.arm_cfg.rollout_chunks,
                              bonus_beta=self.arm_cfg.beta,
                              novelty='none' if self.arm_cfg.novelty == 'none' else 'model',
