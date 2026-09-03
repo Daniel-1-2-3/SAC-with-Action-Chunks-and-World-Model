@@ -55,6 +55,10 @@ defaults:
     # own best-of-N analysis bounds the KL from the sampling policy by
     # log N - (N-1)/N; the paper used N=32 on cube-*. 1 = plain QC-FQL.
     select_n: 16
+    # train_qc.py only: N flow-policy samples per decision for QC's own
+    # best-of-N (act, eval and TD target). Their Table 4/5 value for
+    # cube-*. QC ignores select_n and alpha.
+    qc_num_samples: 32
     utd_ratio: 1
     batch_size: 256
     # Floor only -- raised at runtime to max(., offline_size + online + 1)

@@ -11,6 +11,7 @@ import torch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from tdmpc.agent import TDMPC2Model  # noqa: E402
 from wm.chunk_selector import ChunkSelector  # noqa: E402
+from sac_chunked.qc_agent import QCAgent  # noqa: E402
 
 OBS, ACT, CHUNK, NDYN = 37, 5, 5, 5
 DEV = torch.device('cpu')
@@ -139,3 +140,48 @@ def test_select_end_to_end_train_and_eval():
     state = np.random.randn(OBS).astype(np.float32)
     assert sel.select(state).shape == (CHUNK, ACT)
     assert sel.select(state, eval_mode=True).shape == (CHUNK, ACT)
+
+
+# --------------------------------------------------------------- QC agent
+
+def make_qc(n=8):
+    torch.manual_seed(0)
+    return QCAgent(repr_dim=OBS, action_dim=ACT, chunk_len=CHUNK, device=DEV, lr=3e-4,
+                   hidden_dim=32, num_layers=2, critic_target_tau=0.005, ensemble=2,
+                   num_samples=n, flow_steps=10)
+
+
+def test_qc_sample_chunks_bc_shape_and_clip():
+    ag = make_qc()
+    c = ag.sample_chunks_bc(torch.randn(1, OBS), 8)
+    assert c.shape == (8, CHUNK * ACT)
+    assert c.min() >= -1.0 and c.max() <= 1.0
+    assert ag.sample_chunks_bc(torch.randn(3, OBS), 8).shape == (3 * 8, CHUNK * ACT)
+
+
+def test_qc_best_of_n_picks_the_max_q_candidate():
+    ag = make_qc()
+    feat = torch.randn(1, OBS)
+    torch.manual_seed(1); cands = ag.sample_chunks_bc(feat, 8)
+    q = ag._agg(ag.critic(feat.expand(8, -1), cands)).squeeze(-1)
+    torch.manual_seed(1); pick = ag.best_of_n(feat)
+    assert pick.shape == (1, CHUNK * ACT)
+    assert torch.allclose(pick[0], cands[q.argmax()])
+
+
+def test_qc_act_target_and_updates():
+    ag = make_qc()
+    a = ag.act(np.random.randn(OBS).astype(np.float32), eval_mode=True)
+    assert a.shape == (CHUNK, ACT) and np.abs(a).max() <= 1.0
+    B = 6
+    obs = torch.randn(B, OBS); chunk = torch.rand(B, CHUNK * ACT) * 2 - 1
+    tv = ag.chunk_target_values(torch.randn(B, OBS))
+    assert tv.shape == (B, 1)
+    m = ag.update_critic(obs, chunk, -torch.ones(B, 1) + 0.99 ** CHUNK * tv, torch.ones(B, 1))
+    assert np.isfinite(m['critic_loss'])
+    m = ag.update_actor(obs, torch.ones(B, 1), bc_feat=obs, bc_chunk=chunk,
+                        bc_valid=torch.ones(B, CHUNK))
+    assert set(m) == {'actor_loss', 'bc_flow_loss'}
+    ag.update_target()
+    assert ag.chunk_diversity(obs) >= 0.0
+    assert sorted(ag.state_dict_all()) == ['actor_bc_flow', 'critic', 'critic_target']

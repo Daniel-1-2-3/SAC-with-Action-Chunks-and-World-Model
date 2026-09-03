@@ -241,6 +241,23 @@ class ChunkAgent:
             metrics['diagnosis/critic_target_q_imagined'] = target_Q[n:].mean().item()
         return metrics
 
+    def bc_flow_loss(self, bc_feat, bc_chunk, bc_valid=None):
+        """ acfql.actor_loss L63-79, the rectified-flow BC term (QC eq. 18):
+            interpolate noise -> real chunk at a random time and predict the
+            straight-line velocity. Shared by ChunkAgent (QC-FQL) and QCAgent
+            (QC), which trains its flow policy with this term alone. """
+        z0 = torch.randn_like(bc_chunk)
+        t = torch.rand(bc_chunk.shape[0], 1, device=bc_chunk.device, dtype=bc_chunk.dtype)
+        x_t = (1.0 - t) * z0 + t * bc_chunk
+        vel = bc_chunk - z0
+        pred = self.actor_bc_flow(bc_feat, x_t, t)
+        sq = (pred - vel) ** 2
+        if bc_valid is not None:
+            # Masked per position inside the chunk, then a plain mean over all
+            # elements including the masked ones -- not a masked mean.
+            sq = sq.reshape(-1, self.chunk_len, self.action_dim) * bc_valid[..., None]
+        return sq.mean()
+
     def update_actor(self, feat, weight, bc_feat, bc_chunk, bc_valid=None,
                      actor_batch=None, metrics_on=True):
         """ acfql.actor_loss:
@@ -266,20 +283,7 @@ class ChunkAgent:
             what the CRITIC needs, not what the actor's gradient estimate
             needs. Leave as None to use every row. """
         metrics = {}
-
-        # BC flow loss: interpolate noise -> real chunk at a random time and
-        # predict the straight-line velocity.
-        z0 = torch.randn_like(bc_chunk)
-        t = torch.rand(bc_chunk.shape[0], 1, device=bc_chunk.device, dtype=bc_chunk.dtype)
-        x_t = (1.0 - t) * z0 + t * bc_chunk
-        vel = bc_chunk - z0
-        pred = self.actor_bc_flow(bc_feat, x_t, t)
-        sq = (pred - vel) ** 2
-        if bc_valid is not None:
-            # Masked per position inside the chunk, then a plain mean over all
-            # elements including the masked ones -- not a masked mean.
-            sq = sq.reshape(-1, self.chunk_len, self.action_dim) * bc_valid[..., None]
-        bc_flow_loss = sq.mean()
+        bc_flow_loss = self.bc_flow_loss(bc_feat, bc_chunk, bc_valid)
 
         if actor_batch is not None and actor_batch < feat.shape[0]:
             sel = torch.randperm(feat.shape[0], device=feat.device)[:actor_batch]

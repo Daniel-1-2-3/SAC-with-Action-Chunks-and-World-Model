@@ -7,6 +7,8 @@
 # to EVERY arm if you want the paper-faithful triple setting; never to one arm
 # alone.
 
+# QC (port of Li et al. 2025 Alg. 1, best-of-32 from the flow BC policy)
+python train_qc.py         --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.eval_episodes=50 --general.run_name=t4_qc_s0         --general.out_dir=runs/t4_qc_s0         --seed=0
 # QC-FQL + critic best-of-16 over the distilled actor (our control)
 python train_qcfql_bon.py  --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.eval_episodes=50 --general.run_name=t4_qcfql_bon_s0  --general.out_dir=runs/t4_qcfql_bon_s0  --seed=0
 # plain QC-FQL (same file, N=1)
@@ -16,8 +18,8 @@ python train_explore.py    --general.env_name=cube-triple-play-singletask-task4-
 # explore, attribution (nu = 1)
 python train_explore.py    --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.eval_episodes=50 --general.run_name=t4_explore_nomodel_s0 --general.out_dir=runs/t4_explore_nomodel_s0 --explore.beta=1.0 --explore.num_dyn=5 --explore.novelty=none --explore.nu_cap=1 --seed=0
 
-# Quadruple: swap the env and add --chunk.alpha=100 (QC's value for
-# quadruple) to EVERY arm, so the policy stays the controlled variable.
+# Quadruple: swap the env and add --chunk.alpha=100 (only the QC-FQL-based
+# files use alpha; QC ignores it).
 #   --general.env_name=cube-quadruple-play-singletask-v0 --chunk.alpha=100
 
 # Common flags for any arm:

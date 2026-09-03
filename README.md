@@ -1,8 +1,9 @@
 # World models for action-chunked RL (QC-FQL), cube-triple
 
-Three arms. Every arm trains the SAME policy: QC-FQL (chunked flow
+Three arms. The QC-FQL arms train the SAME policy: QC-FQL (chunked flow
 Q-learning, ported from ColinQiyangLi/qc), observation-space actor and
-critic, real chunk transitions from one shared replay buffer. The explore
+critic, real chunk transitions from one shared replay buffer; the QC arm
+is the paper's own algorithm on the same loop and replay. The explore
 arm also trains a TD-MPC2 latent model on that same replay (encoder ->
 latent, dynamics in latent, reward head and Q both reading the latent,
 latent policy prior; nothing decodes to observation space) and uses it in
@@ -10,6 +11,7 @@ exactly ONE way:
 
 | script | arm | what happens at a chunk boundary | partner |
 |---|---|---|---|
+| `train_qc.py` | **qc** | QC (Li et al. 2025, Alg. 1): flow BC policy, critic best-of-`qc_num_samples` at act, eval and TD-target time. PyTorch port of `agents/acfql.py` `actor_type=best-of-n`; every ported line and deviation is in `sac_chunked/qc_agent.py`. No one-step actor, no alpha. Validated against the vendored official code (`baselines/README.md`) | -- |
 | `train_qcfql_bon.py` | **qcfql_bon** | QC-FQL (Li et al. 2025, Alg. 2) with the online critic picking the best of `select_n` chunks from the distilled one-step actor, at act and eval time. `--chunk.select_n=1` is plain QC-FQL. The paper's control | -- |
 | `train_explore.py` | **explore** | the same critic best-of-N, plus a novelty bonus scaled by the critic's own doubt: `Q_i + beta * g * sigma_Q * s~_i * nu_i`, novelty `nu` in `[0, nu_cap]` from dynamics-ensemble disagreement (Pathak et al. 2019), gate `g` from learning progress. Zero where the critic is sure, so it converges to the control by itself | qcfql_bon |
 
@@ -67,6 +69,19 @@ between exploit (`g = 0`, the control for that episode) and explore
 (fraction of episodes that explored), `select/bandit_mean_explore` vs
 `select/bandit_mean_exploit` (window means, return units) and
 `select/bandit_ucb_gap`. `tests/test_bandit.py` covers the controller.
+
+## QC port: curve check against the paper
+
+`scripts/plot_vs_paper.py --run runs/t4_qc_s0` overlays a run's
+`eval_log.csv` on the paper's released curve for that task
+(`plot_data/ogbench-individual.pkl` in the official repo, vendored under
+`baselines/qc/` from Commit 5 on) and prints where the final point lands
+relative to the paper's 95% CI. Paper QC on cube-triple task4 at 2M steps
+(1M offline + 1M online): success 0.54, CI [0.395, 0.65].
+
+| run | ours at 2M | paper | verdict |
+|---|---|---|---|
+| `t4_qc_s0` (QC port, seed 0, 50 eval episodes) | pending | 0.54 [0.395, 0.65] | pending |
 
 ## Running
 

@@ -68,6 +68,7 @@ class Arm:
         anywhere.
 
         Subclasses override exactly the hook their idea changes:
+          build_policy     the agent (ChunkAgent = QC-FQL; QCAgent = QC)
           build_selector   what picks the candidate chunk at act time
           critic_target    what the QC critic regresses onto
           model_update     how the latent model (if any) trains
@@ -86,16 +87,21 @@ class Arm:
         self.chunk_len = self.chunk.chunk_len
         self.gamma_h = self.gamma ** self.chunk_len
         self.model = None
-        self.policy = ChunkAgent(
-            repr_dim=obs_dim, action_dim=action_dim, chunk_len=self.chunk_len,
-            device=device, lr=self.chunk.lr, hidden_dim=self.chunk.hidden_dim,
+        self.policy = self.build_policy()
+        self.build_model()
+        self.selector = self.build_selector()
+
+    def build_policy(self):
+        """ QC-FQL (acfql.py, actor_type=distill-ddpg). The QC arm returns a
+            QCAgent (best-of-n) instead; same constructor keywords. """
+        return ChunkAgent(
+            repr_dim=self.obs_dim, action_dim=self.action_dim, chunk_len=self.chunk_len,
+            device=self.device, lr=self.chunk.lr, hidden_dim=self.chunk.hidden_dim,
             num_layers=self.chunk.num_layers,
             critic_target_tau=self.chunk.critic_target_tau,
             ensemble=self.chunk.ensemble, alpha=self.chunk.alpha,
             flow_steps=self.chunk.flow_steps, q_agg=self.chunk.q_agg,
             compile_nets=self.chunk.compile_nets)
-        self.build_model()
-        self.selector = self.build_selector()
 
     def build_model(self):
         return None
