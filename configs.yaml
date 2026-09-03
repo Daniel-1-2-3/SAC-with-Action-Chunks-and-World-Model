@@ -116,6 +116,28 @@ defaults:
     dropout: 0.01
     # Dynamics heads. 1 = TD-MPC2. The explore arm sets its own value.
     num_dyn: 1
+    # Balanced sampling for the MODEL's windows, independent of the
+    # policy's chunk.online_frac (which stays at QC's uniform 0.0). This
+    # fraction of every model batch starts in the online region, so the
+    # model fits what the arm is visiting and disagreement there falls;
+    # that fall is what turns "visited" into "not novel". 0.0 = same
+    # uniform sampling as the policy (the earlier behaviour).
+    online_frac: 0.5
+    # The novelty reference (diagnosis/wm_data_disagreement), explore arm:
+    #   step     one-step ensemble disagreement at the first real transition
+    #            of each training window (earlier behaviour). A candidate is
+    #            measured along an imagined path, whose disagreement
+    #            compounds with depth, so the ratio was >1 almost everywhere
+    #            and nu saturated.
+    #   rollout  the same path measure a candidate gets (novelty_at,
+    #            rollout_chunks), over the window's real actions. Like for
+    #            like: a candidate the data would have taken scores ~1.
+    ref_mode: rollout
+    # explore.novelty=reward only: shrink the |d reward / d z| weights
+    # toward uniform, w <- (1 - s) * w + s. 0 = raw weights (earlier
+    # behaviour), 1 = plain mean. 0.5 keeps the reward head's emphasis
+    # without letting a few dims' ensemble noise decide novelty.
+    reward_weight_shrink: 0.5
 
     # --- symlog two-hot for BOTH reward and value, matching the Dreamer
     # config this replaced. Both come out in raw units, comparable to the
@@ -184,6 +206,11 @@ defaults:
     #   unc     beta * s_i * nu_i, the earlier version, g ignored. Kept so
     #           existing runs stay reproducible.
     bonus_scale: spread
+    # spread mode: multiply the bonus by the critic's relative doubt s~_i.
+    # false = the bonus is beta * g * sigma_Q * nu_i. With a 2-head critic
+    # s~_i is mostly noise and halves the bonus on random candidates; true
+    # is the earlier behaviour.
+    use_rel_unc: false
     # Learning-progress gate on the bonus (spread mode only). From the real
     # online episode returns: recent = last W, older = the W before; frac =
     # fraction of recent above median(older); g = 1 - 2 * max(frac - 0.5, 0),

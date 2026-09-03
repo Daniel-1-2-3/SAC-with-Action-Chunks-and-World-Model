@@ -37,7 +37,10 @@ class ExploreArm(ModelArm):
         # keeps num_dyn=1 for every other arm.
         c = self.arm_cfg
         return {'num_dyn': c.num_dyn,
-                'novelty': 'reward' if c.novelty == 'reward' else 'mean'}
+                'novelty': 'reward' if c.novelty == 'reward' else 'mean',
+                'novelty_at': c.novelty_at,
+                'rollout_chunks': c.rollout_chunks,
+                'chunk_len': self.chunk_len}
 
     def build_selector(self):
         return ChunkSelector(self.model, self.policy, self.action_dim,
@@ -51,7 +54,8 @@ class ExploreArm(ModelArm):
                              bonus_scale=self.arm_cfg.bonus_scale,
                              progress_gate=self.arm_cfg.progress_gate,
                              progress_window=self.arm_cfg.progress_window,
-                             progress_tau=self.arm_cfg.progress_tau)
+                             progress_tau=self.arm_cfg.progress_tau,
+                             use_rel_unc=self.arm_cfg.use_rel_unc)
 
     def log_extra(self):
         out = super().log_extra()
@@ -64,6 +68,10 @@ class ExploreArm(ModelArm):
         c = self.arm_cfg
         gate = (f'progress gate W={c.progress_window} tau={c.progress_tau}'
                 if c.progress_gate else 'no progress gate')
+        t = self.config.tdmpc
         return (f'{self.name}: critic best-of-{self.chunk.select_n} + '
-                f'{c.num_dyn}-head novelty[{c.novelty}@{c.novelty_at}, cap {c.nu_cap}] '
-                f'bonus_scale={c.bonus_scale}, beta {c.beta}, {gate}')
+                f'{c.num_dyn}-head novelty[{c.novelty}@{c.novelty_at}, cap {c.nu_cap}, '
+                f'ref {t.ref_mode}, shrink {t.reward_weight_shrink}, '
+                f'model online_frac {t.online_frac}] '
+                f'bonus_scale={c.bonus_scale}, rel_unc={c.use_rel_unc}, '
+                f'beta {c.beta}, {gate}')

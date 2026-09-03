@@ -47,6 +47,18 @@ Read these before anything else on an explore run:
 With wandb disabled, every eval prints the `select/` means since the last
 log step as an `attribution:` line.
 
+Four knobs decide what "novel" means; their defaults are the fixed
+versions, and the earlier behaviour is one flag each:
+
+| knob | default | earlier | what it fixes |
+|---|---|---|---|
+| `tdmpc.ref_mode` | `rollout` | `step` | the reference disagreement is measured on real windows the same way a candidate is (path or end of an imagined chunk), instead of one step from a real state. Imagined drift is in both numerator and denominator, so an in-distribution candidate scores ~1, not >1 everywhere |
+| `tdmpc.reward_weight_shrink` | `0.5` | `0.0` | `novelty=reward` weights blended toward uniform, so a peaked reward head cannot hand novelty to a few dims' ensemble noise |
+| `tdmpc.online_frac` | `0.5` | `0.0` | the model's own balanced sampling: half of every model batch starts in the online region, so visited states stop being novel. The policy's `chunk.online_frac` is untouched |
+| `explore.use_rel_unc` | `false` | `true` | drops the critic's relative-doubt factor from the bonus; with two heads it halved the bonus on random candidates |
+
+Passing all four earlier values reproduces the pre-fix run bit for bit.
+
 ## Running
 
 Commands in COMMANDS.txt. Always pass `--general.run_name`. Static

@@ -37,7 +37,7 @@ class ChunkSelector:
                  rollout_chunks=1, bonus_beta=0.0,
                  novelty='model', novelty_at='path', nu_cap=1.0,
                  bonus_scale='spread', progress_gate=True, progress_window=20,
-                 progress_tau=0.2):
+                 progress_tau=0.2, use_rel_unc=True):
         """ model: a TDMPC2Model (explore arm), or None (control).
             rollout_chunks (explore arm): imagine this many chunks ahead when
             measuring novelty. The first is the candidate; each further
@@ -64,6 +64,9 @@ class ChunkSelector:
         #               'spread' v4: bonus = beta * g * sigma_Q * s~_i * nu_i
         #   progress_gate / progress_window / progress_tau: the learning-
         #               progress gate g, see report_episode_return.
+        #   use_rel_unc (spread mode) multiply by the critic's relative
+        #               doubt s~_i; False drops that factor, so the bonus is
+        #               beta * g * sigma_Q * nu_i.
         assert novelty in ('model', 'none'), novelty
         assert novelty_at in ('path', 'end'), novelty_at
         assert bonus_scale in ('unc', 'spread'), bonus_scale
@@ -74,6 +77,7 @@ class ChunkSelector:
         self.progress_gate = bool(progress_gate)
         self.progress_window = int(progress_window)
         self.progress_tau = float(progress_tau)
+        self.use_rel_unc = bool(use_rel_unc)
         self._returns = []          # real ONLINE episode returns, in order
         self._g = 1.0               # gate value in use (EMA-smoothed)
         self._g_raw = 1.0
@@ -172,7 +176,9 @@ class ChunkSelector:
                 score_i = Q_i + beta * g * sigma_Q * s~_i * nu_i
 
             sigma_Q  population std of Q_i across the n candidates (Q units)
-            s~_i     relative critic doubt clamp(s_i / mean_j s_j, 0, 1)
+            s~_i     relative critic doubt clamp(s_i / mean_j s_j, 0, 1), or
+                     1 with use_rel_unc off (a 2-head ensemble's spread is
+                     mostly noise, and it halved the bonus at random)
             g        learning-progress gate in [0, 1], see
                      report_episode_return; 1 while returns are flat, -> 0
                      while they improve (the arm becomes the control)
@@ -216,7 +222,10 @@ class ChunkSelector:
             scale = self.bonus_beta * s_unc
         else:
             g = self.gate
-            s_rel = torch.clamp(s_unc / (s_unc.mean() + 1e-12), 0.0, 1.0)
+            if self.use_rel_unc:
+                s_rel = torch.clamp(s_unc / (s_unc.mean() + 1e-12), 0.0, 1.0)
+            else:
+                s_rel = torch.ones_like(s_unc)
             scale = self.bonus_beta * g * sigma_q * s_rel
         bonus = scale * nu
         score = critic_score + bonus
@@ -290,28 +299,8 @@ class ChunkSelector:
 
     @torch.no_grad()
     def _candidate_disagreement(self, feat_n, cands):
-        """ Dynamics-ensemble disagreement of each candidate's imagined path,
-            reduced per the model's `novelty` rule (mean over dims, or
-            reward-weighted) and taken either along the path or at its end.
-            Uncompiled on purpose: the reward-weighted rule needs a gradient
-            through the reward head. (n,) """
+        """ Novelty measure of each candidate's imagined path, (n,). The same
+            function measures the data reference (tdmpc.ref_mode=rollout). """
         m = self.model
-        z = m.encode(feat_n)
         acts = cands.reshape(self.n, self.chunk_len, self.action_dim)
-        steps = []
-        for k in range(self.chunk_len):
-            a = acts[:, k]
-            preds = m.net.next_all(z, a)
-            var = preds.var(0, unbiased=False)
-            steps.append(m.reduce_disagreement(var, z, a))
-            z = preds.mean(0)
-        for _ in range(self.rollout_chunks - 1):
-            for _ in range(self.chunk_len):
-                a = m.net.pi(z)[0]
-                preds = m.net.next_all(z, a)
-                var = preds.var(0, unbiased=False)
-                steps.append(m.reduce_disagreement(var, z, a))
-                z = preds.mean(0)
-        if self.novelty_at == 'end':
-            return steps[-1].squeeze(-1)
-        return torch.stack(steps, 0).mean(0).squeeze(-1)
+        return m.path_disagreement(m.encode(feat_n), acts)

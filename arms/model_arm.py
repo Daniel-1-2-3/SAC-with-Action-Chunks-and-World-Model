@@ -27,7 +27,8 @@ class ModelArm(Arm):
 
     def model_update(self, replay, metrics_on):
         t = self.config.tdmpc
-        w = replay.sample_model_windows(t.batch_size, t.horizon, self.device, self.rng)
+        w = replay.sample_model_windows(t.batch_size, t.horizon, self.device, self.rng,
+                                        online_frac=t.online_frac)
         if w is None:
             return {}
         return self.model.update(w['obs'], w['next_obs'], w['action'],

@@ -50,7 +50,8 @@ class TDMPC2Model:
         chunk_disagreement) is everything the arms call at act time. """
 
     def __init__(self, obs_dim, action_dim, device, cfg, gamma,
-                 num_dyn=None, novelty='mean'):
+                 num_dyn=None, novelty='mean', novelty_at='path',
+                 rollout_chunks=1, chunk_len=None):
         """ num_dyn: dynamics heads; overrides cfg.num_dyn (explore arm).
             novelty: how ensemble disagreement over the latent dims is
             reduced to one number, for BOTH the data reference and the
@@ -60,7 +61,13 @@ class TDMPC2Model:
                         dims the reward head reads counts, disagreement in
                         dims it ignores (arm pose) does not. Early, when the
                         reward head is untrained, the weights are ~uniform
-                        and this equals 'mean'. """
+                        and this equals 'mean'. cfg.reward_weight_shrink
+                        blends the weights back toward uniform.
+            novelty_at, rollout_chunks, chunk_len: how a candidate's path is
+            measured by path_disagreement (see there). With
+            cfg.ref_mode='rollout' the data reference is measured the same
+            way on real replay windows, so the ratio compares like with
+            like; 'step' is the earlier one-step reference. """
         self.device = device
         self.action_dim = action_dim
         self.gamma = gamma
@@ -70,6 +77,13 @@ class TDMPC2Model:
         self.tau = float(cfg.tau)
         self.num_q = int(cfg.num_q)
         self.novelty = novelty
+        self.novelty_at = novelty_at
+        self.rollout_chunks = max(1, int(rollout_chunks))
+        self.chunk_len = int(chunk_len) if chunk_len is not None else self.horizon
+        self.ref_mode = str(getattr(cfg, 'ref_mode', 'step'))
+        assert self.ref_mode in ('step', 'rollout'), self.ref_mode
+        self.reward_weight_shrink = float(getattr(cfg, 'reward_weight_shrink', 0.0))
+        assert 0.0 <= self.reward_weight_shrink <= 1.0, self.reward_weight_shrink
 
         self.net = TDMPC2Nets(
             obs_dim, action_dim, latent_dim=cfg.latent_dim, mlp_dim=cfg.mlp_dim,
@@ -80,7 +94,11 @@ class TDMPC2Model:
         # Running mean of ensemble disagreement on REAL transitions, updated
         # every update(). The explore arm's bonus is measured against this,
         # so "novel" means "more uncertain than the data", and the bonus
-        # anneals as the heads converge on the data.
+        # anneals as the heads converge on the data. ref_mode 'step': the
+        # one-step disagreement at the first real transition of each window.
+        # 'rollout': the same path measure a candidate gets
+        # (path_disagreement over the window's real actions), so imagined
+        # drift is in the reference too and the ratio is not inflated by it.
         self.data_disagreement = 1e-8
 
         # tdmpc2.py: the encoder trains at lr * enc_lr_scale, every other
@@ -167,14 +185,24 @@ class TDMPC2Model:
             plain mean is weight 1 everywhere. A row with no gradient at all
             (the head's output layer is zero-initialised, so this is exactly
             the untrained case) falls back to uniform weights, i.e. 'mean'
-            mode. (B, latent). """
+            mode. (B, latent).
+
+            reward_weight_shrink (lambda) blends toward uniform:
+            w <- (1 - lambda) * w + lambda. A sharply peaked reward head
+            otherwise puts nearly all the weight on a handful of dims, and
+            the novelty ratio then hinges on those dims' ensemble noise.
+            lambda 0 = raw weights, 1 = 'mean' mode. """
         with torch.enable_grad():
             zg = z.detach().requires_grad_(True)
             r = self.net.reward_pred(zg, a).sum()
             g, = torch.autograd.grad(r, zg)
         w = g.abs()
         mean = w.mean(-1, keepdim=True)
-        return torch.where(mean > 0, w / (mean + 1e-12), torch.ones_like(w))
+        w = torch.where(mean > 0, w / (mean + 1e-12), torch.ones_like(w))
+        if self.reward_weight_shrink > 0.0:
+            lam = self.reward_weight_shrink
+            w = (1.0 - lam) * w + lam
+        return w
 
     @torch.no_grad()
     def reduce_disagreement(self, var, z, a):
@@ -185,6 +213,38 @@ class TDMPC2Model:
         if self.novelty == 'reward':
             return (var * self.reward_weights(z, a)).mean(-1, keepdim=True)
         return var.mean(-1, keepdim=True)
+
+    @torch.no_grad()
+    def path_disagreement(self, z, actions):
+        """ Dynamics-ensemble disagreement of an imagined path, one number
+            per row (B,). z: (B, latent) encoded start. actions: (B, T,
+            action_dim) rolled through the ensemble MEAN, each step's per-dim
+            variance across heads reduced by `novelty`; then rollout_chunks-1
+            further chunks of chunk_len steps with the policy prior's mean
+            action. novelty_at 'path' = mean over all steps, 'end' = the last
+            step only.
+
+            One function for the explore arm's candidates AND (ref_mode
+            'rollout') the data reference, so both are measured alike.
+            Uncompiled on purpose: the reward-weighted rule needs a gradient
+            through the reward head. """
+        steps = []
+        for k in range(actions.shape[1]):
+            a = actions[:, k]
+            preds = self.net.next_all(z, a)
+            var = preds.var(0, unbiased=False)
+            steps.append(self.reduce_disagreement(var, z, a))
+            z = preds.mean(0)
+        for _ in range(self.rollout_chunks - 1):
+            for _ in range(self.chunk_len):
+                a = self.net.pi(z)[0]
+                preds = self.net.next_all(z, a)
+                var = preds.var(0, unbiased=False)
+                steps.append(self.reduce_disagreement(var, z, a))
+                z = preds.mean(0)
+        if self.novelty_at == 'end':
+            return steps[-1].squeeze(-1)
+        return torch.stack(steps, 0).mean(0).squeeze(-1)
 
     @torch.no_grad()
     def rollout_pi_chunk(self, z, chunk_len, discount0=1.0):
@@ -256,9 +316,7 @@ class TDMPC2Model:
         total, consistency_loss, reward_loss, value_loss, zs, var0 = self._losses(
             obs[:, 0], next_z_real, action, reward, valid, td_targets)
         if var0 is not None:
-            d = self.reduce_disagreement(var0, zs[:, 0].detach(), action[:, 0]).mean().item()
-            self.data_disagreement = 0.99 * self.data_disagreement + 0.01 * d \
-                if self.data_disagreement > 1e-8 else d
+            self.update_novelty_reference(zs, action, valid, var0=var0)
 
         self.opt.zero_grad(set_to_none=True)
         total.backward()
@@ -288,6 +346,34 @@ class TDMPC2Model:
         }
         metrics.update(pi_metrics)
         return metrics
+
+    def update_novelty_reference(self, zs, action, valid, var0=None):
+        """ EMA of the data disagreement (see __init__), from the SAME
+            forward pass / parameters the losses used. Returns the new value.
+
+            zs: (B, H+1, latent) rollout latents, zs[:, 0] the encoded real
+            start. action: (B, H, action_dim) real actions. valid: (B, H, 1).
+            var0: (B, latent) per-dim ensemble variance at step 0, needed by
+            ref_mode 'step' only.
+
+            'step':    reduce_disagreement(var0) at the window's first real
+                       transition, averaged over the batch.
+            'rollout': path_disagreement over the first chunk_len real
+                       actions of every window that stays inside one
+                       episode; skipped (value unchanged) when none does. """
+        if self.ref_mode == 'rollout':
+            T = min(self.chunk_len, action.shape[1])
+            keep = (valid[:, :T, 0].min(dim=1).values > 0.5).nonzero().squeeze(-1)
+            if len(keep) == 0:
+                return self.data_disagreement
+            with torch.no_grad():
+                d = self.path_disagreement(zs[keep, 0].detach(), action[keep, :T]).mean().item()
+        else:
+            assert var0 is not None, "ref_mode 'step' needs the step-0 variance"
+            d = self.reduce_disagreement(var0, zs[:, 0].detach(), action[:, 0]).mean().item()
+        self.data_disagreement = 0.99 * self.data_disagreement + 0.01 * d \
+            if self.data_disagreement > 1e-8 else d
+        return self.data_disagreement
 
     def _losses(self, obs0, next_z_real, action, reward, valid, td_targets):
         """ The three TD-MPC2 losses on one latent rollout (see update()).
