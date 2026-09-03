@@ -11,9 +11,12 @@
     nu_i    = latent-model novelty of candidate i's imagined path, clamped
               to [0, nu_cap] (dynamics-ensemble disagreement relative to the
               data's, Pathak et al. 2019)
-    g       = learning-progress gate in [0, 1]: 1 while real online returns
-              are flat, -> 0 while they improve, so exploration switches
-              itself off when plain learning is working
+    g       = controller output in [0, 1]. explore.controller=gate: the
+              learning-progress gate, 1 while real online returns are flat,
+              -> 0 while they improve, so exploration switches itself off
+              when plain learning is working. explore.controller=bandit: 0
+              or 1 for a whole episode, chosen per episode by a
+              sliding-window UCB over the two arms' returns
 
     so the bonus is bounded by beta * g * sigma_Q * nu_cap: novelty can
     reorder candidates the critic rates within about beta spreads of each
@@ -55,7 +58,10 @@ class ExploreArm(ModelArm):
                              progress_gate=self.arm_cfg.progress_gate,
                              progress_window=self.arm_cfg.progress_window,
                              progress_tau=self.arm_cfg.progress_tau,
-                             use_rel_unc=self.arm_cfg.use_rel_unc)
+                             use_rel_unc=self.arm_cfg.use_rel_unc,
+                             controller=self.arm_cfg.controller,
+                             bandit_window=self.arm_cfg.bandit_window,
+                             bandit_c=self.arm_cfg.bandit_c)
 
     def log_extra(self):
         out = super().log_extra()
@@ -66,8 +72,11 @@ class ExploreArm(ModelArm):
 
     def describe(self):
         c = self.arm_cfg
-        gate = (f'progress gate W={c.progress_window} tau={c.progress_tau}'
-                if c.progress_gate else 'no progress gate')
+        if c.controller == 'bandit':
+            gate = f'bandit controller W={c.bandit_window} c={c.bandit_c}'
+        else:
+            gate = (f'progress gate W={c.progress_window} tau={c.progress_tau}'
+                    if c.progress_gate else 'no progress gate')
         t = self.config.tdmpc
         return (f'{self.name}: critic best-of-{self.chunk.select_n} + '
                 f'{c.num_dyn}-head novelty[{c.novelty}@{c.novelty_at}, cap {c.nu_cap}, '

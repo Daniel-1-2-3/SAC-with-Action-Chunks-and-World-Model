@@ -220,3 +220,15 @@ defaults:
     progress_gate: true
     progress_window: 20
     progress_tau: 0.2
+    # What sets g (spread mode):
+    #   gate    the learning-progress gate above, every decision.
+    #   bandit  per EPISODE: at each real online episode start a
+    #           sliding-window UCB over the last bandit_window finished
+    #           episodes picks exploit (g = 0, the control) or explore
+    #           (g = 1) by their returns, mean / range + c * sqrt(2 ln N / n).
+    #           Logged as select/bandit_arm (fraction of episodes explored),
+    #           bandit_n_window, bandit_mean_exploit, bandit_mean_explore,
+    #           bandit_ucb_gap.
+    controller: gate
+    bandit_window: 20
+    bandit_c: 1.0

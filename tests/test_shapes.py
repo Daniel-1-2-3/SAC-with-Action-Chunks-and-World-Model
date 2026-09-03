@@ -117,11 +117,13 @@ def make_selector(model, **kw):
                          bonus_beta=1.0, **kw)
 
 
+@pytest.mark.parametrize('controller', ['gate', 'bandit'])
 @pytest.mark.parametrize('bonus_scale', ['unc', 'spread'])
 @pytest.mark.parametrize('novelty', ['model', 'none'])
-def test_select_uncertainty_scaled_shape(bonus_scale, novelty):
+def test_select_uncertainty_scaled_shape(bonus_scale, novelty, controller):
     m = make_model()
-    sel = make_selector(m, bonus_scale=bonus_scale, novelty=novelty)
+    sel = make_selector(m, bonus_scale=bonus_scale, novelty=novelty, controller=controller)
+    sel.begin_episode()
     feat_n = torch.randn(1, OBS).repeat(16, 1)
     cands = sel.policy.sample_chunk(feat_n)
     qs = sel.policy.critic(feat_n, cands)

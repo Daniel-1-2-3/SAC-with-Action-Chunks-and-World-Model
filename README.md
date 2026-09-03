@@ -59,6 +59,15 @@ versions, and the earlier behaviour is one flag each:
 
 Passing all four earlier values reproduces the pre-fix run bit for bit.
 
+`explore.controller` decides what sets the gate `g`: `gate` (default) is
+the learning-progress gate; `bandit` picks, once per real online episode,
+between exploit (`g = 0`, the control for that episode) and explore
+(`g = 1`) with a sliding-window UCB over the two arms' episode returns
+(`explore.bandit_window`, `explore.bandit_c`). Read `select/bandit_arm`
+(fraction of episodes that explored), `select/bandit_mean_explore` vs
+`select/bandit_mean_exploit` (window means, return units) and
+`select/bandit_ucb_gap`. `tests/test_bandit.py` covers the controller.
+
 ## Running
 
 Commands in COMMANDS.txt. Always pass `--general.run_name`. Static

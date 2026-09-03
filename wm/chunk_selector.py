@@ -37,7 +37,8 @@ class ChunkSelector:
                  rollout_chunks=1, bonus_beta=0.0,
                  novelty='model', novelty_at='path', nu_cap=1.0,
                  bonus_scale='spread', progress_gate=True, progress_window=20,
-                 progress_tau=0.2, use_rel_unc=True):
+                 progress_tau=0.2, use_rel_unc=True, controller='gate',
+                 bandit_window=20, bandit_c=1.0):
         """ model: a TDMPC2Model (explore arm), or None (control).
             rollout_chunks (explore arm): imagine this many chunks ahead when
             measuring novelty. The first is the candidate; each further
@@ -67,6 +68,12 @@ class ChunkSelector:
         #   use_rel_unc (spread mode) multiply by the critic's relative
         #               doubt s~_i; False drops that factor, so the bonus is
         #               beta * g * sigma_Q * nu_i.
+        #   controller  'gate'    g is the learning-progress gate above
+        #               'bandit'  g is 0 or 1 for a whole episode, chosen at
+        #                         begin_episode() by a sliding-window UCB
+        #                         over the two arms' real episode returns
+        #   bandit_window / bandit_c: the window (episodes) and the UCB
+        #               exploration constant.
         assert novelty in ('model', 'none'), novelty
         assert novelty_at in ('path', 'end'), novelty_at
         assert bonus_scale in ('unc', 'spread'), bonus_scale
@@ -78,6 +85,12 @@ class ChunkSelector:
         self.progress_window = int(progress_window)
         self.progress_tau = float(progress_tau)
         self.use_rel_unc = bool(use_rel_unc)
+        assert controller in ('gate', 'bandit'), controller
+        self.controller = controller
+        self.bandit_window = int(bandit_window)
+        self.bandit_c = float(bandit_c)
+        self._pulls = []            # (arm, return) of the last finished episodes
+        self.bandit_arm = 1         # arm in force: 0 exploit (g=0), 1 explore (g=1)
         self._returns = []          # real ONLINE episode returns, in order
         self._g = 1.0               # gate value in use (EMA-smoothed)
         self._g_raw = 1.0
@@ -109,6 +122,9 @@ class ChunkSelector:
             Fewer than 2W episodes -> g = 1. g is EMA-smoothed with
             progress_tau. With progress_gate off, g is identically 1. """
         self._returns.append(float(ep_return))
+        if self.controller == 'bandit':
+            self._pulls.append((self.bandit_arm, float(ep_return)))
+            return
         if not self.progress_gate:
             return
         W = self.progress_window
@@ -122,8 +138,60 @@ class ChunkSelector:
         self._g_raw = g
         self._g = (1.0 - self.progress_tau) * self._g + self.progress_tau * g
 
+    def begin_episode(self):
+        """ Called by the loop at the start of every REAL online episode
+            (never for eval). Bandit controller only: pick this episode's
+            arm by sliding-window UCB over the last bandit_window finished
+            episodes,
+
+                score_k = mean_k / range + c * sqrt(2 ln N / n_k)
+
+            mean_k the mean return of the episodes that ran arm k in the
+            window, range = max - min of all returns in the window (so c is
+            dimensionless), N the window size in use, n_k arm k's pulls in
+            it. An arm with no pulls in the window is taken first (exploit,
+            then explore). Arm 0 = exploit, g = 0, exactly the control for
+            that episode; arm 1 = explore, g = 1, the full bonus.
+
+            Every call logs five select/bandit_* keys: the arm chosen,
+            the window size, the two window means (raw return units, only
+            when the arm has pulls) and the UCB score gap explore - exploit
+            (only when both have). """
+        if self.controller != 'bandit':
+            return
+        window = self._pulls[-self.bandit_window:]
+        n_total = len(window)
+        means, counts = {}, {}
+        for k in (0, 1):
+            rs = [r for a, r in window if a == k]
+            counts[k] = len(rs)
+            if rs:
+                means[k] = float(np.mean(rs))
+        untried = [k for k in (0, 1) if counts[k] == 0]
+        gap = None
+        if untried:
+            arm = untried[0]
+        else:
+            rets = np.asarray([r for _, r in window])
+            rng_ = max(float(rets.max() - rets.min()), 1e-8)
+            score = {k: means[k] / rng_ + self.bandit_c * np.sqrt(2.0 * np.log(n_total) / counts[k])
+                     for k in (0, 1)}
+            arm = 1 if score[1] >= score[0] else 0
+            gap = score[1] - score[0]
+        self.bandit_arm = int(arm)
+        self._acc('bandit_arm', float(arm))
+        self._acc('bandit_n_window', float(n_total))
+        if 0 in means:
+            self._acc('bandit_mean_exploit', means[0])
+        if 1 in means:
+            self._acc('bandit_mean_explore', means[1])
+        if gap is not None:
+            self._acc('bandit_ucb_gap', float(gap))
+
     @property
     def gate(self):
+        if self.controller == 'bandit':
+            return float(self.bandit_arm)
         return self._g if self.progress_gate else 1.0
 
     def pop_stats(self):

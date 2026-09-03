@@ -284,6 +284,14 @@ def run(config, arm_cls):
     ep_return = 0.0
     print(f'Starting online phase ({arm.describe()})')
 
+    def begin_episode():
+        # Start of a REAL online episode: the explore arm's per-episode
+        # controller (bandit) picks its arm here. Absent elsewhere.
+        if hasattr(arm.selector, 'begin_episode'):
+            arm.selector.begin_episode()
+
+    begin_episode()
+
     while global_step < general.num_online_steps:
         state = np.asarray(obs, dtype=np.float32).reshape(-1)
 
@@ -315,6 +323,7 @@ def run(config, arm_cls):
             ep_return = 0.0
             obs, info = env.reset()
             chunk_pos = chunk_len
+            begin_episode()
 
         global_step += 1
         log_step = offline_steps + global_step
@@ -352,6 +361,7 @@ def run(config, arm_cls):
             obs, info = env.reset()
             chunk_pos = chunk_len
             ep_return = 0.0   # the interrupted episode is not a finished one
+            begin_episode()
 
         if global_step % general.save_every == 0:
             arm.save(out_dir, 'latest')
