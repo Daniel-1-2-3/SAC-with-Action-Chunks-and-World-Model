@@ -1,12 +1,10 @@
-# One config for every arm. Each train_sac_chunked_*.py reads `defaults`,
-# then any preset named with --configs (e.g. `--configs toy`), then dotted
+# One config for every arm. Each train_*.py reads `defaults`, then dotted
 # CLI overrides such as --chunk.select_n=16 or --general.run_name=foo.
 #
 # The QC-FQL block (`chunk`) and the latent-model block (`tdmpc`) are SHARED
 # by every arm by construction -- there is one copy, so no arm can drift
-# from another. An arm's own knobs live in its own block (ranking / mve /
-# explore / optimistic) and are the ONLY thing that differs between it and
-# its comparison partner.
+# from another. An arm's own knobs live in its own block and are
+# the ONLY thing that differs between it and its comparison partner.
 
 defaults:
 
@@ -18,7 +16,7 @@ defaults:
     out_dir: runs/default
     wandb_project: beat-qc-fql
     wandb_mode: online          # 'disabled' skips wandb entirely
-    # Latent-model checkpoint to load (model arms only). '' = train from
+    # Latent-model checkpoint to load (model arms only; none in this tree). '' = train from
     # scratch alongside the policy.
     model_ckpt: ''
     seed_from_offline: True
@@ -32,8 +30,6 @@ defaults:
     save_every: 10000
     eval_every: 10000
     eval_episodes: 20
-    # Only read when env_name is toy-point-push.
-    toy_offline_episodes: 300
 
   # ---------------------------------------------------------------------
   # QC-FQL, ported from github.com/ColinQiyangLi/qc (agents/acfql.py,
@@ -54,15 +50,39 @@ defaults:
   # ---------------------------------------------------------------------
   chunk:
     chunk_len: 5
-    # Candidate chunks per decision, in every arm that selects. QC's own
-    # best-of-N analysis bounds the KL from the sampling policy by
+    # Candidate chunks per decision, drawn from the distilled one-step actor
+    # and picked by the critic (train_control.py; train_qc_fql.py forces 1). QC's
+    # own best-of-N analysis bounds the KL from the sampling policy by
     # log N - (N-1)/N; the paper used N=32 on cube-*. 1 = plain QC-FQL.
     select_n: 16
+    # Where the select_n candidates come from (train_control.py):
+    #   actor  the distilled one-step actor, one pass per candidate (the
+    #          earlier behaviour)
+    #   bc     the flow BC policy: noise -> Euler with flow_steps -> clip,
+    #          i.e. QC's own sampler, still picked by the critic.
+    # Training is untouched either way; only what is drawn at a decision.
+    candidate_source: actor
+    # train_qc.py only: N flow-policy samples per decision for QC's own
+    # best-of-N (act, eval and TD target). Their Table 4/5 value for
+    # cube-*. QC ignores select_n and alpha.
+    qc_num_samples: 32
+    # QC's TD bootstrap: bestofn = argmax over qc_num_samples BC samples at
+    # s' (paper, eq. 11); single = one BC sample (attribution: removes the
+    # max-over-N bias, acting unchanged).
+    qc_target: bestofn
     utd_ratio: 1
     batch_size: 256
     # Floor only -- raised at runtime to max(., offline_size + online + 1)
     # so offline data is never evicted (main.py's max(buffer_size, size+1)).
     replay_capacity: 1000000
+    # Balanced replay sampling, EVERY arm: this fraction of each batch's
+    # start indices (critic/actor chunks AND the model's windows) is drawn
+    # from the online region of the buffer, the rest from the whole buffer.
+    # 0.0 = QC's plain uniform sampling. With a 5M offline seed and ~150k
+    # online transitions at 400k steps, uniform sampling shows the learners
+    # ~3% online data, so two arms' different collections look the same to
+    # them. Logged as replay/online_batch_frac.
+    online_frac: 0.0
     gamma: 0.99
     lr: 3e-4
     hidden_dim: 512
@@ -81,8 +101,8 @@ defaults:
     compile_nets: True
 
   # ---------------------------------------------------------------------
-  # TD-MPC2 latent model (nicklashansen/tdmpc2, state variant). Shared by
-  # every model arm. Encoder -> latent, dynamics in latent, reward head and
+  # TD-MPC2 latent model (nicklashansen/tdmpc2, state variant), trained by
+  # a model arm (library only in this tree). Encoder -> latent, dynamics in latent, reward head and
   # Q both read the latent. Nothing decodes to observation space.
   # ---------------------------------------------------------------------
   tdmpc:
@@ -91,8 +111,9 @@ defaults:
     train_every: 2
     batch_size: 256
     # Latent rollout length per update. 5 = chunk_len, so the model is
-    # trained on exactly the depth a single-chunk scorer consumes (TD-MPC2's
-    # own default is 3). Raise with rollout_chunks if scoring deeper.
+    # trained on exactly the depth a single-chunk novelty measure consumes
+    # (TD-MPC2's own default is 3). Raise with rollout_chunks if imagining
+    # deeper.
     horizon: 5
 
     # --- architecture, TD-MPC2 defaults for state observations
@@ -104,18 +125,38 @@ defaults:
     enc_layers: 2
     # SimNorm group size. The latent is softmaxed in groups of this many,
     # which keeps it bounded WITHOUT a reconstruction loss -- the reason this
-    # model needs no decoder. Each group is also a categorical distribution,
-    # which the optimistic arm's loss reads literally.
+    # model needs no decoder.
     simnorm_dim: 8
     num_q: 5
     dropout: 0.01
-    # Dynamics heads. 1 = TD-MPC2. The explore arm sets its own value.
+    # Dynamics heads. 1 = TD-MPC2.
     num_dyn: 1
+    # Balanced sampling for the MODEL's windows, independent of the
+    # policy's chunk.online_frac (which stays at QC's uniform 0.0). This
+    # fraction of every model batch starts in the online region, so the
+    # model fits what the arm is visiting and disagreement there falls;
+    # that fall is what turns "visited" into "not novel". 0.0 = same
+    # uniform sampling as the policy (the earlier behaviour).
+    online_frac: 0.5
+    # The novelty reference (diagnosis/wm_data_disagreement), model arms:
+    #   step     one-step ensemble disagreement at the first real transition
+    #            of each training window (earlier behaviour). A candidate is
+    #            measured along an imagined path, whose disagreement
+    #            compounds with depth, so the ratio was >1 almost everywhere
+    #            and nu saturated.
+    #   rollout  the same path measure a candidate gets (novelty_at,
+    #            rollout_chunks), over the window's real actions. Like for
+    #            like: a candidate the data would have taken scores ~1.
+    ref_mode: rollout
+    # novelty=reward only: shrink the |d reward / d z| weights
+    # toward uniform, w <- (1 - s) * w + s. 0 = raw weights (earlier
+    # behaviour), 1 = plain mean. 0.5 keeps the reward head's emphasis
+    # without letting a few dims' ensemble noise decide novelty.
+    reward_weight_shrink: 0.5
 
     # --- symlog two-hot for BOTH reward and value, matching the Dreamer
-    # config this replaced. Both terms of a chunk score come out in raw
-    # units, so pooled imagined reward and terminal Q are directly addable
-    # and comparable to the QC critic's own Q.
+    # config this replaced. Both come out in raw units, comparable to the
+    # QC critic's own Q (tdmpc/diagnostics.py).
     num_bins: 101
     vmin: -10.0
     vmax: 10.0
@@ -133,12 +174,12 @@ defaults:
 
     # --- accuracy checks at every eval (tdmpc/diagnostics.py). Offline
     # against replay windows that contain an above-baseline reward, ZERO env
-    # steps. 0 disables. depth is in chunks; 1 = what a single-chunk scorer
-    # consumes.
+    # steps. 0 disables. depth is in chunks; 1 = what a single-chunk novelty
+    # measure consumes.
     diag_windows: 256
     diag_depth: 1
 
-    # torch.compile on the latent model's update and scoring paths -- the
+    # torch.compile on the latent model's update and rollout paths -- the
     # same launch-bound situation as chunk.compile_nets, ~12k tiny kernels
     # per update. Pure speed change, alters no results.
     compile_nets: True
@@ -148,103 +189,4 @@ defaults:
   # its own block.
   # ---------------------------------------------------------------------
 
-  # train_sac_chunked_ranking.py  (partner: train_sac_chunked.py)
-  ranking:
-    # Chunks imagined per candidate. 1 = the candidate only, then the latent
-    # Q. More = continue with the policy prior's actions at the imagined
-    # latent -- no decode, so depth costs dynamics error (wm/latent_drift),
-    # never decoder error.
-    rollout_chunks: 1
 
-  # train_sac_chunked_mve.py  (partner: train_sac_chunked.py)
-  mve:
-    # Chunks of latent expansion after the real chunk. 1 = the QC actor's
-    # own next chunk through the model, then the latent Q. 0 = latent Q at
-    # s' with no rollout. More = continue with the policy prior.
-    chunks: 1
-    # Blend: target bootstrap = (1-w) * Q_qc(s', a') + w * V_mve(s').
-    # 0 recovers QC exactly; 1 is pure MVE. Start in the middle -- the
-    # model's value is trained on single-step TD and is noisier early.
-    weight: 0.5
-
-  # train_sac_chunked_explore.py  (partner: train_sac_chunked.py)
-  explore:
-    rollout_chunks: 1
-    # Dynamics heads for the disagreement bonus (Pathak et al. use 5).
-    num_dyn: 5
-    # Bonus = beta * (critic ensemble std of the candidate) * novelty[0,1].
-    # Dimensionless: beta 1.0 means novelty may move a pick by at most one
-    # critic-std. 0 = exactly the control. Vanishes as the critic's heads
-    # converge, so there is nothing to schedule.
-    beta: 1.0
-    # What "novelty" means:
-    #   model   dynamics-ensemble disagreement, mean over latent dims
-    #   reward  same disagreement, weighted by |d reward_head / d z| -- only
-    #           dims the reward head reads count (object-centric, no decoder)
-    #   none    nu = 1 everywhere: the critic's doubt explores alone, no model
-    #           in the pick. ATTRIBUTION arm.
-    novelty: model
-    # Where along the imagined chunk novelty is measured: path = mean over
-    # the steps (motion), end = final imagined latent only (outcome).
-    novelty_at: path
-    # Ceiling on nu. bonus <= beta * s_i * nu_cap. 1 = the tested setting;
-    # 3 lets the model keep ranking candidates that are all past 2x.
-    nu_cap: 1.0
-
-  # train_sac_chunked_optimistic.py  (partner: train_sac_chunked_ranking.py)
-  optimistic:
-    rollout_chunks: 1
-    # Paper's O-DreamerV3 values. alpha 0.1 collapses learning there;
-    # keep it tiny.
-    alpha: 1.0e-4
-    eta: 3.0e-6
-    # lambda-return mixing for the advantage, and how many real starts per
-    # update are rolled with the prior for `horizon` imagined steps.
-    lam: 0.95
-    imag_batch: 64
-    horizon: 5
-    # How far the imagined next latent moves from the model's prediction
-    # toward the sampled one-hot class per group. 0 = deterministic rollout
-    # (no RBMLE gradient); 1 = pure one-hot draw, which the reward/value
-    # heads never see in training and extrapolate badly on. 0.5 keeps the
-    # rollout inside each simplex while still depending on the draw.
-    sample_mix: 0.5
-
-# =======================================================================
-# Presets. Layer on top of defaults with --configs NAME. They may only
-# override keys that exist above.
-# =======================================================================
-
-# Fast CPU sanity run on the toy pusher (toy/point_push.py). Small nets,
-# short phases, no wandb. Enough to see whether an arm beats the control
-# in minutes -- NOT a substitute for cube runs.
-toy:
-  general:
-    env_name: toy-point-push
-    out_dir: runs/toy
-    wandb_mode: disabled
-    num_offline_steps: 6000
-    num_online_steps: 10000
-    start_training: 500
-    log_every: 200
-    save_every: 100000
-    eval_every: 2000
-    eval_episodes: 20
-    toy_offline_episodes: 300
-  chunk:
-    hidden_dim: 256
-    num_layers: 3
-    alpha: 30.0
-    eef_slice: [0, 2]
-    compile_nets: False
-    replay_capacity: 100000
-  tdmpc:
-    latent_dim: 64
-    mlp_dim: 128
-    enc_dim: 64
-    num_q: 3
-    batch_size: 128
-    diag_windows: 128
-    compile_nets: False
-  optimistic:
-    imag_batch: 32

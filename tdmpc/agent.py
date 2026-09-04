@@ -13,7 +13,6 @@
     different termination models. """
 
 import torch
-import torch.nn.functional as F
 
 from tdmpc.model import TDMPC2Nets, soft_ce
 
@@ -21,9 +20,8 @@ from tdmpc.model import TDMPC2Nets, soft_ce
 class RunningScale:
     """ common/scale.py: running trimmed scale. Tracks the 5th-95th percentile
         range of a batch of values (clamped to at least 1) with an EMA at rate
-        tau. Used to normalise Q in the policy-prior loss and returns in the
-        optimistic loss, so their coefficients mean the same thing at step 1k
-        and step 1M. """
+        tau. Used to normalise Q in the policy-prior loss, so its coefficient
+        means the same thing at step 1k and step 1M. """
 
     def __init__(self, tau=0.01, device='cpu'):
         self.tau = tau
@@ -51,11 +49,10 @@ class TDMPC2Model:
         (encode, rollout_chunk, rollout_pi_chunk, terminal_value,
         chunk_disagreement) is everything the arms call at act time. """
 
-    def __init__(self, obs_dim, action_dim, device, cfg, gamma, optimism=None,
-                 num_dyn=None, novelty='mean'):
-        """ optimism: None, or a config block {alpha, eta, lam, imag_batch,
-            horizon, sample_mix} enabling the Optimistic-World-Models loss.
-            num_dyn: dynamics heads; overrides cfg.num_dyn (explore arm).
+    def __init__(self, obs_dim, action_dim, device, cfg, gamma,
+                 num_dyn=None, novelty='mean', novelty_at='path',
+                 rollout_chunks=1, chunk_len=None):
+        """ num_dyn: dynamics heads; overrides cfg.num_dyn (explore arm).
             novelty: how ensemble disagreement over the latent dims is
             reduced to one number, for BOTH the data reference and the
             explore arm's candidates so the ratio stays meaningful:
@@ -64,7 +61,13 @@ class TDMPC2Model:
                         dims the reward head reads counts, disagreement in
                         dims it ignores (arm pose) does not. Early, when the
                         reward head is untrained, the weights are ~uniform
-                        and this equals 'mean'. """
+                        and this equals 'mean'. cfg.reward_weight_shrink
+                        blends the weights back toward uniform.
+            novelty_at, rollout_chunks, chunk_len: how a candidate's path is
+            measured by path_disagreement (see there). With
+            cfg.ref_mode='rollout' the data reference is measured the same
+            way on real replay windows, so the ratio compares like with
+            like; 'step' is the earlier one-step reference. """
         self.device = device
         self.action_dim = action_dim
         self.gamma = gamma
@@ -73,8 +76,14 @@ class TDMPC2Model:
         self.rho = float(cfg.rho)
         self.tau = float(cfg.tau)
         self.num_q = int(cfg.num_q)
-        self.optimism = optimism
         self.novelty = novelty
+        self.novelty_at = novelty_at
+        self.rollout_chunks = max(1, int(rollout_chunks))
+        self.chunk_len = int(chunk_len) if chunk_len is not None else self.horizon
+        self.ref_mode = str(getattr(cfg, 'ref_mode', 'step'))
+        assert self.ref_mode in ('step', 'rollout'), self.ref_mode
+        self.reward_weight_shrink = float(getattr(cfg, 'reward_weight_shrink', 0.0))
+        assert 0.0 <= self.reward_weight_shrink <= 1.0, self.reward_weight_shrink
 
         self.net = TDMPC2Nets(
             obs_dim, action_dim, latent_dim=cfg.latent_dim, mlp_dim=cfg.mlp_dim,
@@ -85,7 +94,11 @@ class TDMPC2Model:
         # Running mean of ensemble disagreement on REAL transitions, updated
         # every update(). The explore arm's bonus is measured against this,
         # so "novel" means "more uncertain than the data", and the bonus
-        # anneals as the heads converge on the data.
+        # anneals as the heads converge on the data. ref_mode 'step': the
+        # one-step disagreement at the first real transition of each window.
+        # 'rollout': the same path measure a candidate gets
+        # (path_disagreement over the window's real actions), so imagined
+        # drift is in the reference too and the ratio is not inflated by it.
         self.data_disagreement = 1e-8
 
         # tdmpc2.py: the encoder trains at lr * enc_lr_scale, every other
@@ -102,7 +115,6 @@ class TDMPC2Model:
         self.pi_opt = torch.optim.Adam(self.net.pi_net.parameters(), lr=cfg.lr,
                                        eps=1e-5)
         self.scale = RunningScale(tau=self.tau, device=device)
-        self.ret_scale = RunningScale(tau=0.01, device=device)
         self._target_params = list(self.net.Qs_target.parameters())
         self._online_q_params = list(self.net.Qs.parameters())
         self._opt_params = [p for g in self.opt.param_groups for p in g['params']]
@@ -173,14 +185,24 @@ class TDMPC2Model:
             plain mean is weight 1 everywhere. A row with no gradient at all
             (the head's output layer is zero-initialised, so this is exactly
             the untrained case) falls back to uniform weights, i.e. 'mean'
-            mode. (B, latent). """
+            mode. (B, latent).
+
+            reward_weight_shrink (lambda) blends toward uniform:
+            w <- (1 - lambda) * w + lambda. A sharply peaked reward head
+            otherwise puts nearly all the weight on a handful of dims, and
+            the novelty ratio then hinges on those dims' ensemble noise.
+            lambda 0 = raw weights, 1 = 'mean' mode. """
         with torch.enable_grad():
             zg = z.detach().requires_grad_(True)
             r = self.net.reward_pred(zg, a).sum()
             g, = torch.autograd.grad(r, zg)
         w = g.abs()
         mean = w.mean(-1, keepdim=True)
-        return torch.where(mean > 0, w / (mean + 1e-12), torch.ones_like(w))
+        w = torch.where(mean > 0, w / (mean + 1e-12), torch.ones_like(w))
+        if self.reward_weight_shrink > 0.0:
+            lam = self.reward_weight_shrink
+            w = (1.0 - lam) * w + lam
+        return w
 
     @torch.no_grad()
     def reduce_disagreement(self, var, z, a):
@@ -193,6 +215,38 @@ class TDMPC2Model:
         return var.mean(-1, keepdim=True)
 
     @torch.no_grad()
+    def path_disagreement(self, z, actions):
+        """ Dynamics-ensemble disagreement of an imagined path, one number
+            per row (B,). z: (B, latent) encoded start. actions: (B, T,
+            action_dim) rolled through the ensemble MEAN, each step's per-dim
+            variance across heads reduced by `novelty`; then rollout_chunks-1
+            further chunks of chunk_len steps with the policy prior's mean
+            action. novelty_at 'path' = mean over all steps, 'end' = the last
+            step only.
+
+            One function for the explore arm's candidates AND (ref_mode
+            'rollout') the data reference, so both are measured alike.
+            Uncompiled on purpose: the reward-weighted rule needs a gradient
+            through the reward head. """
+        steps = []
+        for k in range(actions.shape[1]):
+            a = actions[:, k]
+            preds = self.net.next_all(z, a)
+            var = preds.var(0, unbiased=False)
+            steps.append(self.reduce_disagreement(var, z, a))
+            z = preds.mean(0)
+        for _ in range(self.rollout_chunks - 1):
+            for _ in range(self.chunk_len):
+                a = self.net.pi(z)[0]
+                preds = self.net.next_all(z, a)
+                var = preds.var(0, unbiased=False)
+                steps.append(self.reduce_disagreement(var, z, a))
+                z = preds.mean(0)
+        if self.novelty_at == 'end':
+            return steps[-1].squeeze(-1)
+        return torch.stack(steps, 0).mean(0).squeeze(-1)
+
+    @torch.no_grad()
     def rollout_pi_chunk(self, z, chunk_len, discount0=1.0):
         """ Same, with actions from the policy prior at each imagined latent.
             This is how a score looks more than one chunk ahead without
@@ -200,7 +254,7 @@ class TDMPC2Model:
 
             DEVIATION: uses the prior's MEAN action. TD-MPC2's planner samples,
             but sampling injects per-candidate noise into a comparison whose
-            whole point is ranking candidates against each other. """
+            whole point is ordering candidates against each other. """
         pooled = torch.zeros(z.shape[0], 1, device=z.device, dtype=z.dtype)
         dis = torch.zeros_like(pooled)
         disc = discount0
@@ -255,22 +309,14 @@ class TDMPC2Model:
               value        two-hot CE against the TD target
             then the policy prior on the detached rollout latents, then the
             target-Q soft update. With a dynamics ensemble, every head gets
-            the consistency loss and the rollout continues through the mean.
-            With `optimism`, the RBMLE loss is added to the total. """
+            the consistency loss and the rollout continues through the mean. """
         cfg = self.cfg
         self.net.train()
         td_targets, next_z_real = self._td_target(next_obs, reward, mask)
         total, consistency_loss, reward_loss, value_loss, zs, var0 = self._losses(
             obs[:, 0], next_z_real, action, reward, valid, td_targets)
         if var0 is not None:
-            d = self.reduce_disagreement(var0, zs[:, 0].detach(), action[:, 0]).mean().item()
-            self.data_disagreement = 0.99 * self.data_disagreement + 0.01 * d \
-                if self.data_disagreement > 1e-8 else d
-
-        opt_metrics = {}
-        if self.optimism is not None:
-            opt_loss, opt_metrics = self._optimistic_loss(obs[:, 0], metrics_on)
-            total = total + opt_loss
+            self.update_novelty_reference(zs, action, valid, var0=var0)
 
         self.opt.zero_grad(set_to_none=True)
         total.backward()
@@ -299,8 +345,35 @@ class TDMPC2Model:
             'diagnosis/reward_batch_std': reward.std().item(),
         }
         metrics.update(pi_metrics)
-        metrics.update(opt_metrics)
         return metrics
+
+    def update_novelty_reference(self, zs, action, valid, var0=None):
+        """ EMA of the data disagreement (see __init__), from the SAME
+            forward pass / parameters the losses used. Returns the new value.
+
+            zs: (B, H+1, latent) rollout latents, zs[:, 0] the encoded real
+            start. action: (B, H, action_dim) real actions. valid: (B, H, 1).
+            var0: (B, latent) per-dim ensemble variance at step 0, needed by
+            ref_mode 'step' only.
+
+            'step':    reduce_disagreement(var0) at the window's first real
+                       transition, averaged over the batch.
+            'rollout': path_disagreement over the first chunk_len real
+                       actions of every window that stays inside one
+                       episode; skipped (value unchanged) when none does. """
+        if self.ref_mode == 'rollout':
+            T = min(self.chunk_len, action.shape[1])
+            keep = (valid[:, :T, 0].min(dim=1).values > 0.5).nonzero().squeeze(-1)
+            if len(keep) == 0:
+                return self.data_disagreement
+            with torch.no_grad():
+                d = self.path_disagreement(zs[keep, 0].detach(), action[keep, :T]).mean().item()
+        else:
+            assert var0 is not None, "ref_mode 'step' needs the step-0 variance"
+            d = self.reduce_disagreement(var0, zs[:, 0].detach(), action[:, 0]).mean().item()
+        self.data_disagreement = 0.99 * self.data_disagreement + 0.01 * d \
+            if self.data_disagreement > 1e-8 else d
+        return self.data_disagreement
 
     def _losses(self, obs0, next_z_real, action, reward, valid, td_targets):
         """ The three TD-MPC2 losses on one latent rollout (see update()).
@@ -398,85 +471,6 @@ class TDMPC2Model:
             'diagnosis/pi_entropy': (-log_prob).mean().item(),
             'diagnosis/pi_q_scaled': q.mean().item(),
             'diagnosis/q_scale': float(self.scale()),
-        }
-
-    def _optimistic_loss(self, obs0, metrics_on):
-        """ Optimistic World Models (Mete et al. 2026), eq. 10, on the SimNorm
-            latent read as G categoricals:
-
-              L_opt = -alpha * sum_l A_l * log p(z_{l+1} | z_l, a_l)
-                      - eta  * sum_l H(p(. | z_l, a_l))
-
-            An imagined trajectory is rolled from real encoded starts with
-            the policy prior, SAMPLING each next latent from the dynamics'
-            categoricals (straight-through) so the draw has a likelihood.
-            A_l = (G^lam_l - V(z_l)) / max(1, S), the lambda-return over
-            imagined rewards bootstrapped by Q(z, pi(z)), S the running
-            5-95 percentile range of those returns. Gradient reaches the
-            DYNAMICS only: starts are detached, advantages are detached.
-
-            The effect is RBMLE's: transitions that turned out better than
-            the value expected get their likelihood raised, so imagination
-            drifts optimistic, and the scorer that reads it prefers chunks
-            the optimistic model likes. alpha must be tiny (paper: 1e-4). """
-        o = self.optimism
-        L = int(o.horizon)
-        n = min(int(o.imag_batch), obs0.shape[0])
-        mix = float(o.sample_mix)
-        with torch.no_grad():
-            z = self.net.encode(obs0[:n])
-        logps, ents, rewards, values = [], [], [], []
-        for _ in range(L):
-            with torch.no_grad():
-                a = self.net.pi(z)[1]
-                rewards.append(self.net.reward_pred(z, a))
-                values.append(self.net.q_subset(z, a, reduce='avg'))
-            p_next = self.net.next(z, a)
-            ents.append(self.net.latent_entropy(p_next))
-            onehot, logp = self.net.sample_latent(p_next)
-            # The heads only ever train on soft SimNorm latents, so a pure
-            # one-hot draw is off-distribution for them. Continue the rollout
-            # on a convex mix of the draw and the prediction: still inside
-            # each simplex, still dependent on the draw (so the advantage
-            # depends on it and the RBMLE gradient is non-zero in
-            # expectation), with sample_mix setting how far toward the
-            # vertex it goes.
-            z = (1.0 - mix) * p_next + mix * onehot
-            logps.append(logp)
-        with torch.no_grad():
-            v_end = self.terminal_value(z.detach())
-            # lambda-return backwards from the bootstrap:
-            #   G_l = r_l + gamma * [(1 - lam) V(z_{l+1}) + lam * G_{l+1}],
-            #   G_{L-1} = r_{L-1} + gamma * V(z_L).
-            # values[l] is V(z_l), so the bootstrap for step l is values[l+1]
-            # and v_end for the last step.
-            lam = float(o.lam)
-            next_values = values[1:] + [v_end]
-            ret = v_end
-            returns = [None] * L
-            for l in reversed(range(L)):
-                if l == L - 1:
-                    ret = rewards[l] + self.gamma * v_end
-                else:
-                    ret = rewards[l] + self.gamma * ((1 - lam) * next_values[l] + lam * ret)
-                returns[l] = ret
-            returns_t = torch.stack(returns, 0)                    # (L, n, 1)
-            values_t = torch.stack(values, 0)
-            self.ret_scale.update(returns_t)
-            adv = (returns_t - values_t) / torch.clamp(self.ret_scale(), min=1.0)
-        logp_t = torch.stack(logps, 0)
-        ent_t = torch.stack(ents, 0)
-        loss = -float(o.alpha) * (adv * logp_t).sum(0).mean() \
-               - float(o.eta) * ent_t.sum(0).mean()
-        if not metrics_on:
-            return loss, {}
-        return loss, {
-            'optimism/loss': loss.item(),
-            'optimism/adv_mean': adv.mean().item(),
-            'optimism/adv_std': adv.std().item(),
-            'optimism/logp_mean': logp_t.mean().item(),
-            'optimism/latent_entropy': ent_t.mean().item(),
-            'optimism/return_scale': float(self.ret_scale()),
         }
 
     @torch.no_grad()

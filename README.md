@@ -1,66 +1,34 @@
-# World models for action-chunked RL (QC-FQL), cube-triple
+# QC-FQL + critic best-of-N (control), QC, QC-FQL
 
-Five arms. Every arm trains the SAME policy: QC-FQL (chunked flow
-Q-learning, ported from ColinQiyangLi/qc), observation-space actor and
-critic, real chunk transitions from one shared replay buffer. Four of them
-also train a TD-MPC2 latent model on that same replay (encoder -> latent,
-dynamics in latent, reward head and Q both reading the latent, latent
-policy prior; nothing decodes to observation space). Each arm uses the
-model in exactly ONE way, and differs from its comparison partner in
-exactly that:
+Three offline-to-online RL arms on OGBench cube tasks, one training loop
+(`sac_chunked/experiment.py`), one replay, same protocol as Li et al. 2025
+(*Reinforcement Learning with Action Chunking*): 1M offline updates on the
+play dataset, 1M online env steps, 50 eval episodes.
 
-| script | arm | what the model does | partner |
+| script | arm | what it does | published number (cube-triple task4) |
 |---|---|---|---|
-| `train_sac_chunked.py` | **control** | nothing. Critic ranks `select_n` candidate chunks (QC's own best-of-N). `--chunk.select_n=1` = plain QC-FQL | -- |
-| `train_sac_chunked_ranking.py` | **ranking** | ranks the same candidates by `sum gamma^t r_model + gamma^H Q_model` | control |
-| `train_sac_chunked_mve.py` | **mve** | replaces the critic's bootstrap with a latent value expansion (Feinberg et al. 2018). Acting is the control's | control |
-| `train_sac_chunked_explore.py` | **explore** | critic best-of-N + novelty bonus scaled by the critic's own ensemble uncertainty: `Q_i + beta * std_heads(Q_i) * novelty_i`, novelty in [0,1] from dynamics-ensemble disagreement (Pathak et al. 2019). Zero where the critic is sure, so it converges to the control by itself | control |
-| `train_sac_chunked_optimistic.py` | **optimistic** | ranking with an optimistic (RBMLE) dynamics loss (Mete et al. 2026) | ranking |
+| `train_control.py` | **control** | QC-FQL training; at act and eval time the online critic picks the best of `chunk.select_n` chunks sampled from the distilled one-step actor (`candidate_source=actor`) or the flow BC policy (`=bc`). This is our method. | -- |
+| `train_qc_fql.py` | **qc_fql** | QC-FQL exactly (Alg. 2): the one-step actor's single output. The control with `select_n=1`. Paper alpha for triple is 100. | 26 |
+| `train_qc.py` | **qc** | QC (Alg. 1): flow BC policy, best-of-32 by the critic at act, eval and TD-target time. PyTorch port of `ColinQiyangLi/qc`; deviations listed in `sac_chunked/qc_agent.py`. `chunk.qc_target=single` bootstraps on one BC sample instead. | 54 |
+| `train_official.py` | -- | runs the vendored official JAX code (`baselines/qc`) with the same flags, to validate the port. | -- |
 
-The method of each arm is in `arms/<name>.py`; the shared loop is
-`sac_chunked/experiment.py`; the model is `tdmpc/`; the buffer is
-`sac_chunked/replay.py`; the selector is `wm/chunk_selector.py`. One
-`configs.yaml` holds the QC block and the model block ONCE, so arms cannot
-drift apart; each arm's own knobs sit in its own block.
+`tdmpc/` and `wm/` are the latent world-model architecture and the chunk
+selector, kept as library code; no arm in this tree trains a model.
 
-## Is the model contributing anything?
+## Commands
+See `COMMANDS.txt`. Every arm takes the same `--general.*` and `--chunk.*`
+flags; `--seed` sets init, batch order and env resets.
 
-Read these before anything else on a model-arm run:
+## Speed
+Eval is most of the wall clock: each eval is `eval_episodes` x 1000 env steps
+plus a critic call per chunk, plus the video render. Defaults are unchanged
+(`eval_every: 10000`, `eval_episodes: 20`); `--general.eval_every=100000` is
+QC's cadence if a run needs to be fast. First line of a run must read
+`PyTorch device: cuda`; a CPU warning is printed otherwise (see `install.sh`).
 
-- `select/term_r_share`  reward term's share of the score's spread across
-  candidates. Near 0: the reward head is irrelevant to the ranking.
-- `select/term_q_std`  spread of the terminal latent value.
-- `select/pick_agreement`, `select/model_critic_corr`  how often / how
-  closely the model picks what the critic would. Near 1: the arm has
-  reduced to the control.
-- `mve/corr`, `mve/abs_gap` (mve arm)  is the expansion informative, or a
-  noisier copy of the QC bootstrap.
-- explore arm, critic side: `select/frac_within_unc` (candidates the critic
-  cannot separate from its favourite; 1/n = sure, 1 = no opinion),
-  `select/unc_over_gap` (error bar over its own margin). Both should fall
-  over training; that fall IS the anneal. Cross-check with
-  `diagnosis/critic_calibration` (ensemble spread over real TD error): near
-  0 means the heads agree but are wrong, so the bonus is silenced for the
-  wrong reason.
-- explore arm, bonus side: `select/pick_changed`, `select/bonus_over_gap`
-  (how much of the critic's margin novelty could buy), `select/picked_unc`,
-  `select/picked_novelty`. Novelty side: `select/novelty_frac_active` (~0 =
-  bonus dead), `select/novelty_frac_saturated` (~1 = bonus is a constant),
-  `diagnosis/wm_data_disagreement` (the denominator; drift moves both).
-  `select/unc_novelty_corr` > 0 means critic doubt and model novelty point
-  at the same candidates.
-- `wm/reward_corr`, `wm/latent_drift_rel`, `wm/value_critic_corr`  model
-  accuracy against replay at every eval, zero env steps
-  (`tdmpc/diagnostics.py`).
+## Install
+`bash install.sh` -- installs torch from the CUDA index (never plain PyPI,
+never next to `jax[cuda12]`) and the MuJoCo rendering libs.
 
-## Running
-
-Commands in COMMANDS.txt. Always pass `--general.run_name`.
-
-Fast sanity race on the toy pusher (`toy/point_push.py`, CPU, minutes):
-
-    python toy/race.py --arms critic ranking mve explore optimistic --seeds 0 1
-
-Metric decided in advance for cube: steps until eval/mean_return first
-crosses a fixed threshold both arms clearly pass. Log the 2/3-cube crossing
-and the 3/3 crossing separately.
+## Static checks
+`python -m pyflakes .`, `python -m pytest -q tests`.

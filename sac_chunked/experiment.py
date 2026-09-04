@@ -27,14 +27,13 @@ from helpers.interop import numeric_metrics
 OBS_KEY = 'state'
 ENV_ACTION_LOW = -1.0
 ENV_ACTION_HIGH = 1.0
-TOY_ENV = 'toy-point-push'
 
 
 # ------------------------------------------------------------------ config
 
 def load_config(folder, argv=None):
-    """ configs.yaml `defaults`, plus any presets named with --configs (e.g.
-        --configs toy), plus dotted CLI overrides (--chunk.select_n=16). """
+    """ configs.yaml `defaults`, plus any presets named with --configs (none
+        are defined today), plus dotted CLI overrides (--chunk.select_n=16). """
     configs_txt = elements.Path(pathlib.Path(folder) / 'configs.yaml').read()
     configs = yaml.YAML(typ='safe').load(configs_txt)
     parsed, other = elements.Flags(configs=['defaults']).parse_known(argv)
@@ -52,13 +51,7 @@ def prefixed(d, default_prefix):
 # --------------------------------------------------------------------- env
 
 def build_env(general, seed):
-    """ (env, offline_dataset). OGBench for the real tasks; the toy pusher
-        when env_name is 'toy-point-push'. """
-    if general.env_name == TOY_ENV:
-        from toy.point_push import make_toy_env_and_dataset
-        env, dataset = make_toy_env_and_dataset(
-            num_episodes=general.toy_offline_episodes, seed=seed)
-        return env, (dataset if general.seed_from_offline else None)
+    """ (env, offline_dataset), OGBench. """
     from helpers.ogbench_methods import OGBenchMethods
     import ogbench
     if general.seed_from_offline:
@@ -71,15 +64,17 @@ def build_env(general, seed):
 
 class Arm:
     """ What an arm must provide. The base class IS the control: QC-FQL with
-        the critic ranking select_n candidate chunks, no model anywhere.
+        the critic picking the best of select_n candidate chunks, no model
+        anywhere.
 
         Subclasses override exactly the hook their idea changes:
-          build_selector   what ranks candidate chunks at act time
+          build_policy     the agent (ChunkAgent = QC-FQL; QCAgent = QC)
+          build_selector   what picks the candidate chunk at act time
           critic_target    what the QC critic regresses onto
           model_update     how the latent model (if any) trains
           report           model diagnostics at eval, zero env steps """
 
-    name = 'critic_best_of_n'
+    name = 'control'
 
     def __init__(self, config, obs_dim, action_dim, device, rng):
         self.config = config
@@ -92,16 +87,21 @@ class Arm:
         self.chunk_len = self.chunk.chunk_len
         self.gamma_h = self.gamma ** self.chunk_len
         self.model = None
-        self.policy = ChunkAgent(
-            repr_dim=obs_dim, action_dim=action_dim, chunk_len=self.chunk_len,
-            device=device, lr=self.chunk.lr, hidden_dim=self.chunk.hidden_dim,
+        self.policy = self.build_policy()
+        self.build_model()
+        self.selector = self.build_selector()
+
+    def build_policy(self):
+        """ QC-FQL (acfql.py, actor_type=distill-ddpg). The QC arm returns a
+            QCAgent (best-of-n) instead; same constructor keywords. """
+        return ChunkAgent(
+            repr_dim=self.obs_dim, action_dim=self.action_dim, chunk_len=self.chunk_len,
+            device=self.device, lr=self.chunk.lr, hidden_dim=self.chunk.hidden_dim,
             num_layers=self.chunk.num_layers,
             critic_target_tau=self.chunk.critic_target_tau,
             ensemble=self.chunk.ensemble, alpha=self.chunk.alpha,
             flow_steps=self.chunk.flow_steps, q_agg=self.chunk.q_agg,
             compile_nets=self.chunk.compile_nets)
-        self.build_model()
-        self.selector = self.build_selector()
 
     def build_model(self):
         return None
@@ -109,8 +109,7 @@ class Arm:
     def build_selector(self):
         from wm.chunk_selector import ChunkSelector
         return ChunkSelector(None, self.policy, self.action_dim, self.chunk_len,
-                             self.chunk.select_n, self.gamma, self.device,
-                             score_mode='critic')
+                             self.chunk.select_n, self.gamma, self.device)
 
     def describe(self):
         n = self.chunk.select_n
@@ -185,6 +184,11 @@ def run(config, arm_cls):
 
     chunk_len = chunk.chunk_len
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device.type != 'cuda':
+        print('*' * 78)
+        print('* WARNING: torch cannot see a GPU -- this run will be ~50x slower on CPU.')
+        print('* Check nvidia-smi, then reinstall torch from the CUDA index (bash install.sh).')
+        print('*' * 78, flush=True)
     torch.set_float32_matmul_precision('high')
     rng = np.random.default_rng(config.seed)
     set_seed_everywhere(config.seed)
@@ -205,7 +209,8 @@ def run(config, arm_cls):
     # offline data is never evicted once online transitions arrive.
     dataset_size = len(train_dataset['observations']) if train_dataset is not None else 0
     capacity = max(chunk.replay_capacity, dataset_size + general.num_online_steps + 1)
-    replay = ChunkTransitionReplay(obs_dim, action_dim, chunk_len, capacity=capacity)
+    replay = ChunkTransitionReplay(obs_dim, action_dim, chunk_len, capacity=capacity,
+                                   online_frac=chunk.online_frac)
     if train_dataset is not None:
         n = replay.seed_from_offline(train_dataset)
         print(f'Seeded replay with {n} offline transitions '
@@ -245,10 +250,10 @@ def run(config, arm_cls):
         rep = arm.report(replay)
         if rep:
             log_dict.update(numeric_metrics(rep))
-        # Selection / target attribution since the last log step, so a run
-        # without wandb still shows whether the model is doing anything.
+        # Selection attribution since the last log step, so a run without
+        # wandb still shows whether the model is doing anything.
         attrib = {k: v for k, v in last_extra.items()
-                  if k.startswith(('select/', 'mve/'))}
+                  if k.startswith('select/')}
         if attrib:
             print('  attribution: ' + '  '.join(
                 f'{k.split("/", 1)[1]} {v:.3f}' for k, v in sorted(attrib.items())))
@@ -287,7 +292,16 @@ def run(config, arm_cls):
     chunk_buffer = None
     chunk_pos = chunk_len
     global_step = 0
+    ep_return = 0.0
     print(f'Starting online phase ({arm.describe()})')
+
+    def begin_episode():
+        # Start of a REAL online episode: a model arm's per-episode
+        # controller (bandit) picks its arm here. Absent elsewhere.
+        if hasattr(arm.selector, 'begin_episode'):
+            arm.selector.begin_episode()
+
+    begin_episode()
 
     while global_step < general.num_online_steps:
         state = np.asarray(obs, dtype=np.float32).reshape(-1)
@@ -310,9 +324,17 @@ def run(config, arm_cls):
                    terminated, truncated)
 
         obs = next_obs
+        ep_return += float(reward)
         if terminated or truncated:
+            # Real online episode finished: feed its return to the selector's
+            # learning-progress gate (model arms; absent in this tree). Eval
+            # episodes never come through here.
+            if hasattr(arm.selector, 'report_episode_return'):
+                arm.selector.report_episode_return(ep_return)
+            ep_return = 0.0
             obs, info = env.reset()
             chunk_pos = chunk_len
+            begin_episode()
 
         global_step += 1
         log_step = offline_steps + global_step
@@ -342,12 +364,15 @@ def run(config, arm_cls):
             metrics['replay/success_frac_total'] = s['total_frac']
             metrics['replay/success_frac_online'] = s['online_frac']
             metrics['replay/success_episodes_online'] = s['online_success']
+            metrics['replay/online_batch_frac'] = replay.last_online_frac
             log(numeric_metrics(metrics), log_step)
 
         if global_step % general.eval_every == 0:
             run_eval(log_step, n_updates)
             obs, info = env.reset()
             chunk_pos = chunk_len
+            ep_return = 0.0   # the interrupted episode is not a finished one
+            begin_episode()
 
         if global_step % general.save_every == 0:
             arm.save(out_dir, 'latest')

@@ -1,5 +1,0 @@
-[tool.pytest.ini_options]
-markers = ['slow']
-addopts = ['--strict-config', '-ra']
-pythonpath = ['.']
-testpaths = ['embodied/tests']

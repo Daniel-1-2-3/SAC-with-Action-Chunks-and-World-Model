@@ -1,42 +1,14 @@
 numpy<2
-
-# Config loading only (elements.Config / elements.Flags) and configs.yaml.
 elements>=3.17.0
 ruamel.yaml
-
-# JAX stack. NOT needed by training any more -- the world model is TD-MPC2 in
-# PyTorch and nothing in the active code imports jax. These are here only for
-# the vendored embodied/ (DreamerV3) tree, which nothing imports either.
-# Safe to drop along with embodied/.
-jax[cuda12]<0.7.0
-optax
-chex
-einops
-jaxtyping
-ninjax>=3.5.1
-
-# policy (PyTorch side) -- install from the CUDA index above, not plain PyPI,
-# or pip serves a CPU-only wheel
-torch
-
-# environment
+# PyTorch: install from the CUDA index (install.sh), NOT plain PyPI, or a
+# CPU-only wheel may be served and every run prints "device: cpu".
+# Never install jax[cuda12] next to torch: its nvidia-* wheels replace
+# torch's CUDA libraries and torch.cuda.is_available() becomes False.
 ogbench
 mujoco
-
-# rendering and plots
+gymnasium
 opencv-python
 matplotlib
-
-# embodied support (vendored tree only)
-google-resumable-media>=2.7.2
-granular>=0.20.3
-portal>=3.5.0
-scope>=0.4.4
-av
-
-# logging and misc
-wandb[media]
-requests
-tqdm
-colored_traceback
-ipdb
+wandb
+imageio

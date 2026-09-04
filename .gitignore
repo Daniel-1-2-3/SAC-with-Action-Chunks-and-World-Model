@@ -5,3 +5,4 @@ runs/
 *_out/
 wandb/
 *.log
+.venv-qc/

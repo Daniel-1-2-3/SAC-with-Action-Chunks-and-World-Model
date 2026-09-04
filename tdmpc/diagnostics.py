@@ -34,7 +34,7 @@ has both kinds, so the correlation is defined.
 
 Stated plainly: rollouts here are teacher-forced with the actions in replay,
 so this measures accuracy on the data distribution, not on the current
-policy's. When the policy is far from the data these numbers are optimistic.
+policy's. When the policy is far from the data these numbers flatter the model.
 They are still the right gate: a model that cannot predict rewards on data it
 was trained on will not predict them on-policy either.
 
@@ -59,7 +59,7 @@ def model_report(model, policy, replay, chunk_len, depth, gamma, device, rng,
     span = chunk_len * depth
     half = max(num_windows // 2, 3)
     w_hit = replay.sample_reward_windows(half, span, device, rng)
-    w_uni = replay.sample_model_windows(half, span, device, rng)
+    w_uni = replay.sample_model_windows(half, span, device, rng, online_frac=0.0)
     if w_uni is None:
         return {}
     w = w_uni if w_hit is None else {
