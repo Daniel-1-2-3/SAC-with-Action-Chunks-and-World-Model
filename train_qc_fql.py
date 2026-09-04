@@ -3,6 +3,9 @@
 
       python train_qc_fql.py --chunk.alpha=100 --general.run_name=NAME --seed=0 """
 
+import os
+os.environ.setdefault('MUJOCO_GL', 'egl')
+
 from arms.qc_fql import QCFQLArm
 from sac_chunked.experiment import main
 

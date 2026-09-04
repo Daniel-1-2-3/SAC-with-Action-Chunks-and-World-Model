@@ -5,6 +5,9 @@
 
       python train_qc.py --general.run_name=NAME --seed=0 """
 
+import os
+os.environ.setdefault('MUJOCO_GL', 'egl')
+
 from arms.qc_arm import QCArm
 from sac_chunked.experiment import main
 
