@@ -396,10 +396,13 @@ class TDMPC2Model:
             'loss_reward': item(reward_loss),
             'loss_value': item(value_loss),
             'grad_norm': grad_norm.item(),
-            'diagnosis/td_target_mean': td_targets.mean().item(),
-            'diagnosis/td_target_std': td_targets.std().item(),
             'diagnosis/reward_batch_std': reward.std().item(),
         }
+        # Step mode only: chunk mode has no per-step TD targets (its target
+        # lives inside _chunk_value_loss; wm/loss_value tracks the fit).
+        if td_targets is not None:
+            metrics['diagnosis/td_target_mean'] = td_targets.mean().item()
+            metrics['diagnosis/td_target_std'] = td_targets.std().item()
         metrics.update(pi_metrics)
         return metrics
 
