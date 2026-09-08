@@ -115,6 +115,16 @@ defaults:
     # (TD-MPC2's own default is 3). Raise with rollout_chunks if imagining
     # deeper.
     horizon: 5
+    # Q ensemble mode:
+    #   step   the reference: Q(z, a_t) with the 1-step TD target (TD-MPC2)
+    #   chunk  Q(z, a_{t:t+chunk_len}) -- the QC critic's own action space --
+    #          trained on the SAME chunk transitions as the critic
+    #          (replay.sample_chunks), target = pooled_chunk_reward +
+    #          gamma^chunk_len * chunk_mask * min two random TARGET heads at
+    #          (z', prior chunk unrolled in latent space). The policy prior
+    #          trains against the chunk Q of its own unrolled chunk.
+    #          train_control_wm.py; see tdmpc/agent.py _chunk_value_loss.
+    q_mode: step
 
     # --- architecture, TD-MPC2 defaults for state observations
     latent_dim: 512
@@ -188,5 +198,19 @@ defaults:
   # Per-arm knobs. Each arm differs from its comparison partner ONLY in
   # its own block.
   # ---------------------------------------------------------------------
+
+  # train_control_wm.py: the control plus a TD-MPC2 latent model trained
+  # alongside it (the tdmpc block above; --tdmpc.q_mode=chunk for the
+  # chunk-level Q).
+  wm_control:
+    # Who scores -- and so picks -- the act-time candidates:
+    #   critic  the QC critic, the control's exact behaviour. A chunk-q
+    #           model's scores are computed anyway and logged against the
+    #           critic every decision (select/model_pick_agree,
+    #           model_rank_corr, model_pick_regret_q): shadow mode, zero
+    #           behavioural change.
+    #   model   the model's chunk Q executes the argmax (needs
+    #           tdmpc.q_mode=chunk); the critic becomes the shadow.
+    score_source: critic
 
 

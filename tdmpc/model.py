@@ -12,11 +12,16 @@
     bins, matching the Dreamer configuration this replaced, so the reward term
     and the value term of a chunk score stay in comparable units.
 
-    One addition over the reference, off by default:
+    Two additions over the reference, both off by default:
       num_dyn > 1   an ENSEMBLE of dynamics heads. The rollout uses their mean;
                     their spread is the disagreement bonus of the explore arm
                     (Pathak et al. 2019, "Self-Supervised Exploration via
-                    Disagreement"). """
+                    Disagreement").
+      q_mode 'chunk'  the Q ensemble reads a whole ACTION CHUNK
+                    (chunk_len * action_dim) instead of one action, so the
+                    model carries a latent twin of the QC chunk critic.
+                    'step' is the reference. The chunk training target lives
+                    in tdmpc/agent.py (_chunk_value_loss). """
 
 from copy import deepcopy
 
@@ -51,7 +56,7 @@ def two_hot(x, vmin, vmax, num_bins):
     bin_idx = bin_idx.long().unsqueeze(-1).clamp(0, num_bins - 1)
     soft = torch.zeros(*x.shape, num_bins, device=x.device, dtype=x.dtype)
     soft.scatter_(-1, bin_idx, 1 - bin_offset)
-    soft.scatter_(-1, (bin_idx + 1).clamp_max(num_bins - 1), bin_offset)
+    soft.scatter_(-1, (bin_idx + 1) % num_bins, bin_offset)
     return soft
 
 
@@ -224,7 +229,8 @@ class TDMPC2Nets(nn.Module):
 
     def __init__(self, obs_dim, action_dim, latent_dim=512, mlp_dim=512,
                  enc_dim=256, enc_layers=2, simnorm_dim=8, num_q=5,
-                 dropout=0.01, num_bins=101, vmin=-10.0, vmax=10.0, num_dyn=1):
+                 dropout=0.01, num_bins=101, vmin=-10.0, vmax=10.0, num_dyn=1,
+                 q_mode='step', chunk_len=1):
         super().__init__()
         self.obs_dim = obs_dim
         self.action_dim = action_dim
@@ -232,6 +238,12 @@ class TDMPC2Nets(nn.Module):
         self.simnorm_dim = simnorm_dim
         self.num_q = num_q
         self.num_dyn = max(1, int(num_dyn))
+        assert q_mode in ('step', 'chunk'), q_mode
+        self.q_mode = q_mode
+        self.chunk_len = max(1, int(chunk_len))
+        # Width of the Q heads' action input: one action ('step', the
+        # reference) or a flattened chunk ('chunk').
+        self.q_action_dim = action_dim * (self.chunk_len if q_mode == 'chunk' else 1)
         self.num_bins = num_bins
         self.vmin = vmin
         self.vmax = vmax
@@ -250,7 +262,7 @@ class TDMPC2Nets(nn.Module):
                                     out_act=SimNorm(simnorm_dim))
         self.reward = mlp(latent_dim + action_dim, mlp_dim, num_bins, 2)
         self.pi_net = mlp(latent_dim, mlp_dim, 2 * action_dim, 2)
-        self.Qs = EnsembleMLP(num_q, latent_dim + action_dim, mlp_dim,
+        self.Qs = EnsembleMLP(num_q, latent_dim + self.q_action_dim, mlp_dim,
                               num_bins, 2, dropout=dropout)
         self.register_buffer(
             'bins', torch.linspace(vmin, vmax, num_bins), persistent=False)
@@ -301,24 +313,33 @@ class TDMPC2Nets(nn.Module):
         return from_two_hot(self.reward_logits(z, action), self.bins)
 
     def pi(self, z):
-        """ Returns (mu, action, log_prob), all tanh-squashed to [-1, 1].
-            `mu` is the deterministic mean action.
+        """ Returns (mu, action, log_prob, scaled_entropy); the first three
+            are tanh-squashed to [-1, 1]. `mu` is the deterministic mean
+            action.
 
-            world_model.py additionally reports a "scaled entropy", which is
-            -log_prob multiplied by action_dim (its entropy_scale reduces to
-            exactly that outside the multitask path). pi_loss uses the scaled
-            one; it is recoverable here as -log_prob * action_dim. """
+            scaled_entropy follows world_model.py pi() exactly:
+            scaled_log_prob = log_prob * action_dim is taken BEFORE the tanh
+            correction, entropy_scale = scaled_log_prob / (log_prob + 1e-8)
+            AFTER it, and scaled_entropy = -log_prob * entropy_scale. The
+            post-squash log_probs cancel, so this equals action_dim times the
+            PRE-squash Gaussian log-density (up to the 1e-8), NOT
+            -log_prob * action_dim. pi_loss consumes it. """
         mu, log_std = self.pi_net(z).chunk(2, dim=-1)
         log_std = self.log_std_min + 0.5 * (self.log_std_max - self.log_std_min) * \
             (torch.tanh(log_std) + 1)
         eps = torch.randn_like(mu)
         log_prob = gaussian_logprob(eps, log_std)
+        scaled_log_prob = log_prob * self.action_dim
         mu, action, log_prob = squash(mu, mu + eps * log_std.exp(), log_prob)
-        return mu, action, log_prob
+        entropy_scale = scaled_log_prob / (log_prob + 1e-8)
+        return mu, action, log_prob, -log_prob * entropy_scale
 
     def q_logits(self, z, action, target=False, idx=None):
         """ (num_q, B, num_bins), or (len(idx), B, num_bins) for a subset of
-            heads -- the unselected heads are not computed. """
+            heads -- the unselected heads are not computed. `action` is one
+            action in 'step' mode, a flattened chunk in 'chunk' mode. """
+        assert action.shape[-1] == self.q_action_dim, \
+            (action.shape[-1], self.q_action_dim, self.q_mode)
         heads = self.Qs_target if target else self.Qs
         return heads(torch.cat([z, action], dim=-1), idx=idx)
 

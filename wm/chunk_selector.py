@@ -38,7 +38,8 @@ class ChunkSelector:
                  novelty='model', novelty_at='path', nu_cap=1.0,
                  bonus_scale='spread', progress_gate=True, progress_window=20,
                  progress_tau=0.2, use_rel_unc=True, controller='gate',
-                 bandit_window=20, bandit_c=1.0, candidate_source='actor'):
+                 bandit_window=20, bandit_c=1.0, candidate_source='actor',
+                 score_source='critic'):
         """ model: a TDMPC2Model (explore arm), or None (control).
             rollout_chunks (explore arm): imagine this many chunks ahead when
             measuring novelty. The first is the candidate; each further
@@ -80,6 +81,15 @@ class ChunkSelector:
         #                              (policy.compute_flow_actions on
         #                              policy.noise(n): Euler, flow_steps,
         #                              clipped). Scoring is unchanged.
+        #   score_source  'critic'  the QC critic's score executes (the
+        #                           control). With a chunk-q model attached,
+        #                           the model's scores are still computed and
+        #                           logged as a shadow every decision
+        #                           (select/model_pick_agree, model_rank_corr,
+        #                           model_pick_regret_q).
+        #                 'model'   the model's chunk Q executes the argmax
+        #                           (needs tdmpc.q_mode=chunk); the critic
+        #                           becomes the shadow.
         assert novelty in ('model', 'none'), novelty
         assert novelty_at in ('path', 'end'), novelty_at
         assert bonus_scale in ('unc', 'spread'), bonus_scale
@@ -98,6 +108,12 @@ class ChunkSelector:
         self._pulls = []            # (arm, return) of the last finished episodes
         assert candidate_source in ('actor', 'bc'), candidate_source
         self.candidate_source = candidate_source
+        assert score_source in ('critic', 'model'), score_source
+        if score_source == 'model':
+            assert model is not None and getattr(model, 'q_mode', 'step') == 'chunk', \
+                'score_source=model needs a model with tdmpc.q_mode=chunk'
+            assert bonus_beta == 0.0, 'model scoring and the novelty bonus are separate arms'
+        self.score_source = score_source
         self.bandit_arm = 1         # arm in force: 0 exploit (g=0), 1 explore (g=1)
         self._returns = []          # real ONLINE episode returns, in order
         self._g = 1.0               # gate value in use (EMA-smoothed)
@@ -233,17 +249,48 @@ class ChunkSelector:
 
         if self.bonus_beta > 0.0 and not eval_mode and self.model is not None:
             return self._select_uncertainty_scaled(feat_n, cands, qs, critic_score)
-        idx_t = torch.argmax(critic_score)
-        # One GPU->CPU transfer for everything this decision needs.
-        stats = torch.stack([
+
+        # Chunk-q model attached: score the SAME candidates with the model's
+        # chunk Q -- one batched forward, no rollout. Executes the pick when
+        # score_source=model; otherwise logged as a shadow against the
+        # critic's ordering.
+        model_score = None
+        if self.model is not None and getattr(self.model, 'q_mode', 'step') == 'chunk':
+            z = self.model.encode(feat_n[:1]).expand(self.n, -1)
+            model_score = self.model.chunk_q(z, cands).squeeze(-1)   # (n,)
+
+        score = critic_score if (self.score_source == 'critic' or model_score is None) \
+            else model_score
+        idx_t = torch.argmax(score)
+        crit_t = torch.argmax(critic_score)
+        stack = [
             idx_t.float(),
-            critic_score[idx_t] - critic_score.mean(),
+            crit_t.float(),
+            critic_score[crit_t] - critic_score.mean(),
             critic_score.std(),
-        ]).cpu().tolist()
+        ]
+        if model_score is not None:
+            model_t = torch.argmax(model_score)
+            # Spearman between the two orderings of this decision's candidates.
+            r_c = torch.argsort(torch.argsort(critic_score)).float()
+            r_m = torch.argsort(torch.argsort(model_score)).float()
+            rc, rm = r_c - r_c.mean(), r_m - r_m.mean()
+            stack += [
+                model_t.float(),
+                (rc * rm).mean() / (rc.std(correction=0) * rm.std(correction=0) + 1e-8),
+                # What the critic thinks the model's pick costs, in Q units.
+                critic_score[crit_t] - critic_score[model_t],
+            ]
+        # One GPU->CPU transfer for everything this decision needs.
+        stats = torch.stack(stack).cpu().tolist()
         idx = int(stats[0])
         if not eval_mode:
-            self._acc('score_gap', stats[1])
-            self._acc('score_std', stats[2])
+            self._acc('score_gap', stats[2])
+            self._acc('score_std', stats[3])
+            if model_score is not None:
+                self._acc('model_pick_agree', float(int(stats[4]) == int(stats[1])))
+                self._acc('model_rank_corr', stats[5])
+                self._acc('model_pick_regret_q', stats[6])
         return cands[idx].detach().cpu().numpy().reshape(
             self.chunk_len, self.action_dim)
 

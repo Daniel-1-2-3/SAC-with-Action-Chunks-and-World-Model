@@ -80,6 +80,13 @@ class TDMPC2Model:
         self.novelty_at = novelty_at
         self.rollout_chunks = max(1, int(rollout_chunks))
         self.chunk_len = int(chunk_len) if chunk_len is not None else self.horizon
+        # Q ensemble mode (see model.py): 'step' = the reference's per-step
+        # Q with the 1-step TD target; 'chunk' = Q over whole action chunks,
+        # trained on the QC critic's own chunk transitions
+        # (_chunk_value_loss). Everything else is identical in both modes.
+        self.q_mode = str(getattr(cfg, 'q_mode', 'step'))
+        assert self.q_mode in ('step', 'chunk'), self.q_mode
+        self.gamma_h = float(gamma) ** self.chunk_len
         self.ref_mode = str(getattr(cfg, 'ref_mode', 'step'))
         assert self.ref_mode in ('step', 'rollout'), self.ref_mode
         self.reward_weight_shrink = float(getattr(cfg, 'reward_weight_shrink', 0.0))
@@ -90,7 +97,8 @@ class TDMPC2Model:
             enc_dim=cfg.enc_dim, enc_layers=cfg.enc_layers,
             simnorm_dim=cfg.simnorm_dim, num_q=cfg.num_q, dropout=cfg.dropout,
             num_bins=cfg.num_bins, vmin=cfg.vmin, vmax=cfg.vmax,
-            num_dyn=(cfg.num_dyn if num_dyn is None else num_dyn)).to(device)
+            num_dyn=(cfg.num_dyn if num_dyn is None else num_dyn),
+            q_mode=self.q_mode, chunk_len=self.chunk_len).to(device)
         # Running mean of ensemble disagreement on REAL transitions, updated
         # every update(). The explore arm's bonus is measured against this,
         # so "novel" means "more uncertain than the data", and the bonus
@@ -126,8 +134,12 @@ class TDMPC2Model:
             try:
                 opts = dict(mode='default', fullgraph=False)
                 self._losses = torch.compile(self._losses, **opts)
-                self._td_target = torch.compile(self._td_target, **opts)
-                self._pi_loss = torch.compile(self._pi_loss, **opts)
+                if self.q_mode == 'chunk':
+                    self._pi_loss_chunk = torch.compile(self._pi_loss_chunk, **opts)
+                    self._chunk_value_loss = torch.compile(self._chunk_value_loss, **opts)
+                else:
+                    self._td_target = torch.compile(self._td_target, **opts)
+                    self._pi_loss = torch.compile(self._pi_loss, **opts)
                 self.encode = torch.compile(self.encode, **opts)
                 self.rollout_chunk = torch.compile(self.rollout_chunk, **opts)
                 self.rollout_pi_chunk = torch.compile(self.rollout_pi_chunk, **opts)
@@ -268,15 +280,44 @@ class TDMPC2Model:
 
     @torch.no_grad()
     def terminal_value(self, z):
-        """ Q(z, pi(z)) at the end of the imagined horizon, (B, 1).
+        """ Q(z, pi(z)) at the end of the imagined horizon, (B, 1). In chunk
+            q_mode the action is the prior's unrolled chunk (prior_chunk).
 
             DEVIATION from _estimate_value, which uses a sampled prior action
             and the average of two random Q heads: both are fresh noise per
             call, and every candidate in one decision must be scored by the
             same function. So: the prior's mean action, mean over the whole
             ensemble. """
+        if self.q_mode == 'chunk':
+            return self.net.q_values(z, self.prior_chunk(z, sample=False)).mean(0)
         a = self.net.pi(z)[0]
         return self.net.q_values(z, a).mean(0)
+
+    @torch.no_grad()
+    def prior_chunk(self, z, sample=True):
+        """ Unroll the policy prior chunk_len steps through the dynamics
+            (ensemble mean) and return the flattened action chunk
+            (B, chunk_len * action_dim). sample=True draws each step's
+            action, as the reference samples its bootstrap action (TD
+            targets); False uses the prior's mean at every step (scoring --
+            the same determinism DEVIATION as terminal_value). """
+        acts = []
+        for _ in range(self.chunk_len):
+            out = self.net.pi(z)
+            a = out[1] if sample else out[0]
+            acts.append(a)
+            z, _ = self._step(z, a)
+        return torch.cat(acts, dim=-1)
+
+    @torch.no_grad()
+    def chunk_q(self, z, chunks):
+        """ Chunk-mode Q(z, chunk), mean over the WHOLE ensemble, (B, 1) --
+            the model-side twin of the QC critic's score for the same
+            (state, chunk). One batched forward, no rollout, no decode.
+            Same scoring convention as terminal_value: every candidate
+            through the same deterministic function. """
+        assert self.q_mode == 'chunk', 'chunk_q needs tdmpc.q_mode=chunk'
+        return self.net.q_values(z, chunks).mean(0)
 
     # --------------------------------------------------------------- training
 
@@ -294,7 +335,8 @@ class TDMPC2Model:
         q = self.net.q_subset(flat_z, a, reduce='min', target=True)
         return reward + self.gamma * mask * q.reshape(B, H, 1), next_z
 
-    def update(self, obs, next_obs, action, reward, mask, valid, metrics_on=True):
+    def update(self, obs, next_obs, action, reward, mask, valid, chunk_batch=None,
+               metrics_on=True):
         """ One TD-MPC2 joint update on a batch of consecutive real
             transitions (see ChunkTransitionReplay.sample_model_windows).
 
@@ -309,12 +351,26 @@ class TDMPC2Model:
               value        two-hot CE against the TD target
             then the policy prior on the detached rollout latents, then the
             target-Q soft update. With a dynamics ensemble, every head gets
-            the consistency loss and the rollout continues through the mean. """
+            the consistency loss and the rollout continues through the mean.
+
+            chunk q_mode: the value loss moves off the windows onto
+            chunk_batch (replay.sample_chunks output -- the SAME chunk
+            transitions the QC critic trains on); consistency, reward and
+            the prior update are unchanged. See _chunk_value_loss. """
         cfg = self.cfg
+        if self.q_mode == 'chunk':
+            assert chunk_batch is not None, 'q_mode=chunk needs a chunk batch'
+            with torch.no_grad():
+                next_z_real = self.net.encode(next_obs)
+            td_targets = None
+        else:
+            td_targets, next_z_real = self._td_target(next_obs, reward, mask)
         self.net.train()
-        td_targets, next_z_real = self._td_target(next_obs, reward, mask)
         total, consistency_loss, reward_loss, value_loss, zs, var0 = self._losses(
             obs[:, 0], next_z_real, action, reward, valid, td_targets)
+        if self.q_mode == 'chunk':
+            value_loss = self._chunk_value_loss(chunk_batch)
+            total = total + cfg.value_coef * value_loss
         if var0 is not None:
             self.update_novelty_reference(zs, action, valid, var0=var0)
 
@@ -379,9 +435,10 @@ class TDMPC2Model:
         """ The three TD-MPC2 losses on one latent rollout (see update()).
             Every Q head and every dynamics head is evaluated in one batched
             call per step; the per-head means are identical to the old
-            per-head loops. Returns the total, the three terms, the rollout
-            latents (B, H+1, latent) and the step-0 per-dim dynamics
-            disagreement (B, latent) (None with one head). """
+            per-head loops. td_targets None skips the per-step value term
+            (chunk q_mode trains value elsewhere). Returns the total, the
+            three terms, the rollout latents (B, H+1, latent) and the step-0
+            per-dim dynamics disagreement (B, latent) (None with one head). """
         cfg = self.cfg
         horizon = action.shape[1]
         z = self.net.encode(obs0)
@@ -396,10 +453,11 @@ class TDMPC2Model:
             reward_loss = reward_loss + rho * (w * soft_ce(
                 self.net.reward_logits(z, action[:, t]), reward[:, t],
                 cfg.vmin, cfg.vmax, cfg.num_bins)).mean()
-            q_logits = self.net.q_logits(z, action[:, t])          # (num_q, B, bins)
-            # sum_i mean_b(w * ce_i) / num_q == mean over (i, b) of w * ce
-            value_loss = value_loss + rho * (w * soft_ce(
-                q_logits, td_targets[:, t], cfg.vmin, cfg.vmax, cfg.num_bins)).mean()
+            if td_targets is not None:
+                q_logits = self.net.q_logits(z, action[:, t])      # (num_q, B, bins)
+                # sum_i mean_b(w * ce_i) / num_q == mean over (i, b) of w * ce
+                value_loss = value_loss + rho * (w * soft_ce(
+                    q_logits, td_targets[:, t], cfg.vmin, cfg.vmax, cfg.num_bins)).mean()
             preds = self.net.next_all(z, action[:, t])             # (num_dyn, B, latent)
             if preds.shape[0] > 1 and t == 0:
                 dis0 = preds.detach().var(0, unbiased=False)         # (B, latent)
@@ -419,13 +477,66 @@ class TDMPC2Model:
                  + cfg.value_coef * value_loss)
         return total, consistency_loss, reward_loss, value_loss, torch.stack(zs, dim=1), dis0
 
+    def _chunk_value_loss(self, chunk_batch):
+        """ Chunk-mode value loss, on the SAME chunk transitions the QC
+            critic trains on (replay.sample_chunks: obs, flattened chunk,
+            pooled discounted chunk reward, chunk bootstrap mask, chunk
+            validity, step validity, next obs at s_{t+h}).
+
+            Two-hot CE of Q(z, chunk) against
+
+                pooled_chunk_reward + gamma^chunk_len * chunk_mask * boot
+
+            where boot is the min over two random TARGET heads at
+            (z', prior_chunk(z', sample=True)) -- the reference's own TD
+            conventions (sampled bootstrap action, min of two random target
+            heads), with the "action" widened to the prior's unrolled chunk.
+            Weighted by the chunk validity; the mean folds the /num_q. """
+        cfg = self.cfg
+        c_obs, c_chunk, c_rew, c_mask, c_valid = chunk_batch[:5]
+        c_next = chunk_batch[6]
+        with torch.no_grad():
+            z_next = self.net.encode(c_next)
+            boot = self.net.q_subset(z_next, self.prior_chunk(z_next, sample=True),
+                                     reduce='min', target=True)
+            v_target = c_rew + self.gamma_h * c_mask * boot
+        z = self.net.encode(c_obs)
+        return (c_valid * soft_ce(self.net.q_logits(z, c_chunk), v_target,
+                                  cfg.vmin, cfg.vmax, cfg.num_bins)).mean()
+
     def _pi_loss(self, zs):
-        """ Network half of _update_pi (prior action, log-prob, average of
-            two random Q heads), separated so it can be compiled. """
-        _, action, log_prob = self.net.pi(zs)
+        """ Network half of _update_pi (prior action, log-prob, scaled
+            entropy, average of two random Q heads), separated so it can be
+            compiled. """
+        _, action, log_prob, scaled_entropy = self.net.pi(zs)
         flat = lambda x: x.reshape(-1, x.shape[-1])
         q = self.net.q_subset(flat(zs), flat(action), reduce='avg')
-        return q.reshape(*zs.shape[:-1], 1), log_prob
+        return q.reshape(*zs.shape[:-1], 1), log_prob, scaled_entropy
+
+    def _pi_loss_chunk(self, zs):
+        """ Chunk-mode half of _update_pi: from every (detached) rollout
+            latent, unroll the prior chunk_len steps -- each imagined latent
+            severed by no_grad, dynamics through the ensemble mean -- and
+            score the resulting chunk with the chunk Q (average of two
+            random heads; the caller freezes the Q parameters). Gradient
+            reaches the prior only through the Q's action inputs -- the
+            reference's DDPG-style route, widened from one action to a
+            chunk. scaled_entropy is the mean of the per-step scaled
+            entropies, keeping entropy_coef's meaning. """
+        flat = lambda x: x.reshape(-1, x.shape[-1])
+        z0 = flat(zs)
+        z = z0
+        acts, ents = [], []
+        for _ in range(self.chunk_len):
+            _, a, _, se = self.net.pi(z)
+            acts.append(a)
+            ents.append(se)
+            with torch.no_grad():
+                z = self.net.next(z, a)
+        q = self.net.q_subset(z0, torch.cat(acts, dim=-1), reduce='avg')
+        scaled_entropy = torch.stack(ents, 0).mean(0)
+        return (q.reshape(*zs.shape[:-1], 1),
+                scaled_entropy.reshape(*zs.shape[:-1], 1))
 
     def _update_pi(self, zs, valid, metrics_on=True):
         """ tdmpc2.py update_pi: maximum-entropy policy prior on detached
@@ -438,19 +549,24 @@ class TDMPC2Model:
 
             Q is the average of two random heads with its PARAMETERS
             detached (the reference's _detach_Qs): gradient reaches the prior
-            through the action input only. scaled_entropy is -log_prob times
-            action_dim. Only Q is divided by the running scale. """
+            through the action input only. scaled_entropy comes from pi(),
+            computed by the reference's entropy_scale formula (action_dim
+            times the pre-squash Gaussian log-density -- see model.pi). Only
+            Q is divided by the running scale. """
         cfg = self.cfg
         for p in self._online_q_params:
             p.requires_grad_(False)
         try:
-            q, log_prob = self._pi_loss(zs)
+            if self.q_mode == 'chunk':
+                q, scaled_entropy = self._pi_loss_chunk(zs)
+                log_prob = None
+            else:
+                q, log_prob, scaled_entropy = self._pi_loss(zs)
         finally:
             for p in self._online_q_params:
                 p.requires_grad_(True)
         self.scale.update(q[:, 0])
         q = q / self.scale()
-        scaled_entropy = -log_prob * self.action_dim
         rho = torch.tensor(
             [self.rho ** t for t in range(zs.shape[1])],
             device=zs.device, dtype=zs.dtype)
@@ -465,10 +581,14 @@ class TDMPC2Model:
 
         if not metrics_on:
             return {}
+        # Chunk path has no single log_prob; scaled_entropy / action_dim is
+        # the matching per-step entropy readout (see model.pi).
+        ent = ((-log_prob).mean() if log_prob is not None
+               else (scaled_entropy / self.action_dim).mean())
         return {
             'loss_pi': pi_loss.item(),
             'diagnosis/pi_grad_norm': pi_grad.item(),
-            'diagnosis/pi_entropy': (-log_prob).mean().item(),
+            'diagnosis/pi_entropy': ent.item(),
             'diagnosis/pi_q_scaled': q.mean().item(),
             'diagnosis/q_scale': float(self.scale()),
         }
