@@ -51,7 +51,7 @@ class TDMPC2Model:
 
     def __init__(self, obs_dim, action_dim, device, cfg, gamma,
                  num_dyn=None, novelty='mean', novelty_at='path',
-                 rollout_chunks=1, chunk_len=None):
+                 rollout_chunks=1, chunk_len=None, q_mode=None):
         """ num_dyn: dynamics heads; overrides cfg.num_dyn (explore arm).
             novelty: how ensemble disagreement over the latent dims is
             reduced to one number, for BOTH the data reference and the
@@ -84,7 +84,8 @@ class TDMPC2Model:
         # Q with the 1-step TD target; 'chunk' = Q over whole action chunks,
         # trained on the QC critic's own chunk transitions
         # (_chunk_value_loss). Everything else is identical in both modes.
-        self.q_mode = str(getattr(cfg, 'q_mode', 'step'))
+        self.q_mode = str(getattr(cfg, 'q_mode', 'step') if q_mode is None
+                          else q_mode)
         assert self.q_mode in ('step', 'chunk'), self.q_mode
         self.gamma_h = float(gamma) ** self.chunk_len
         self.ref_mode = str(getattr(cfg, 'ref_mode', 'step'))
@@ -310,14 +311,15 @@ class TDMPC2Model:
         return torch.cat(acts, dim=-1)
 
     @torch.no_grad()
-    def chunk_q(self, z, chunks):
+    def chunk_q(self, z, chunks, target=False):
         """ Chunk-mode Q(z, chunk), mean over the WHOLE ensemble, (B, 1) --
             the model-side twin of the QC critic's score for the same
             (state, chunk). One batched forward, no rollout, no decode.
+            target=True reads the target heads, for use inside a TD target.
             Same scoring convention as terminal_value: every candidate
             through the same deterministic function. """
         assert self.q_mode == 'chunk', 'chunk_q needs tdmpc.q_mode=chunk'
-        return self.net.q_values(z, chunks).mean(0)
+        return self.net.q_values(z, chunks, target=target).mean(0)
 
     # --------------------------------------------------------------- training
 
@@ -336,7 +338,7 @@ class TDMPC2Model:
         return reward + self.gamma * mask * q.reshape(B, H, 1), next_z
 
     def update(self, obs, next_obs, action, reward, mask, valid, chunk_batch=None,
-               metrics_on=True):
+               next_chunk=None, metrics_on=True):
         """ One TD-MPC2 joint update on a batch of consecutive real
             transitions (see ChunkTransitionReplay.sample_model_windows).
 
@@ -369,7 +371,7 @@ class TDMPC2Model:
         total, consistency_loss, reward_loss, value_loss, zs, var0 = self._losses(
             obs[:, 0], next_z_real, action, reward, valid, td_targets)
         if self.q_mode == 'chunk':
-            value_loss = self._chunk_value_loss(chunk_batch)
+            value_loss = self._chunk_value_loss(chunk_batch, next_chunk)
             total = total + cfg.value_coef * value_loss
         if var0 is not None:
             self.update_novelty_reference(zs, action, valid, var0=var0)
@@ -480,7 +482,7 @@ class TDMPC2Model:
                  + cfg.value_coef * value_loss)
         return total, consistency_loss, reward_loss, value_loss, torch.stack(zs, dim=1), dis0
 
-    def _chunk_value_loss(self, chunk_batch):
+    def _chunk_value_loss(self, chunk_batch, next_chunk=None):
         """ Chunk-mode value loss, on the SAME chunk transitions the QC
             critic trains on (replay.sample_chunks: obs, flattened chunk,
             pooled discounted chunk reward, chunk bootstrap mask, chunk
@@ -490,18 +492,25 @@ class TDMPC2Model:
 
                 pooled_chunk_reward + gamma^chunk_len * chunk_mask * boot
 
-            where boot is the min over two random TARGET heads at
-            (z', prior_chunk(z', sample=True)) -- the reference's own TD
-            conventions (sampled bootstrap action, min of two random target
-            heads), with the "action" widened to the prior's unrolled chunk.
-            Weighted by the chunk validity; the mean folds the /num_q. """
+            where boot is the min over two random TARGET heads at (z',
+            next_chunk).
+
+            next_chunk is the ACTOR's chunk at s' (tdmpc.chunk_bootstrap
+            'actor', the default): the same bootstrap policy the QC critic
+            uses, BC-anchored to the buffer. Passing None falls back to the
+            policy prior's unrolled chunk ('prior', TD-MPC2's own
+            convention) -- which on offline data drifts off-distribution,
+            since nothing executes it and nothing constrains it to the
+            data. Weighted by the chunk validity; the mean folds the
+            /num_q. """
         cfg = self.cfg
         c_obs, c_chunk, c_rew, c_mask, c_valid = chunk_batch[:5]
         c_next = chunk_batch[6]
         with torch.no_grad():
             z_next = self.net.encode(c_next)
-            boot = self.net.q_subset(z_next, self.prior_chunk(z_next, sample=True),
-                                     reduce='min', target=True)
+            boot_chunk = (self.prior_chunk(z_next, sample=True)
+                          if next_chunk is None else next_chunk)
+            boot = self.net.q_subset(z_next, boot_chunk, reduce='min', target=True)
             v_target = c_rew + self.gamma_h * c_mask * boot
         z = self.net.encode(c_obs)
         return (c_valid * soft_ce(self.net.q_logits(z, c_chunk), v_target,

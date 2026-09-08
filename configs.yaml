@@ -123,7 +123,8 @@ defaults:
     #          gamma^chunk_len * chunk_mask * min two random TARGET heads at
     #          (z', prior chunk unrolled in latent space). The policy prior
     #          trains against the chunk Q of its own unrolled chunk.
-    #          train_control_wm.py; see tdmpc/agent.py _chunk_value_loss.
+    #          arms/mve.py forces this on; see tdmpc/agent.py
+    #          _chunk_value_loss.
     q_mode: step
 
     # --- architecture, TD-MPC2 defaults for state observations
@@ -188,6 +189,13 @@ defaults:
     # measure consumes.
     diag_windows: 256
     diag_depth: 1
+    # Reward above which a diagnostic window counts as "something happened".
+    # -1.0 (the buffer's success threshold) admits only fully-solved steps,
+    # of which cube-triple play has ~2 in 3M, so the hit batch comes back
+    # empty and the hit-gap metrics never log. -3.0 admits any step where a
+    # cube was placed (~8% of steps), which is the contrast these metrics
+    # are for.
+    diag_hit_thresh: -3.0
 
     # torch.compile on the latent model's update and rollout paths -- the
     # same launch-bound situation as chunk.compile_nets, ~12k tiny kernels
@@ -199,18 +207,22 @@ defaults:
   # its own block.
   # ---------------------------------------------------------------------
 
-  # train_control_wm.py: the control plus a TD-MPC2 latent model trained
-  # alongside it (the tdmpc block above; --tdmpc.q_mode=chunk for the
-  # chunk-level Q).
-  wm_control:
-    # Who scores -- and so picks -- the act-time candidates:
-    #   critic  the QC critic, the control's exact behaviour. A chunk-q
-    #           model's scores are computed anyway and logged against the
-    #           critic every decision (select/model_pick_agree,
-    #           model_rank_corr, model_pick_regret_q): shadow mode, zero
-    #           behavioural change.
-    #   model   the model's chunk Q executes the argmax (needs
-    #           tdmpc.q_mode=chunk); the critic becomes the shadow.
-    score_source: critic
+  # train_mve.py: the control, with the critic's TD target bootstrapping on
+  # the world model's chunk value. Selection is the control's throughout.
+  mve:
+    # Where the CRITIC's TD target gets its continuation value:
+    #   wm      Q_wm_target(z', actor chunk at s') -- the arm's method
+    #   critic  QC eq. 15 unchanged, making this arm the control exactly
+    #           (same script, same rng consumption, model still training):
+    #           the matched partner for an attribution pair.
+    critic_target_source: wm
+    # Whose chunk the model's OWN chunk-Q bootstraps from at s':
+    #   actor  the QC actor's chunk -- the policy that acts, BC-anchored to
+    #          the buffer, and the same bootstrap the critic uses
+    #   prior  TD-MPC2's convention, the model's own policy prior unrolled
+    #          in latent space. Online that prior IS the behaviour policy;
+    #          on a large offline buffer nothing executes or constrains it,
+    #          so it drifts off-distribution.
+    chunk_bootstrap: actor
 
 

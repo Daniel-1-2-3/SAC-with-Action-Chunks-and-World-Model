@@ -120,40 +120,33 @@ def print_wm_report(m, depth):
 
 @torch.no_grad()
 def chunk_q_report(model, policy, replay, chunk_len, device, rng,
-                   num_windows=256, select_n=16):
-    """ Chunk-mode Q accuracy checks, measured against the QC critic on real
-        replay data. ZERO env steps; empty dict unless tdmpc.q_mode=chunk.
+                   num_windows=256, hit_thresh=-3.0):
+    """ Accuracy of the chunk Q the MVE arm feeds into the critic's TD
+        target. ZERO env steps; empty dict unless tdmpc.q_mode=chunk.
 
-    The chunk Q's job is to reproduce the critic's chunk ordering from the
-    latent, so every number here is a head-to-head on identical inputs:
+    The arm only ever asks the model one question -- how good is this REAL
+    state with this chunk -- so every number here is that question, asked on
+    real replayed chunks and answered by both value functions:
 
-      diagnosis/chunkq_critic_corr   correlation of the two values on REAL
-                                     replayed chunks (mixed reward-hit +
-                                     uniform windows, as model_report mixes)
-      diagnosis/chunkq_hit_gap       mean chunk-Q on reward-containing
-      diagnosis/criticq_hit_gap      windows minus on uniform windows, per
-                                     scorer. Both should be positive once
-                                     the value separates success states;
-                                     the model matching the critic's gap is
-                                     the pre-check that its value carries
-                                     the same signal.
-      diagnosis/cand_pick_agree      fresh actor candidates (select_n per
-      diagnosis/cand_rank_corr       state, the act-time distribution): how
-      diagnosis/cand_regret_q        often both scorers pick the same chunk,
-                                     their mean per-state Spearman, and what
-                                     the critic thinks the model's pick
-                                     costs (Q units). The eval-time twin of
-                                     the select/ shadow stats -- same
-                                     protocol at every eval, in BOTH runs of
-                                     a pair.
-      diagnosis/prior_minus_actor_q  the critic's value of the model prior's
-                                     unrolled chunk minus of the actor's
-                                     chunk, same states. Strongly negative =
-                                     lazy prior = pessimistic bootstrap in
-                                     the chunk TD target (the known weak
-                                     link).
-      diagnosis/chunkq_mean/_std,    scale and spread of each scorer, for
-      diagnosis/criticq_mean/_std    calibration drift. """
+      diagnosis/chunkq_critic_corr  correlation of the two values on the
+                                    same (state, chunk) pairs. The readiness
+                                    gauge: the target is only as good as
+                                    the model's agreement with a value
+                                    function that works.
+      diagnosis/chunkq_hit_gap      mean Q on chunks containing a step above
+      diagnosis/criticq_hit_gap     hit_thresh, minus mean Q on uniform
+                                    chunks, per value function. Does each
+                                    one separate progress from nothing, and
+                                    by a similar margin? A model Q flat here
+                                    while the critic's gap opens cannot
+                                    carry the target.
+      diagnosis/chunkq_mean/_std,   scale and spread of each. A collapsing
+      diagnosis/criticq_mean/_std   chunkq_std is the model Q going
+                                    constant.
+
+    Half the windows are drawn to contain an above-hit_thresh step and half
+    uniformly: uniform alone makes every ground-truth reward identical on a
+    sparse task, so the contrast vanishes. """
     if getattr(model, 'q_mode', 'step') != 'chunk':
         return {}
     half = max(num_windows // 2, 3)
@@ -167,7 +160,8 @@ def chunk_q_report(model, policy, replay, chunk_len, device, rng,
         obs0 = w['obs'][keep][:, 0]
         return obs0, w['action'][keep].reshape(len(keep), -1)
 
-    hit = grab(replay.sample_reward_windows(half, chunk_len, device, rng))
+    hit = grab(replay.sample_reward_windows(half, chunk_len, device, rng,
+                                            thresh=hit_thresh))
     uni = grab(replay.sample_model_windows(half, chunk_len, device, rng,
                                            online_frac=0.0))
     if uni is None:
@@ -195,33 +189,8 @@ def chunk_q_report(model, policy, replay, chunk_len, device, rng,
         mq, cq = mq_u, cq_u
     out['diagnosis/chunkq_critic_corr'] = _corr(mq.cpu().numpy(), cq.cpu().numpy())
 
-    obs_c = uni[0][:min(64, uni[0].shape[0])]
-    M, n = obs_c.shape[0], int(select_n)
-    if n >= 2 and M >= 3:
-        feat = obs_c.repeat_interleave(n, dim=0)
-        cands = policy.sample_chunk(feat)
-        mq_c = model.chunk_q(model.encode(feat), cands).squeeze(-1).reshape(M, n)
-        cq_c = policy._agg(policy.critic(feat, cands)).squeeze(-1).reshape(M, n)
-        m_pick, c_pick = mq_c.argmax(-1), cq_c.argmax(-1)
-        r_m = torch.argsort(torch.argsort(mq_c, dim=-1), dim=-1).float()
-        r_c = torch.argsort(torch.argsort(cq_c, dim=-1), dim=-1).float()
-        rm = r_m - r_m.mean(-1, keepdim=True)
-        rc = r_c - r_c.mean(-1, keepdim=True)
-        spear = ((rm * rc).mean(-1)
-                 / (rm.std(-1, correction=0) * rc.std(-1, correction=0) + 1e-8))
-        regret = cq_c.max(-1).values - cq_c.gather(-1, m_pick[:, None]).squeeze(-1)
-        out['diagnosis/cand_pick_agree'] = float((m_pick == c_pick).float().mean())
-        out['diagnosis/cand_rank_corr'] = float(spear.mean())
-        out['diagnosis/cand_regret_q'] = float(regret.mean())
-
-        prior = model.prior_chunk(model.encode(obs_c), sample=False)
-        pq = policy._agg(policy.critic(obs_c, prior)).squeeze(-1)
-        aq = policy._agg(policy.critic(obs_c, policy.sample_chunk(obs_c))).squeeze(-1)
-        out['diagnosis/prior_minus_actor_q'] = float((pq - aq).mean())
-
-    keys = ('cand_pick_agree', 'cand_rank_corr', 'chunkq_critic_corr',
-            'chunkq_hit_gap', 'criticq_hit_gap', 'prior_minus_actor_q')
-    line = '  '.join(f'{k} {out["diagnosis/" + k]:.3f}'
-                     for k in keys if 'diagnosis/' + k in out)
-    print(f'  chunk-q: {line}')
+    keys = ('chunkq_critic_corr', 'chunkq_hit_gap', 'criticq_hit_gap',
+            'chunkq_std', 'criticq_std')
+    print('  chunk-q: ' + '  '.join(f'{k} {out["diagnosis/" + k]:.3f}'
+                                    for k in keys if 'diagnosis/' + k in out))
     return out

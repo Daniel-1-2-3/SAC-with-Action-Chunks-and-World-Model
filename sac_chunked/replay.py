@@ -194,17 +194,24 @@ class ChunkTransitionReplay:
         starts = self._starts(batch_size, horizon, rng, online_frac)
         return self._windows(starts, horizon, device)
 
-    def sample_reward_windows(self, batch_size, horizon, device, rng):
+    def sample_reward_windows(self, batch_size, horizon, device, rng,
+                              thresh=None):
         """ DIAGNOSTICS ONLY. Windows guaranteed to contain an above-baseline
             reward step, so the ground truth has variance and correlations
             are defined. Training must never use this -- it changes the data
             distribution the model and critic are fit on.
 
-            Returns None when the buffer holds no above-baseline reward yet. """
+            thresh overrides success_reward_thresh for the hit test. The
+            buffer's own threshold means FULLY SOLVED (reward 0), which
+            cube-triple play contains ~2 of in 3M steps; a caller wanting
+            "any progress" passes -3.0. None keeps the buffer's value.
+
+            Returns None when the buffer holds no above-threshold reward. """
         size = len(self)
         if size < horizon:
             return None
-        hits = np.flatnonzero(self.reward[:size, 0] > self.success_reward_thresh)
+        thr = self.success_reward_thresh if thresh is None else float(thresh)
+        hits = np.flatnonzero(self.reward[:size, 0] > thr)
         if len(hits) == 0:
             return None
         r = hits[rng.integers(0, len(hits), size=batch_size)]
