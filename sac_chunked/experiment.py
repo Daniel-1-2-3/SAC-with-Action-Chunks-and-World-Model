@@ -123,6 +123,13 @@ class Arm:
         with torch.no_grad():
             return reward + self.gamma_h * mask * self.policy.chunk_target_values(next_obs)
 
+    def shape_reward(self, obs, next_obs, reward, mask, metrics_on=False):
+        """ Hook: the reward term the critic target should use for this
+            batch. Identity in every base arm; a shaping arm returns
+            reward + bonus. Only the critic target sees the result -- the
+            buffer, the actor losses and every reward metric stay raw. """
+        return reward
+
     def model_update(self, replay, metrics_on):
         return {}
 
@@ -152,7 +159,9 @@ def agent_update(arm, replay, metrics_on=True):
         return None
     b_obs, b_chunk, b_rew, b_mask, b_valid, b_step_valid, b_next = batch
 
-    targets = arm.critic_target(b_next, b_rew, b_mask, metrics_on=metrics_on)
+    shaped_rew = arm.shape_reward(b_obs, b_next, b_rew, b_mask,
+                                  metrics_on=metrics_on)
+    targets = arm.critic_target(b_next, shaped_rew, b_mask, metrics_on=metrics_on)
 
     metrics = {}
     metrics.update(prefixed(arm.policy.update_critic(
