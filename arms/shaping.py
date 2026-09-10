@@ -9,7 +9,10 @@
 
     Every critic update, the reward term of the target gains
 
-        bonus = coef * (gamma^h * mask * phi(s') - phi(s))
+        bonus = coef * (gamma^h * mask * (phi(s') - c) - (phi(s) - c))
+
+    where c is a slow running mean of phi (shaping.center) -- see
+    shape_reward for why the centering is load-bearing.
 
     via Arm.shape_reward (sac_chunked/experiment.py). Nothing else sees the
     bonus: the replay buffer stores raw rewards, the actor losses and every
@@ -48,6 +51,10 @@ class WMShapingMixin:
         assert s.potential in ('wm', 'none'), s.potential
         assert s.chunk_bootstrap in ('actor', 'prior'), s.chunk_bootstrap
         self._shape_stats = {}
+        # Slow running mean of phi, for centering. None until the first
+        # batch, which initializes it directly (no warmup from 0 -- that
+        # would replay a shrinking copy of the constant this removes).
+        self._phi_center = None
 
     def build_model(self):
         self.model = TDMPC2Model(self.obs_dim, self.action_dim, self.device,
@@ -69,18 +76,46 @@ class WMShapingMixin:
                                   self.policy.sample_chunk(obs), target=True)
 
     def shape_reward(self, obs, next_obs, reward, mask, metrics_on=False):
+        """ bonus = coef * (discount^h * mask * centered phi(next state)
+                           - centered phi(start state))
+
+            Centering (shaping.center) subtracts a slow running mean of phi
+            from both terms. Without it, phi's LEVEL (~-290 on this task)
+            leaks through the discount as a constant
+
+                coef * (discount^h - 1) * level  ~  +14 per chunk
+
+            which compounds through the critic's bootstrap by
+            1 / (1 - discount^h) ~ 20.5x into a ~+290 relocation of every
+            critic value, chasing phi's drifting level all run -- the
+            t4_shaped_s2 failure. Subtracting a constant from a potential is
+            still a potential, so policy invariance is untouched; centered,
+            a typical state reads ~0 and the bonus carries only the climb. """
         s = self.config.shaping
         if s.potential != 'wm':
             return reward
         with torch.no_grad():
-            bonus = s.coef * (self.gamma_h * mask * self.phi(next_obs)
-                              - self.phi(obs))
+            phi_obs = self.phi(obs)
+            phi_next = self.phi(next_obs)
+            if s.center:
+                m = 0.5 * (phi_obs.mean() + phi_next.mean())
+                if self._phi_center is None:
+                    self._phi_center = m
+                else:
+                    self._phi_center = ((1.0 - s.center_tau) * self._phi_center
+                                        + s.center_tau * m)
+                phi_obs = phi_obs - self._phi_center
+                phi_next = phi_next - self._phi_center
+            bonus = s.coef * (self.gamma_h * mask * phi_next - phi_obs)
             if metrics_on:
                 self._shape_stats = {
                     'diagnosis/shaping_bonus_mean': float(bonus.mean()),
                     'diagnosis/shaping_bonus_abs': float(bonus.abs().mean()),
                     'diagnosis/shaping_bonus_std': float(bonus.std()),
                 }
+                if self._phi_center is not None:
+                    self._shape_stats['diagnosis/shaping_phi_center'] = \
+                        float(self._phi_center)
             return reward + bonus
 
     def log_extra(self):

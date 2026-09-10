@@ -223,6 +223,12 @@ defaults:
     #       (identical rng consumption: the matched control of a pair)
     potential: wm
     coef: 1.0
+    # Center phi with a slow running mean before the difference. OFF
+    # reproduces t4_shaped_s2's failure: phi's level (~-290) leaks through
+    # the discount as a constant +14 per chunk, relocating the critic by
+    # ~20.5x that. Keep on.
+    center: True
+    center_tau: 0.01
     # Whose chunk the model's OWN chunk-Q bootstraps from at s':
     #   actor  the policy's chunk -- BC-anchored to the buffer
     #   prior  TD-MPC2's own convention (its policy prior, unrolled in
