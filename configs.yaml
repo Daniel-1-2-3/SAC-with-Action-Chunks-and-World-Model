@@ -126,6 +126,14 @@ defaults:
     #          arms/mve.py forces this on; see tdmpc/agent.py
     #          _chunk_value_loss.
     q_mode: step
+    # How the chunk-Q reduces its OWN bootstrap heads:
+    #   mean  average all heads -- the QC critic's q_agg, so both value
+    #         functions carry the same optimism
+    #   min   TD-MPC2's rule (min of two random target heads). Sits ~0.56 *
+    #         head spread below the mean on every backup; the bootstrap
+    #         amplifies that by 1 / (1 - discount^h) ~ 20x, which measured
+    #         as a -0.5 per-step gap and a -10 to -20 value gap in t4_mve_s0.
+    chunk_boot_agg: mean
 
     # --- architecture, TD-MPC2 defaults for state observations
     latent_dim: 512
@@ -206,6 +214,21 @@ defaults:
   # Per-arm knobs. Each arm differs from its comparison partner ONLY in
   # its own block.
   # ---------------------------------------------------------------------
+
+  # train_mve.py: the control, with the critic's TD target taking its
+  # continuation value from the world model's chunk Q at the REAL next
+  # state with the actor's chunk. No rollout, no imagined state.
+  mve:
+    # wm      Q_wm_target(z', actor chunk at s') -- the arm's method
+    # critic  QC eq. 15 unchanged, making this arm the control exactly
+    #         (same script, same rng consumption, model still training):
+    #         the matched partner for an attribution pair.
+    critic_target_source: wm
+    # Whose chunk the model's OWN chunk-Q bootstraps from at s':
+    #   actor  the QC actor's chunk -- BC-anchored to the buffer
+    #   prior  TD-MPC2's convention (its policy prior, unrolled in latent
+    #          space) -- off-distribution on offline data
+    chunk_bootstrap: actor
 
   # train_shaped_{control,qc,qcfql}.py: the base arm plus a TD-MPC2 latent
   # model trained alongside, whose value shapes the critic's reward

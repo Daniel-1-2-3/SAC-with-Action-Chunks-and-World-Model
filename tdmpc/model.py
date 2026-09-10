@@ -349,8 +349,17 @@ class TDMPC2Nets(nn.Module):
 
     def q_subset(self, z, action, reduce='min', target=False):
         """ world_model.py Q(return_type='min'|'avg'): two RANDOM heads,
-            reduced. 'min' is the pessimistic TD target; 'avg' is what the
-            policy-prior loss and TD-MPC2's own planner use. (B, 1). """
+            reduced. 'min' is TD-MPC2's pessimistic TD target; 'avg' is what
+            the policy-prior loss and TD-MPC2's own planner use. (B, 1).
+
+            'mean' is NOT from the reference: it averages ALL num_q heads,
+            matching the QC critic's q_agg=mean. Min-of-two sits below the
+            heads' mean by about 0.56 * their spread on every backup, which
+            the bootstrap amplifies by 1 / (1 - discount^h); with the same
+            rule on both sides the two value functions carry the same
+            optimism. """
+        if reduce == 'mean':
+            return self.q_values(z, action, target).mean(0)
         idx = torch.randperm(self.num_q, device=z.device)[:2]
         q = self.q_values(z, action, target, idx=idx)
         return q.min(0).values if reduce == 'min' else q.mean(0)

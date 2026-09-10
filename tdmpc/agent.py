@@ -86,6 +86,11 @@ class TDMPC2Model:
         # (_chunk_value_loss). Everything else is identical in both modes.
         self.q_mode = str(getattr(cfg, 'q_mode', 'step') if q_mode is None
                           else q_mode)
+        # Aggregation for the chunk-Q's OWN bootstrap. 'min' is TD-MPC2's
+        # (min of two random target heads); 'mean' averages all heads, the
+        # QC critic's q_agg -- see model.q_subset.
+        self.chunk_boot_agg = str(getattr(cfg, 'chunk_boot_agg', 'min'))
+        assert self.chunk_boot_agg in ('min', 'mean'), self.chunk_boot_agg
         assert self.q_mode in ('step', 'chunk'), self.q_mode
         self.gamma_h = float(gamma) ** self.chunk_len
         self.ref_mode = str(getattr(cfg, 'ref_mode', 'step'))
@@ -492,8 +497,12 @@ class TDMPC2Model:
 
                 pooled_chunk_reward + gamma^chunk_len * chunk_mask * boot
 
-            where boot is the min over two random TARGET heads at (z',
-            next_chunk).
+            where boot reduces the TARGET heads at (z', next_chunk) by
+            tdmpc.chunk_boot_agg: 'min' over two random heads (TD-MPC2's
+            rule) or 'mean' over all of them (the QC critic's rule -- equal
+            optimism on both sides; min-of-two sits ~0.56 * head spread
+            below the mean every backup, amplified by
+            1 / (1 - discount^h) ~ 20x into the value level).
 
             next_chunk is the ACTOR's chunk at s' (tdmpc.chunk_bootstrap
             'actor', the default): the same bootstrap policy the QC critic
@@ -510,7 +519,8 @@ class TDMPC2Model:
             z_next = self.net.encode(c_next)
             boot_chunk = (self.prior_chunk(z_next, sample=True)
                           if next_chunk is None else next_chunk)
-            boot = self.net.q_subset(z_next, boot_chunk, reduce='min', target=True)
+            boot = self.net.q_subset(z_next, boot_chunk,
+                                     reduce=self.chunk_boot_agg, target=True)
             v_target = c_rew + self.gamma_h * c_mask * boot
         z = self.net.encode(c_obs)
         return (c_valid * soft_ce(self.net.q_logits(z, c_chunk), v_target,
