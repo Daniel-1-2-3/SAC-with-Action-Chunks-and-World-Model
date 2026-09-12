@@ -146,9 +146,19 @@ class ChunkSelector:
         self._g_raw = g
         self._g = (1.0 - self.progress_tau) * self._g + self.progress_tau * g
 
+    def _arm_value_capture(self):
+        self._ep_first_pending = True
+        self._ep_first_vals = None
+
     def begin_episode(self):
         """ Called by the loop at the start of every REAL online episode
-            (never for eval). Bandit controller only: pick this episode's
+            (never for eval). Also arms the episode-start value capture:
+            the next select() records the critic's (and, if a model is
+            attached, the wm's) value estimate of the start state, which
+            report_episode_discounted later pairs with the realized
+            discounted return -- ground-truth calibration of both value
+            functions at episode-start granularity. Bandit controller
+            only for the rest: pick this episode's
             arm by sliding-window UCB over the last bandit_window finished
             episodes,
 
@@ -165,6 +175,7 @@ class ChunkSelector:
             the window size, the two window means (raw return units, only
             when the arm has pulls) and the UCB score gap explore - exploit
             (only when both have). """
+        self._arm_value_capture()
         if self.controller != 'bandit':
             return
         window = self._pulls[-self.bandit_window:]
@@ -202,6 +213,25 @@ class ChunkSelector:
             return float(self.bandit_arm)
         return self._g if self.progress_gate else 1.0
 
+    def report_episode_discounted(self, disc_return):
+        """ Realized discounted return of the episode whose start-state
+            values _ep_first_vals captured. Emits, per finished episode:
+              select/critic_value_first, select/critic_optimism
+              select/wm_value_first,     select/wm_optimism   (model arms)
+            optimism = estimate - realized: persistent positive means the
+            value function promises more than episodes deliver. """
+        vals = getattr(self, '_ep_first_vals', None)
+        if vals is None:
+            return
+        critic_v, wm_v = vals
+        self._ep_first_vals = None
+        self._acc('critic_value_first', critic_v)
+        self._acc('critic_optimism', critic_v - float(disc_return))
+        self._acc('realized_disc_return', float(disc_return))
+        if wm_v == wm_v:                       # not NaN
+            self._acc('wm_value_first', wm_v)
+            self._acc('wm_optimism', wm_v - float(disc_return))
+
     def pop_stats(self):
         """ Means since the last pop, prefixed select/. Empty when disabled or
             no decisions happened. """
@@ -230,6 +260,24 @@ class ChunkSelector:
         # QC's own best-of-N: the online critic scores every candidate.
         qs = self.policy.critic(feat_n, cands)          # (ensemble, n, 1)
         critic_score = self.policy._agg(qs).squeeze(-1)  # (n,)
+
+        if getattr(self, '_ep_first_pending', False) and not eval_mode:
+            # Episode-start value estimates, paired later with the realized
+            # discounted return by report_episode_discounted.
+            self._ep_first_pending = False
+            wm_v = float('nan')
+            if self.model is not None:
+                try:
+                    z1 = self.model.encode(feat)
+                    if getattr(self.model, 'q_mode', 'step') == 'chunk':
+                        wm_v = float(self.model.chunk_q(
+                            z1, cands[:1], target=True).squeeze())
+                    else:
+                        wm_v = float(self.model.net.q_subset(
+                            z1, self.model.net.pi(z1)[1], reduce='avg').squeeze())
+                except Exception:
+                    pass
+            self._ep_first_vals = (float(critic_score.max()), wm_v)
 
         if self.bonus_beta > 0.0 and not eval_mode and self.model is not None:
             return self._select_uncertainty_scaled(feat_n, cands, qs, critic_score)

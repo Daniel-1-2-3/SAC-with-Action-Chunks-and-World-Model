@@ -172,6 +172,19 @@ defaults:
     # behaviour), 1 = plain mean. 0.5 keeps the reward head's emphasis
     # without letting a few dims' ensemble noise decide novelty.
     reward_weight_shrink: 0.5
+    # --- MPPI (train_tdmpc.py only; reference tdmpc2.py defaults) ---
+    # The planner optimizes plan_chunks * chunk_len single-step actions
+    # and the env commits the first chunk. Values per the reference:
+    # 512 samples, 64 elites, 6 iterations, std in [0.05, 2], softmax
+    # temperature 0.5, 24 prior-seeded trajectories.
+    plan_chunks: 2
+    num_samples: 512
+    num_elites: 64
+    iterations: 6
+    min_std: 0.05
+    max_std: 2.0
+    temperature: 0.5
+    num_pi_trajs: 24
 
     # --- symlog two-hot for BOTH reward and value, matching the Dreamer
     # config this replaced. Both come out in raw units, comparable to the
@@ -214,6 +227,38 @@ defaults:
   # Per-arm knobs. Each arm differs from its comparison partner ONLY in
   # its own block.
   # ---------------------------------------------------------------------
+
+  # train_explore.py: the control + a bandit-gated dynamics-disagreement
+  # bonus at act-time selection, online collection only. score_i =
+  # Q_i + beta_active * sigma_Q * nu_i; nu from the model's dynamics-
+  # ensemble disagreement vs the real-data reference; beta_active in
+  # {0, beta} per episode by sliding-window UCB over real episode returns
+  # (wm/chunk_selector.py). Eval never sees the bonus; beta 0 = control.
+  explore:
+    beta: 1.0
+    # spread  v4: bonus = beta * gate * sigma_Q * nu   (gate = bandit arm)
+    # unc     v3: bonus = beta * s_i * nu (per-candidate critic doubt)
+    bonus_scale: spread
+    # model   nu from dynamics-ensemble disagreement (the measured signal)
+    # none    nu = 1: critic-doubt-only attribution arm
+    novelty: model
+    novelty_at: path
+    nu_cap: 1.0
+    rollout_chunks: 1
+    # dynamics heads for the ensemble (constructor override; the shared
+    # tdmpc.num_dyn stays 1 for every other arm). >= 2 required for
+    # novelty=model.
+    num_dyn: 4
+    # bandit  per-episode beta in {0, beta}, sliding-window UCB on real
+    #         returns -- the v5 fix for Phase-4's endpoint tax
+    # gate    v4 learning-progress gate (kept for reproducibility)
+    controller: bandit
+    bandit_window: 40
+    bandit_c: 1.0
+    progress_gate: True
+    progress_window: 20
+    progress_tau: 0.2
+    use_rel_unc: False
 
   # train_mve.py: the control, with the critic's TD target taking its
   # continuation value from the world model's chunk Q at the REAL next

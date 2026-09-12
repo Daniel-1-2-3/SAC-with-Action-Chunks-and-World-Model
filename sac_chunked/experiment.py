@@ -302,6 +302,7 @@ def run(config, arm_cls):
     chunk_pos = chunk_len
     global_step = 0
     ep_return = 0.0
+    ep_disc_return, ep_disc_pow = 0.0, 1.0
     print(f'Starting online phase ({arm.describe()})')
 
     def begin_episode():
@@ -334,13 +335,21 @@ def run(config, arm_cls):
 
         obs = next_obs
         ep_return += float(reward)
+        ep_disc_return += ep_disc_pow * float(reward)
+        ep_disc_pow *= arm.gamma
         if terminated or truncated:
             # Real online episode finished: feed its return to the selector's
             # learning-progress gate (model arms; absent in this tree). Eval
             # episodes never come through here.
             if hasattr(arm.selector, 'report_episode_return'):
                 arm.selector.report_episode_return(ep_return)
+            # Realized DISCOUNTED return of the finished episode -- the
+            # ground truth that value estimates promise. Consumed by
+            # selectors that calibrate a value function against it.
+            if hasattr(arm.selector, 'report_episode_discounted'):
+                arm.selector.report_episode_discounted(ep_disc_return)
             ep_return = 0.0
+            ep_disc_return, ep_disc_pow = 0.0, 1.0
             obs, info = env.reset()
             chunk_pos = chunk_len
             begin_episode()

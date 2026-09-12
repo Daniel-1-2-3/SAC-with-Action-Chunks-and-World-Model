@@ -89,10 +89,27 @@ def model_report(model, policy, replay, chunk_len, depth, gamma, device, rng,
     perm = torch.randperm(z_real_end.shape[0], device=device)
     spread = (z_real_end - z_real_end[perm]).pow(2).sum(-1).sqrt().mean()
 
+    # Uncertainty calibration (dynamics ensembles only): is the ensemble's
+    # imagined disagreement on a window's REAL actions correlated with the
+    # rollout's ACTUAL error on that window? The explore arm's bonus
+    # assumes yes; this measures it.
+    unc_err_corr = None
+    if getattr(model.net, 'num_dyn', 1) > 1:
+        try:
+            dis = model.path_disagreement(model.encode(obs[:, 0]), act)
+            dis = dis.reshape(-1).cpu().numpy()
+            dr = drift.reshape(-1).cpu().numpy()
+            if dis.std() > 1e-9 and dr.std() > 1e-9:
+                unc_err_corr = float(np.corrcoef(dis, dr)[0, 1])
+        except Exception:
+            pass
+
     model_v = model.terminal_value(z_real_end).squeeze(-1).cpu().numpy()
     critic_v = policy.chunk_target_values(next_obs[:, -1]).squeeze(-1).cpu().numpy()
 
+    out_extra = {} if unc_err_corr is None else {'wm/unc_err_corr': unc_err_corr}
     return {
+        **out_extra,
         'wm/reward_mae': float(np.abs(pred_pooled - real_pooled).mean()),
         'wm/reward_corr': _corr(pred_pooled, real_pooled),
         'wm/reward_pred_std': float(np.std(pred_pooled)),
