@@ -88,9 +88,18 @@ class WMOnlyAgent(ChunkAgent):
     def update_target(self):
         """ No-op: the wm maintains its own target network (tdmpc.tau). """
 
+    @torch.no_grad()
     def chunk_target_values(self, next_feats):
-        raise RuntimeError('wm_only has no QC critic target -- '
-                           'arm.critic_target returns None by design')
+        """ The 'value of the next state under our policy' probe that
+            model_report and any critic_target-style caller reads. The wm
+            IS the value function here: TARGET-head chunk Q at the policy's
+            own chunk. (wm/value_critic_corr in this arm compares the wm's
+            prior-chunk value against this — same model, two chunk
+            proposers — rather than against an independent critic.) """
+        m = self.model
+        assert m is not None, 'wm not attached to the agent yet'
+        return m.chunk_q(m.encode(next_feats), self.sample_chunk(next_feats),
+                         target=True)
 
     def state_dict_all(self):
         return {
