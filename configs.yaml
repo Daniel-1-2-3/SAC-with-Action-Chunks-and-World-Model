@@ -13,8 +13,8 @@ defaults:
   general:
     env_name: cube-triple-play-singletask-v0
     run_name: ''
-    out_dir: runs/default
-    wandb_project: beat-qc-fql
+    out_dir: runs/seed-task-testing/default
+    wandb_project: seed-task-testing
     wandb_mode: online          # 'disabled' skips wandb entirely
     # Latent-model checkpoint to load (model arms only; none in this tree). '' = train from
     # scratch alongside the policy.
@@ -51,11 +51,11 @@ defaults:
   chunk:
     chunk_len: 5
     # Candidate chunks per decision, drawn from the distilled one-step actor
-    # and picked by the critic (train_control.py; train_qc_fql.py forces 1). QC's
+    # and picked by the critic (train_combined.py; train_qc_fql.py forces 1). QC's
     # own best-of-N analysis bounds the KL from the sampling policy by
     # log N - (N-1)/N; the paper used N=32 on cube-*. 1 = plain QC-FQL.
     select_n: 16
-    # Where the select_n candidates come from (train_control.py):
+    # Where the select_n candidates come from (train_combined.py):
     #   actor  the distilled one-step actor, one pass per candidate (the
     #          earlier behaviour)
     #   bc     the flow BC policy: noise -> Euler with flow_steps -> clip,
@@ -123,7 +123,7 @@ defaults:
     #          gamma^chunk_len * chunk_mask * min two random TARGET heads at
     #          (z', prior chunk unrolled in latent space). The policy prior
     #          trains against the chunk Q of its own unrolled chunk.
-    #          arms/mve.py forces this on; see tdmpc/agent.py
+    #          arms/wm_combined.py forces this on; see tdmpc/agent.py
     #          _chunk_value_loss.
     q_mode: step
     # How the chunk-Q reduces its OWN bootstrap heads:
@@ -172,20 +172,6 @@ defaults:
     # behaviour), 1 = plain mean. 0.5 keeps the reward head's emphasis
     # without letting a few dims' ensemble noise decide novelty.
     reward_weight_shrink: 0.5
-    # --- MPPI (train_tdmpc.py only; reference tdmpc2.py defaults) ---
-    # The planner optimizes plan_chunks * chunk_len single-step actions
-    # and the env commits the first chunk. Values per the reference:
-    # 512 samples, 64 elites, 6 iterations, std in [0.05, 2], softmax
-    # temperature 0.5, 24 prior-seeded trajectories.
-    plan_chunks: 2
-    num_samples: 512
-    num_elites: 64
-    iterations: 6
-    min_std: 0.05
-    max_std: 2.0
-    temperature: 0.5
-    num_pi_trajs: 24
-
     # --- symlog two-hot for BOTH reward and value, matching the Dreamer
     # config this replaced. Both come out in raw units, comparable to the
     # QC critic's own Q (tdmpc/diagnostics.py).
@@ -228,44 +214,12 @@ defaults:
   # its own block.
   # ---------------------------------------------------------------------
 
-  # train_explore.py: the control + a bandit-gated dynamics-disagreement
-  # bonus at act-time selection, online collection only. score_i =
-  # Q_i + beta_active * sigma_Q * nu_i; nu from the model's dynamics-
-  # ensemble disagreement vs the real-data reference; beta_active in
-  # {0, beta} per episode by sliding-window UCB over real episode returns
-  # (wm/chunk_selector.py). Eval never sees the bonus; beta 0 = control.
-  explore:
-    beta: 1.0
-    # spread  v4: bonus = beta * gate * sigma_Q * nu   (gate = bandit arm)
-    # unc     v3: bonus = beta * s_i * nu (per-candidate critic doubt)
-    bonus_scale: spread
-    # model   nu from dynamics-ensemble disagreement (the measured signal)
-    # none    nu = 1: critic-doubt-only attribution arm
-    novelty: model
-    novelty_at: path
-    nu_cap: 1.0
-    rollout_chunks: 1
-    # dynamics heads for the ensemble (constructor override; the shared
-    # tdmpc.num_dyn stays 1 for every other arm). >= 2 required for
-    # novelty=model.
-    num_dyn: 4
-    # bandit  per-episode beta in {0, beta}, sliding-window UCB on real
-    #         returns -- the v5 fix for Phase-4's endpoint tax
-    # gate    v4 learning-progress gate (kept for reproducibility)
-    controller: bandit
-    bandit_window: 40
-    bandit_c: 1.0
-    progress_gate: True
-    progress_window: 20
-    progress_tau: 0.2
-    use_rel_unc: False
-
-  # train_mve.py: the control, with the critic's TD target taking its
+  # train_wm_combined.py: the combined arm, with the critic's TD target taking its
   # continuation value from the world model's chunk Q at the REAL next
   # state with the actor's chunk. No rollout, no imagined state.
-  mve:
+  wm_combined:
     # wm      Q_wm_target(z', actor chunk at s') -- the arm's method
-    # critic  QC eq. 15 unchanged, making this arm the control exactly
+    # critic  QC eq. 15 unchanged, making this arm the combined arm exactly
     #         (same script, same rng consumption, model still training):
     #         the matched partner for an attribution pair.
     critic_target_source: wm
@@ -273,32 +227,4 @@ defaults:
     #   actor  the QC actor's chunk -- BC-anchored to the buffer
     #   prior  TD-MPC2's convention (its policy prior, unrolled in latent
     #          space) -- off-distribution on offline data
-    chunk_bootstrap: actor
-
-  # train_shaped_{control,qc,qcfql}.py: the base arm plus a TD-MPC2 latent
-  # model trained alongside, whose value shapes the critic's reward
-  # (potential-based). phi(s) = wm chunk-Q (TARGET heads) at (z(s), the
-  # policy's chunk at s); the critic target's reward term gains
-  #   coef * (gamma^h * mask * phi(s') - phi(s)).
-  # Only the critic target sees the bonus: the buffer, actor losses, reward
-  # metrics and eval all stay raw, and best-of-N is invariant (every
-  # candidate at s shares phi(s)). Along a trajectory the bonus telescopes,
-  # so it changes how fast value propagates, not which policy is best; a
-  # CONSTANT phi error cancels in the difference.
-  shaping:
-    # wm    the bonus above
-    # none  no bonus -- the exact base arm, with the model still training
-    #       (identical rng consumption: the matched control of a pair)
-    potential: wm
-    coef: 1.0
-    # Center phi with a slow running mean before the difference. OFF
-    # reproduces t4_shaped_s2's failure: phi's level (~-290) leaks through
-    # the discount as a constant +14 per chunk, relocating the critic by
-    # ~20.5x that. Keep on.
-    center: True
-    center_tau: 0.01
-    # Whose chunk the model's OWN chunk-Q bootstraps from at s':
-    #   actor  the policy's chunk -- BC-anchored to the buffer
-    #   prior  TD-MPC2's own convention (its policy prior, unrolled in
-    #          latent space) -- off-distribution on offline data
     chunk_bootstrap: actor

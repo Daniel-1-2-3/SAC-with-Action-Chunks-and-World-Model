@@ -10,7 +10,7 @@
                        (the paper's QC; validates train_qc.py)
     --baseline qcfql   main.py --agent.alpha=chunk.alpha (actor_type
                        distill-ddpg, the paper's QC-FQL; the policy of
-                       train_control.py --chunk.select_n=1)
+                       train_combined.py --chunk.select_n=1)
 
     Every other flag is read from configs.yaml exactly as our train_*.py
     read it (--configs presets and dotted overrides included) and mapped to

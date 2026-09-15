@@ -113,35 +113,6 @@ def test_model_update_shapes():
 
 # --------------------------------------------------------------- selector
 
-def make_selector(model, **kw):
-    return ChunkSelector(model, StubPolicy(), ACT, CHUNK, n=16, gamma=0.99, device=DEV,
-                         bonus_beta=1.0, **kw)
-
-
-@pytest.mark.parametrize('controller', ['gate', 'bandit'])
-@pytest.mark.parametrize('bonus_scale', ['unc', 'spread'])
-@pytest.mark.parametrize('novelty', ['model', 'none'])
-def test_select_uncertainty_scaled_shape(bonus_scale, novelty, controller):
-    m = make_model()
-    sel = make_selector(m, bonus_scale=bonus_scale, novelty=novelty, controller=controller)
-    sel.begin_episode()
-    feat_n = torch.randn(1, OBS).repeat(16, 1)
-    cands = sel.policy.sample_chunk(feat_n)
-    qs = sel.policy.critic(feat_n, cands)
-    out = sel._select_uncertainty_scaled(feat_n, cands, qs, qs.mean(0).squeeze(-1))
-    assert out.shape == (CHUNK, ACT)
-    stats = sel.pop_stats()
-    assert 'select/novelty_mean' in stats and 'select/pick_changed' in stats
-
-
-def test_select_end_to_end_train_and_eval():
-    m = make_model()
-    sel = make_selector(m, bonus_scale='spread', novelty='model')
-    state = np.random.randn(OBS).astype(np.float32)
-    assert sel.select(state).shape == (CHUNK, ACT)
-    assert sel.select(state, eval_mode=True).shape == (CHUNK, ACT)
-
-
 # --------------------------------------------------------------- QC agent
 
 def make_qc(n=8):

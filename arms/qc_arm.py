@@ -7,7 +7,7 @@
     selector is disabled: n=1 passthrough, select() is exactly policy.act.
     chunk.select_n and chunk.alpha are ignored; chunk.qc_num_samples is N.
 
-    Comparison: train_control.py (QC-FQL with critic best-of-N over the
+    Comparison: train_combined.py (QC-FQL with critic best-of-N over the
     distilled actor) differs in what is sampled (one-step actor vs. the
     flow) and in the actor loss (distillation + Q term vs. BC only). """
 

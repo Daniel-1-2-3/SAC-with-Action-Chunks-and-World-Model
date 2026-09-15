@@ -1,21 +1,23 @@
-# Three arms. Same protocol as the QC paper: 1M offline + 1M online, 50 eval
-# episodes. Triple: alpha default 300 (FQL's); the paper's QC-FQL uses 100.
-# Quadruple: add --general.env_name=cube-quadruple-play-singletask-v0 --chunk.alpha=100
+Task 4, all arms, seed 1
+OMP_NUM_THREADS=2 nohup python train_qc_fql.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --chunk.alpha=100 --general.run_name=t4_qcfql_s1 --general.out_dir=runs/seed-task-testing/t4_qcfql_s1 --seed=1 > t4_qcfql_s1.log 2>&1 &
+OMP_NUM_THREADS=2 nohup python train_qc.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.run_name=t4_qc_s1 --general.out_dir=runs/seed-task-testing/t4_qc_s1 --seed=1 > t4_qc_s1.log 2>&1 &
+OMP_NUM_THREADS=2 nohup python train_combined.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.run_name=t4_combined_s1 --general.out_dir=runs/seed-task-testing/t4_combined_s1 --seed=1 > t4_combined_s1.log 2>&1 &
+OMP_NUM_THREADS=2 nohup python train_wm_combined.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.run_name=t4_wm_combined_s1 --general.out_dir=runs/seed-task-testing/t4_wm_combined_s1 --seed=1 > t4_wm_combined_s1.log 2>&1 &
 
-# CONTROL: QC-FQL training + critic best-of-16 over the one-step actor (ours)
-python train_control.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.run_name=t4_control_s0 --general.out_dir=runs/t4_control_s0 --seed=0
-#   same, at the paper's alpha
-python train_control.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --chunk.alpha=100 --general.run_name=t4_control_a100_s0 --general.out_dir=runs/t4_control_a100_s0 --seed=0
-#   candidates from the flow BC policy instead of the actor (attribution)
-python train_control.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --chunk.candidate_source=bc --general.run_name=t4_control_bc_s0 --general.out_dir=runs/t4_control_bc_s0 --seed=0
+Task 4, all arms, seed 2
+OMP_NUM_THREADS=2 nohup python train_qc_fql.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --chunk.alpha=100 --general.run_name=t4_qcfql_s2 --general.out_dir=runs/seed-task-testing/t4_qcfql_s2 --seed=2 > t4_qcfql_s2.log 2>&1 &
+OMP_NUM_THREADS=2 nohup python train_qc.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.run_name=t4_qc_s2 --general.out_dir=runs/seed-task-testing/t4_qc_s2 --seed=2 > t4_qc_s2.log 2>&1 &
+OMP_NUM_THREADS=2 nohup python train_combined.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.run_name=t4_combined_s2 --general.out_dir=runs/seed-task-testing/t4_combined_s2 --seed=2 > t4_combined_s2.log 2>&1 &
+OMP_NUM_THREADS=2 nohup python train_wm_combined.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.run_name=t4_wm_combined_s2 --general.out_dir=runs/seed-task-testing/t4_wm_combined_s2 --seed=2 > t4_wm_combined_s2.log 2>&1 &
 
-# QC-FQL (Li et al. 2025 Alg. 2), single actor sample, paper's alpha
-python train_qc_fql.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --chunk.alpha=100 --general.run_name=t4_qcfql_s0 --general.out_dir=runs/t4_qcfql_s0 --seed=0
+Task 3, all arms, seed 1
+OMP_NUM_THREADS=2 nohup python train_qc_fql.py --general.env_name=cube-triple-play-singletask-task3-v0 --general.num_offline_steps=1000000 --chunk.alpha=100 --general.run_name=t3_qcfql_s1 --general.out_dir=runs/seed-task-testing/t3_qcfql_s1 --seed=1 > t3_qcfql_s1.log 2>&1 &
+OMP_NUM_THREADS=2 nohup python train_qc.py --general.env_name=cube-triple-play-singletask-task3-v0 --general.num_offline_steps=1000000 --general.run_name=t3_qc_s1 --general.out_dir=runs/seed-task-testing/t3_qc_s1 --seed=1 > t3_qc_s1.log 2>&1 &
+OMP_NUM_THREADS=2 nohup python train_combined.py --general.env_name=cube-triple-play-singletask-task3-v0 --general.num_offline_steps=1000000 --general.run_name=t3_combined_s1 --general.out_dir=runs/seed-task-testing/t3_combined_s1 --seed=1 > t3_combined_s1.log 2>&1 &
+OMP_NUM_THREADS=2 nohup python train_wm_combined.py --general.env_name=cube-triple-play-singletask-task3-v0 --general.num_offline_steps=1000000 --general.run_name=t3_wm_combined_s1 --general.out_dir=runs/seed-task-testing/t3_wm_combined_s1 --seed=1 > t3_wm_combined_s1.log 2>&1 &
 
-# QC (Li et al. 2025 Alg. 1), best-of-32 from the flow BC policy; no alpha
-python train_qc.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.run_name=t4_qc_s0 --general.out_dir=runs/t4_qc_s0 --seed=0
-#   TD target from one BC sample instead of best-of-32 (attribution)
-python train_qc.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --chunk.qc_target=single --general.run_name=t4_qc_single_s0 --general.out_dir=runs/t4_qc_single_s0 --seed=0
-
-# Official JAX code (validates the QC port), one-time setup: bash baselines/setup_qc_venv.sh
-python train_official.py --baseline qc --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.run_name=t4_official_qc_s0 --seed=0
+Task 3, all arms, seed 2
+OMP_NUM_THREADS=2 nohup python train_qc_fql.py --general.env_name=cube-triple-play-singletask-task3-v0 --general.num_offline_steps=1000000 --chunk.alpha=100 --general.run_name=t3_qcfql_s2 --general.out_dir=runs/seed-task-testing/t3_qcfql_s2 --seed=2 > t3_qcfql_s2.log 2>&1 &
+OMP_NUM_THREADS=2 nohup python train_qc.py --general.env_name=cube-triple-play-singletask-task3-v0 --general.num_offline_steps=1000000 --general.run_name=t3_qc_s2 --general.out_dir=runs/seed-task-testing/t3_qc_s2 --seed=2 > t3_qc_s2.log 2>&1 &
+OMP_NUM_THREADS=2 nohup python train_combined.py --general.env_name=cube-triple-play-singletask-task3-v0 --general.num_offline_steps=1000000 --general.run_name=t3_combined_s2 --general.out_dir=runs/seed-task-testing/t3_combined_s2 --seed=2 > t3_combined_s2.log 2>&1 &
+OMP_NUM_THREADS=2 nohup python train_wm_combined.py --general.env_name=cube-triple-play-singletask-task3-v0 --general.num_offline_steps=1000000 --general.run_name=t3_wm_combined_s2 --general.out_dir=runs/seed-task-testing/t3_wm_combined_s2 --seed=2 > t3_wm_combined_s2.log 2>&1 &

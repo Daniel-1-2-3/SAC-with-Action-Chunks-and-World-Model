@@ -63,7 +63,7 @@ def build_env(general, seed):
 # --------------------------------------------------------------------- arm
 
 class Arm:
-    """ What an arm must provide. The base class IS the control: QC-FQL with
+    """ What an arm must provide. The base class IS the combined arm: QC-FQL with
         the critic picking the best of select_n candidate chunks, no model
         anywhere.
 
@@ -74,7 +74,7 @@ class Arm:
           model_update     how the latent model (if any) trains
           report           model diagnostics at eval, zero env steps """
 
-    name = 'control'
+    name = 'combined'
 
     def __init__(self, config, obs_dim, action_dim, device, rng):
         self.config = config
@@ -123,13 +123,6 @@ class Arm:
         with torch.no_grad():
             return reward + self.gamma_h * mask * self.policy.chunk_target_values(next_obs)
 
-    def shape_reward(self, obs, next_obs, reward, mask, metrics_on=False):
-        """ Hook: the reward term the critic target should use for this
-            batch. Identity in every base arm; a shaping arm returns
-            reward + bonus. Only the critic target sees the result -- the
-            buffer, the actor losses and every reward metric stay raw. """
-        return reward
-
     def model_update(self, replay, metrics_on):
         return {}
 
@@ -159,9 +152,7 @@ def agent_update(arm, replay, metrics_on=True):
         return None
     b_obs, b_chunk, b_rew, b_mask, b_valid, b_step_valid, b_next = batch
 
-    shaped_rew = arm.shape_reward(b_obs, b_next, b_rew, b_mask,
-                                  metrics_on=metrics_on)
-    targets = arm.critic_target(b_next, shaped_rew, b_mask, metrics_on=metrics_on)
+    targets = arm.critic_target(b_next, b_rew, b_mask, metrics_on=metrics_on)
 
     metrics = {}
     metrics.update(prefixed(arm.policy.update_critic(

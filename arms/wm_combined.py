@@ -1,12 +1,12 @@
-""" MVE arm -- model value expansion, value-only.
+""" WM-COMBINED arm -- model value expansion, value-only.
 
-    Everything about the control (arms/control.py) is unchanged: QC-FQL
+    Everything about the combined arm (arms/combined.py) is unchanged: QC-FQL
     training, critic best-of-N selection at act and eval time, the same
     actor, the same replay. The ONE difference is where the critic's TD
     target gets its continuation value.
 
-      control  R_chunk + gamma^h * mask * Q_critic_target(s', actor chunk)
-      mve      R_chunk + gamma^h * mask * Q_wm_target(z', actor chunk)
+      combined R_chunk + gamma^h * mask * Q_critic_target(s', actor chunk)
+      wm_comb. R_chunk + gamma^h * mask * Q_wm_target(z', actor chunk)
 
     R_chunk is the REAL pooled discounted reward of the replayed chunk and
     s' is the REAL observation h steps later; only the value function
@@ -17,7 +17,7 @@
     The world model (tdmpc/agent.py, forced to q_mode='chunk') trains
     alongside on replay: consistency and reward on windows, and its own
     chunk Q on the SAME chunk transitions the critic uses, bootstrapping
-    from the actor's chunk at s' (mve.chunk_bootstrap).
+    from the actor's chunk at s' (wm_combined.chunk_bootstrap).
 
     EQUAL OPTIMISM: tdmpc.chunk_boot_agg defaults to 'mean', matching the
     critic's q_agg. With TD-MPC2's 'min' (min of two random target heads)
@@ -25,13 +25,14 @@
     backup, which the bootstrap amplifies by 1 / (1 - gamma^h) ~ 20x -- the
     -0.5 per-step and -10 to -20 value gap measured in t4_mve_s0.
 
-    mve.critic_target_source=critic makes this arm the control exactly --
+    wm_combined.critic_target_source=critic makes this arm the combined
+    arm exactly --
     same script, same rng consumption, model still training -- i.e. the
     matched partner for an attribution pair. """
 
 import torch
 
-from arms.control import ControlArm
+from arms.combined import CombinedArm
 from tdmpc.agent import TDMPC2Model
 from tdmpc.diagnostics import chunk_q_report, model_report
 
@@ -44,14 +45,14 @@ def _corr_t(a, b):
                  / (ac.std(correction=0) * bc.std(correction=0) + 1e-8))
 
 
-class MVEArm(ControlArm):
-    name = 'mve'
+class WMCombinedArm(CombinedArm):
+    name = 'wm_combined'
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.source = self.config.mve.critic_target_source
+        self.source = self.config.wm_combined.critic_target_source
         assert self.source in ('critic', 'wm'), self.source
-        assert self.config.mve.chunk_bootstrap in ('actor', 'prior')
+        assert self.config.wm_combined.chunk_bootstrap in ('actor', 'prior')
         self._target_stats = {}
 
     def build_model(self):
@@ -65,7 +66,7 @@ class MVEArm(ControlArm):
 
     def describe(self):
         return (f'{super().describe()} | critic target: {self.source}'
-                f' (wm bootstrap: {self.config.mve.chunk_bootstrap}, '
+                f' (wm bootstrap: {self.config.wm_combined.chunk_bootstrap}, '
                 f'agg: {self.config.tdmpc.chunk_boot_agg})')
 
     def critic_target(self, next_obs, reward, mask, metrics_on=False):
@@ -111,7 +112,7 @@ class MVEArm(ControlArm):
         if chunk_batch is None:
             return {}
         next_chunk = None
-        if self.config.mve.chunk_bootstrap == 'actor':
+        if self.config.wm_combined.chunk_bootstrap == 'actor':
             with torch.no_grad():
                 next_chunk = self.policy.sample_chunk(chunk_batch[6])
         return self.model.update(w['obs'], w['next_obs'], w['action'],

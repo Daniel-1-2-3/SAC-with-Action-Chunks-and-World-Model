@@ -1,4 +1,4 @@
-""" CONTROL arm -- the paper's method, "QC-FQL + critic best-of-N".
+""" COMBINED arm -- the paper's method, "QC-FQL + critic best-of-N".
 
     QC-FQL training (Li et al. 2025, Alg. 2: flow BC policy, distilled
     one-step actor, chunk critic). At act and eval time the online critic
@@ -12,8 +12,8 @@ from sac_chunked.experiment import Arm
 from wm.chunk_selector import ChunkSelector
 
 
-class ControlArm(Arm):
-    name = 'control'
+class CombinedArm(Arm):
+    name = 'combined'
 
     def build_selector(self):
         return ChunkSelector(None, self.policy, self.action_dim, self.chunk_len,
