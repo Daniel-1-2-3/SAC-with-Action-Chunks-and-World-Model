@@ -1,3 +1,9 @@
+Task 4, all arms, seed 0
+OMP_NUM_THREADS=2 nohup python train_qc_fql.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --chunk.alpha=100 --general.run_name=t4_qcfql_s0 --general.out_dir=runs/seed-task-testing/t4_qcfql_s0 --seed=0 > t4_qcfql_s0.log 2>&1 &
+OMP_NUM_THREADS=2 nohup python train_qc.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.run_name=t4_qc_s0 --general.out_dir=runs/seed-task-testing/t4_qc_s0 --seed=0 > t4_qc_s0.log 2>&1 &
+OMP_NUM_THREADS=2 nohup python train_combined.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.run_name=t4_combined_s0 --general.out_dir=runs/seed-task-testing/t4_combined_s0 --seed=0 > t4_combined_s0.log 2>&1 &
+OMP_NUM_THREADS=2 nohup python train_wm_combined.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.run_name=t4_wm_combined_s0 --general.out_dir=runs/seed-task-testing/t4_wm_combined_s0 --seed=0 > t4_wm_combined_s0.log 2>&1 &
+
 Task 4, all arms, seed 1
 OMP_NUM_THREADS=2 nohup python train_qc_fql.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --chunk.alpha=100 --general.run_name=t4_qcfql_s1 --general.out_dir=runs/seed-task-testing/t4_qcfql_s1 --seed=1 > t4_qcfql_s1.log 2>&1 &
 OMP_NUM_THREADS=2 nohup python train_qc.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.run_name=t4_qc_s1 --general.out_dir=runs/seed-task-testing/t4_qc_s1 --seed=1 > t4_qc_s1.log 2>&1 &
@@ -9,6 +15,12 @@ OMP_NUM_THREADS=2 nohup python train_qc_fql.py --general.env_name=cube-triple-pl
 OMP_NUM_THREADS=2 nohup python train_qc.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.run_name=t4_qc_s2 --general.out_dir=runs/seed-task-testing/t4_qc_s2 --seed=2 > t4_qc_s2.log 2>&1 &
 OMP_NUM_THREADS=2 nohup python train_combined.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.run_name=t4_combined_s2 --general.out_dir=runs/seed-task-testing/t4_combined_s2 --seed=2 > t4_combined_s2.log 2>&1 &
 OMP_NUM_THREADS=2 nohup python train_wm_combined.py --general.env_name=cube-triple-play-singletask-task4-v0 --general.num_offline_steps=1000000 --general.run_name=t4_wm_combined_s2 --general.out_dir=runs/seed-task-testing/t4_wm_combined_s2 --seed=2 > t4_wm_combined_s2.log 2>&1 &
+
+Task 3, all arms, seed 0
+OMP_NUM_THREADS=2 nohup python train_qc_fql.py --general.env_name=cube-triple-play-singletask-task3-v0 --general.num_offline_steps=1000000 --chunk.alpha=100 --general.run_name=t3_qcfql_s0 --general.out_dir=runs/seed-task-testing/t3_qcfql_s0 --seed=0 > t3_qcfql_s0.log 2>&1 &
+OMP_NUM_THREADS=2 nohup python train_qc.py --general.env_name=cube-triple-play-singletask-task3-v0 --general.num_offline_steps=1000000 --general.run_name=t3_qc_s0 --general.out_dir=runs/seed-task-testing/t3_qc_s0 --seed=0 > t3_qc_s0.log 2>&1 &
+OMP_NUM_THREADS=2 nohup python train_combined.py --general.env_name=cube-triple-play-singletask-task3-v0 --general.num_offline_steps=1000000 --general.run_name=t3_combined_s0 --general.out_dir=runs/seed-task-testing/t3_combined_s0 --seed=0 > t3_combined_s0.log 2>&1 &
+OMP_NUM_THREADS=2 nohup python train_wm_combined.py --general.env_name=cube-triple-play-singletask-task3-v0 --general.num_offline_steps=1000000 --general.run_name=t3_wm_combined_s0 --general.out_dir=runs/seed-task-testing/t3_wm_combined_s0 --seed=0 > t3_wm_combined_s0.log 2>&1 &
 
 Task 3, all arms, seed 1
 OMP_NUM_THREADS=2 nohup python train_qc_fql.py --general.env_name=cube-triple-play-singletask-task3-v0 --general.num_offline_steps=1000000 --chunk.alpha=100 --general.run_name=t3_qcfql_s1 --general.out_dir=runs/seed-task-testing/t3_qcfql_s1 --seed=1 > t3_qcfql_s1.log 2>&1 &
