@@ -53,7 +53,11 @@ class ChunkTransitionReplay:
         self.mask = np.zeros((self.capacity, 1), dtype=np.float32)
         self.terminal = np.zeros((self.capacity, 1), dtype=np.float32)
         self.idx = 0
-        self.full = False
+        # Reference size accounting (utils/datasets.py ReplayBuffer):
+        # size = max(pointer, size) after each add, so sampling covers
+        # [0, size) and once the ring wraps, new transitions overwrite the
+        # oldest slots while size stays put.
+        self.size = 0
         self.offline_episodes = 0
         self.offline_success = 0
         self.online_episodes = 0
@@ -61,7 +65,7 @@ class ChunkTransitionReplay:
         self._ep_success = False
 
     def __len__(self):
-        return self.capacity if self.full else self.idx
+        return self.size
 
     def add(self, obs, action, reward, next_obs, terminated, truncated=False):
         i = self.idx
@@ -74,8 +78,7 @@ class ChunkTransitionReplay:
         # does not zero the bootstrap mask.
         self.terminal[i] = 1.0 if (terminated or truncated) else 0.0
         self.idx = (self.idx + 1) % self.capacity
-        if self.idx == 0:
-            self.full = True
+        self.size = max(self.idx, self.size)
 
         if reward > self.success_reward_thresh:
             self._ep_success = True
@@ -86,7 +89,11 @@ class ChunkTransitionReplay:
 
     def seed_from_offline(self, dataset):
         obs = np.asarray(dataset['observations'], dtype=np.float32)
-        act = np.asarray(dataset['actions'], dtype=np.float32)
+        # envs/env_utils.py make_env_and_datasets (action_clip_eps=1e-5):
+        # dataset actions are clipped to +-(1 - 1e-5) before training ever
+        # sees them. Online actions are stored as executed, like main.py.
+        act = np.clip(np.asarray(dataset['actions'], dtype=np.float32),
+                      -1.0 + 1e-5, 1.0 - 1e-5)
         rew = np.asarray(dataset['rewards'], dtype=np.float32).reshape(-1, 1)
         nobs = np.asarray(dataset['next_observations'], dtype=np.float32)
         term = np.asarray(dataset['terminals']).reshape(-1).astype(bool)
@@ -104,9 +111,8 @@ class ChunkTransitionReplay:
         self.mask[sl] = mk[:n]
         self.terminal[sl] = term[:n].astype(np.float32).reshape(-1, 1)
         self.idx = n % self.capacity
+        self.size = n
         self.offline_size = n
-        if n >= self.capacity:
-            self.full = True
 
         ep_ok = False
         for t in range(n):

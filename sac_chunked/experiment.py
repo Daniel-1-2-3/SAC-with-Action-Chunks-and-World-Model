@@ -154,13 +154,12 @@ def agent_update(arm, replay, metrics_on=True):
 
     targets = arm.critic_target(b_next, b_rew, b_mask, metrics_on=metrics_on)
 
+    # acfql total_loss + _update: one batch, critic and actor losses from the
+    # same pre-update parameters, one combined backward, then the polyak
+    # target update -- see ChunkAgent.update / QCAgent.update.
     metrics = {}
-    metrics.update(prefixed(arm.policy.update_critic(
-        b_obs, b_chunk, targets, b_valid, metrics_on=metrics_on), 'sac'))
-    # Reference passes one batch to both terms; weight is ones because the
-    # actor loss in acfql.actor_loss is unweighted.
-    metrics.update(prefixed(arm.policy.update_actor(
-        b_obs, torch.ones_like(b_valid), bc_feat=b_obs, bc_chunk=b_chunk,
+    metrics.update(prefixed(arm.policy.update(
+        b_obs, b_chunk, targets, b_valid, bc_feat=b_obs, bc_chunk=b_chunk,
         bc_valid=b_step_valid, metrics_on=metrics_on), 'sac'))
     arm.policy.update_target()
 
@@ -205,10 +204,13 @@ def run(config, arm_cls):
     obs_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
 
-    # main.py sizes the buffer as max(buffer_size, dataset.size + 1), so
-    # offline data is never evicted once online transitions arrive.
+    # main.py sizes the buffer as max(buffer_size, dataset.size + 1). When
+    # the dataset is bigger than buffer_size minus the online steps (cube-
+    # triple's 3M is), online transitions wrap the ring and overwrite the
+    # OLDEST offline transitions, raising the online fraction of every
+    # uniform batch late in training -- reproduced exactly.
     dataset_size = len(train_dataset['observations']) if train_dataset is not None else 0
-    capacity = max(chunk.replay_capacity, dataset_size + general.num_online_steps + 1)
+    capacity = max(chunk.replay_capacity, dataset_size + 1)
     replay = ChunkTransitionReplay(obs_dim, action_dim, chunk_len, capacity=capacity,
                                    online_frac=chunk.online_frac)
     if train_dataset is not None:

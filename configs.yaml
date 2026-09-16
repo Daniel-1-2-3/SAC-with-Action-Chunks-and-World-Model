@@ -72,9 +72,11 @@ defaults:
     qc_target: bestofn
     utd_ratio: 1
     batch_size: 256
-    # Floor only -- raised at runtime to max(., offline_size + online + 1)
-    # so offline data is never evicted (main.py's max(buffer_size, size+1)).
-    replay_capacity: 1000000
+    # main.py FLAGS.buffer_size. Capacity at runtime is
+    # max(., dataset_size + 1), the reference's exact rule -- so on cube-
+    # triple (3M-transition dataset) the online steps wrap the ring and
+    # overwrite the oldest offline transitions, exactly as theirs does.
+    replay_capacity: 2000000
     # Balanced replay sampling, EVERY arm: this fraction of each batch's
     # start indices (critic/actor chunks AND the model's windows) is drawn
     # from the online region of the buffer, the rest from the whole buffer.

@@ -1,18 +1,28 @@
 import torch
 import torch.nn as nn
 
+def _reference_init(linear):
+    """ utils/networks.py default_init: variance_scaling(1.0, 'fan_avg',
+        'uniform'), which is exactly Xavier/Glorot uniform, with flax Dense's
+        default zero bias. The reference applies it to EVERY Dense layer of
+        both Value and ActorVectorField, output layers included. """
+    nn.init.xavier_uniform_(linear.weight)
+    nn.init.zeros_(linear.bias)
+    return linear
+
+
 def build_mlp(in_dim, hidden_dim, num_layers, out_dim, layer_norm):
     """ utils/networks.py MLP. Dense -> activation -> LayerNorm per hidden
         layer, activation is gelu, no activation on the output layer. """
     layers = []
     d = in_dim
     for _ in range(num_layers):
-        layers.append(nn.Linear(d, hidden_dim))
+        layers.append(_reference_init(nn.Linear(d, hidden_dim)))
         layers.append(nn.GELU())
         if layer_norm:
             layers.append(nn.LayerNorm(hidden_dim))
         d = hidden_dim
-    layers.append(nn.Linear(d, out_dim))
+    layers.append(_reference_init(nn.Linear(d, out_dim)))
     return nn.Sequential(*layers)
 
 class ActorVectorField(nn.Module):
@@ -171,9 +181,96 @@ class ChunkAgent:
         next_chunk = self.sample_chunk(next_feats)
         return self._agg(self.critic_target(next_feats, next_chunk))
 
+    def _critic_metrics(self, metrics, critic_loss, qs, sq, target_Q):
+        """ The critic diagnostics update_critic reports, on a whole-batch
+            (n_real = None) basis, shared by the joint `update` paths. """
+        q_mean = qs.mean(0)
+        spread = qs.std(0)
+        metrics['critic_loss'] = critic_loss.item()
+        metrics['critic_target_q'] = target_Q.mean().item()
+        metrics['critic_q'] = q_mean.mean().item()
+        metrics['diagnosis/critic_q_max'] = q_mean.max().item()
+        metrics['diagnosis/critic_q_min'] = q_mean.min().item()
+        metrics['diagnosis/critic_ensemble_spread'] = spread.mean().item()
+        metrics['diagnosis/critic_target_q_range'] = (target_Q.max() - target_Q.min()).item()
+        sq_det = sq.detach()
+        metrics['diagnosis/critic_mse_real'] = sq_det.mean().item()
+        metrics['diagnosis/critic_spread_real'] = spread.mean().item()
+        metrics['diagnosis/critic_calibration'] = (
+            spread.mean() / (sq_det.mean().sqrt() + 1e-8)).item()
+        metrics['diagnosis/critic_q_real'] = q_mean.mean().item()
+        metrics['diagnosis/critic_target_q_real'] = target_Q.mean().item()
+        return metrics
+
+    def update(self, feat, chunk, target_Q, valid, bc_feat, bc_chunk,
+               bc_valid=None, metrics_on=True):
+        """ acfql total_loss + _update (L110-152), exactly: critic loss and
+            actor loss are computed from the SAME pre-update parameters and
+            applied in ONE combined backward, then both Adam steps. Adam is
+            per-parameter and the two losses touch disjoint parameters, so
+            stepping the two optimizers equals the reference's single adam
+            over the summed loss.
+
+            Critic loss (L45): mean over (heads, batch) of
+            valid * (Q - target)^2 -- the reference's exact reduction.
+
+            Actor loss (L54-108): bc_flow + alpha * distill + q term. The
+            critic call inside the Q term runs with the critic's parameters
+            frozen so its gradient reaches the one-step actor only; the
+            reference calls select('critic') without params=grad_params,
+            which is the same thing. """
+        metrics = {}
+        target_Q = target_Q.detach()
+
+        # --- critic loss, pre-update parameters
+        qs = self.critic(feat, chunk)
+        sq = (qs - target_Q.unsqueeze(0)) ** 2       # (ensemble, batch, 1)
+        critic_loss = (valid * sq).mean()
+
+        # --- actor loss, the same pre-update parameters
+        bc_flow_loss = self.bc_flow_loss(bc_feat, bc_chunk, bc_valid)
+        noises = self.noise(feat.shape[0])
+        target_flow_chunk = self.compute_flow_actions(feat, noises)
+        actor_chunk = self.actor_onestep_flow(feat, noises)
+        distill_loss = ((actor_chunk - target_flow_chunk) ** 2).mean()
+        clipped = torch.clamp(actor_chunk, -1.0, 1.0)
+        for p in self.critic.parameters():
+            p.requires_grad_(False)
+        q = self._agg(self.critic(feat, clipped))
+        for p in self.critic.parameters():
+            p.requires_grad_(True)
+        q_loss = -q.mean()
+        actor_loss = bc_flow_loss + self.alpha * distill_loss + q_loss
+
+        self.critic_opt.zero_grad(set_to_none=True)
+        self.actor_opt.zero_grad(set_to_none=True)
+        (critic_loss + actor_loss).backward()
+        self.critic_opt.step()
+        self.actor_opt.step()
+
+        if not metrics_on:
+            return metrics
+        self._critic_metrics(metrics, critic_loss, qs, sq, target_Q)
+        metrics['actor_loss'] = actor_loss.item()
+        metrics['bc_flow_loss'] = bc_flow_loss.item()
+        metrics['distill_loss'] = distill_loss.item()
+        metrics['actor_q_term'] = q_loss.item()
+        _bc = bc_flow_loss.detach() + self.alpha * distill_loss.detach()
+        metrics['diagnosis/actor_bc_share'] = (_bc / (q_loss.detach().abs() + _bc).clamp_min(1e-8)).item()
+        metrics['diagnosis/actor_chunk_abs_mean'] = clipped.detach().abs().mean().item()
+        metrics['diagnosis/actor_chunk_clip_frac'] = (actor_chunk.detach().abs() > 1.0).float().mean().item()
+        metrics['diagnosis/actor_bc_gap'] = (actor_chunk.detach() - target_flow_chunk).abs().mean().item()
+        c = clipped.detach().reshape(-1, self.chunk_len, self.action_dim)
+        metrics['diagnosis/actor_intra_chunk_jerk'] = (c[:, 1:] - c[:, :-1]).abs().mean().item()
+        return metrics
+
     def update_critic(self, feat, chunk, target_Q, weight, n_real=None,
                       metrics_on=True):
-        """ acfql.critic_loss. weight is `valid` for the replay arm and the
+        """ NOT used by the training loop anymore -- `update` above is (one
+            combined backward, the reference's exact reduction). Kept for
+            callers that need a critic-only step.
+
+            acfql.critic_loss. weight is `valid` for the replay arm and the
             imagined survival weight for the world-model arm. The reference
             multiplies by the mask and takes a plain mean -- it does NOT
             renormalize by the mask's sum.
@@ -260,7 +357,10 @@ class ChunkAgent:
 
     def update_actor(self, feat, weight, bc_feat, bc_chunk, bc_valid=None,
                      actor_batch=None, metrics_on=True):
-        """ acfql.actor_loss:
+        """ NOT used by the training loop anymore -- `update` above is. Kept
+            for callers that need an actor-only step (actor_batch, weights).
+
+            acfql.actor_loss:
 
               actor_loss = bc_flow_loss + alpha * distill_loss + q_loss
 

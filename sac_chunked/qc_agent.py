@@ -39,24 +39,21 @@
 
     Deviations from acfql.py, all listed:
       1. Two Adam optimizers (critic, BC flow) instead of one Adam over the
-         summed loss (L126, L301). Identical updates: Adam is per-parameter
-         and the two losses touch disjoint parameters once the actor's Q
-         term is zero (L97-99).
-      2. ChunkAgent.update_critic sums the per-head masked means instead of
-         averaging over (heads, batch) (L45): the loss is num_qs times
-         theirs. Adam is invariant to a constant gradient scale except
-         through eps=1e-8, so the update is the same to that precision.
-      3. Weight init is PyTorch's nn.Linear default, not flax's
-         variance_scaling(1.0, 'fan_avg', 'uniform') with zero bias
-         (utils/networks.py L8-10). Shared with ChunkAgent.
-      4. actor_onestep_flow is not built. The reference builds it (L277-282)
+         summed loss (L126, L301), both stepped from the ONE combined
+         backward in QCAgent.update. Identical updates: Adam is
+         per-parameter and the two losses touch disjoint parameters once
+         the actor's Q term is zero (L97-99).
+      2. actor_onestep_flow is not built. The reference builds it (L277-282)
          but in best-of-n mode it receives zero gradient and is never read.
-      5. Replay: the reference clips dataset actions to +-(1 - 1e-5)
-         (envs/env_utils.py L149-153); ours stores them as loaded. Window
-         sampling, masks, valid and the pooled reward follow
-         utils/datasets.py sample_sequence (sac_chunked/replay.py).
-      6. chunk_diversity (a metric only) is the std across the N flow
+      3. chunk_diversity (a metric only) is the std across the N flow
          samples at a state; the reference has no such metric.
+    Previously listed deviations now removed: the critic loss uses their
+    exact mean over (heads, batch) (L45); weights are initialized with
+    their variance_scaling(1.0, 'fan_avg', 'uniform') = Xavier uniform and
+    zero bias (utils/networks.py L8-10); replay clips dataset actions to
+    +-(1 - 1e-5) (envs/env_utils.py L149-153). Window sampling, masks,
+    valid and the pooled reward follow utils/datasets.py sample_sequence
+    (sac_chunked/replay.py).
     Everything the loop does around the agent (offline then online phases,
     start_training, utd_ratio, chunk executed open loop) is main.py's, see
     sac_chunked/experiment.py. """
@@ -68,8 +65,9 @@ from sac_chunked.sac_chunk_agent import ActorVectorField, ChunkAgent, ChunkCriti
 
 class QCAgent(ChunkAgent):
     """ Shares with ChunkAgent: _agg, noise, compute_flow_actions,
-        update_critic, update_target, bc_flow_loss. Everything that touched
-        the one-step actor is replaced by best-of-N over the flow policy. """
+        _critic_metrics, update_target, bc_flow_loss. Everything that
+        touched the one-step actor is replaced by best-of-N over the flow
+        policy. """
 
     def __init__(self, repr_dim, action_dim, chunk_len, device, lr, hidden_dim,
                  num_layers, critic_target_tau, ensemble=2, num_samples=32,
@@ -179,9 +177,41 @@ class QCAgent(ChunkAgent):
 
     # ----------------------------------------------------------- training
 
+    def update(self, feat, chunk, target_Q, valid, bc_feat, bc_chunk,
+               bc_valid=None, metrics_on=True):
+        """ acfql _update (L110-152) in best-of-n mode: critic loss (their
+            exact mean over heads and batch, L45) + the BC flow loss,
+            computed from the same pre-update parameters, one combined
+            backward, both Adam steps. The two losses touch disjoint
+            parameters (distill_loss = q_loss = 0, L97-99), so no freezing
+            is needed and two Adams equal their single one. """
+        metrics = {}
+        target_Q = target_Q.detach()
+
+        qs = self.critic(feat, chunk)
+        sq = (qs - target_Q.unsqueeze(0)) ** 2       # (ensemble, batch, 1)
+        critic_loss = (valid * sq).mean()
+        bc_flow_loss = self.bc_flow_loss(bc_feat, bc_chunk, bc_valid)
+
+        self.critic_opt.zero_grad(set_to_none=True)
+        self.actor_opt.zero_grad(set_to_none=True)
+        (critic_loss + bc_flow_loss).backward()
+        self.critic_opt.step()
+        self.actor_opt.step()
+
+        if not metrics_on:
+            return metrics
+        self._critic_metrics(metrics, critic_loss, qs, sq, target_Q)
+        metrics['actor_loss'] = bc_flow_loss.item()
+        metrics['bc_flow_loss'] = bc_flow_loss.item()
+        return metrics
+
     def update_actor(self, feat, weight, bc_feat, bc_chunk, bc_valid=None,
                      actor_batch=None, metrics_on=True):
-        """ L54-108 in best-of-n mode: actor_loss = bc_flow_loss, nothing
+        """ NOT used by the training loop anymore -- `update` above is. Kept
+            for callers that need a BC-only step.
+
+            L54-108 in best-of-n mode: actor_loss = bc_flow_loss, nothing
             else. feat / weight / actor_batch are the ChunkAgent interface
             and unused here. """
         bc_flow_loss = self.bc_flow_loss(bc_feat, bc_chunk, bc_valid)
