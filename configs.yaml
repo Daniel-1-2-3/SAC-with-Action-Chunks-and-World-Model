@@ -123,7 +123,7 @@ defaults:
     #          gamma^chunk_len * chunk_mask * min two random TARGET heads at
     #          (z', prior chunk unrolled in latent space). The policy prior
     #          trains against the chunk Q of its own unrolled chunk.
-    #          arms/wm_combined.py forces this on; see tdmpc/agent.py
+    #          arms/wm_explore.py keeps this off; see tdmpc/agent.py
     #          _chunk_value_loss.
     q_mode: step
     # How the chunk-Q reduces its OWN bootstrap heads:
@@ -214,17 +214,35 @@ defaults:
   # its own block.
   # ---------------------------------------------------------------------
 
-  # train_wm_combined.py: the combined arm, with the critic's TD target taking its
-  # continuation value from the world model's chunk Q at the REAL next
-  # state with the actor's chunk. No rollout, no imagined state.
-  wm_combined:
-    # wm      Q_wm_target(z', actor chunk at s') -- the arm's method
-    # critic  QC eq. 15 unchanged, making this arm the combined arm exactly
-    #         (same script, same rng consumption, model still training):
-    #         the matched partner for an attribution pair.
-    critic_target_source: wm
-    # Whose chunk the model's OWN chunk-Q bootstraps from at s':
-    #   actor  the QC actor's chunk -- BC-anchored to the buffer
-    #   prior  TD-MPC2's convention (its policy prior, unrolled in latent
-    #          space) -- off-distribution on offline data
-    chunk_bootstrap: actor
+  # train_wm_explore.py: the combined arm + a bandit-gated dynamics-disagreement
+  # bonus at act-time selection, online collection only. score_i =
+  # Q_i + beta_active * sigma_Q * nu_i; nu from the model's dynamics-
+  # ensemble disagreement vs the real-data reference; beta_active in
+  # {0, beta} per episode by sliding-window UCB over real episode returns
+  # (wm/chunk_selector.py). Eval never sees the bonus; beta 0 = combined arm.
+  wm_explore:
+    beta: 1.0
+    # spread  v4: bonus = beta * gate * sigma_Q * nu   (gate = bandit arm)
+    # unc     v3: bonus = beta * s_i * nu (per-candidate critic doubt)
+    bonus_scale: spread
+    # model   nu from dynamics-ensemble disagreement (the measured signal)
+    # none    nu = 1: critic-doubt-only attribution arm
+    novelty: model
+    novelty_at: path
+    nu_cap: 1.0
+    rollout_chunks: 1
+    # dynamics heads for the ensemble (constructor override; the shared
+    # tdmpc.num_dyn stays 1 for every other arm). >= 2 required for
+    # novelty=model.
+    num_dyn: 4
+    # bandit  per-episode beta in {0, beta}, sliding-window UCB on real
+    #         returns -- the v5 fix for Phase-4's endpoint tax
+    # gate    v4 learning-progress gate (kept for reproducibility)
+    controller: bandit
+    bandit_window: 40
+    bandit_c: 1.0
+    progress_gate: True
+    progress_window: 20
+    progress_tau: 0.2
+    use_rel_unc: False
+
