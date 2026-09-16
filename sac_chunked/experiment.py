@@ -68,7 +68,7 @@ class Arm:
         anywhere.
 
         Subclasses override exactly the hook their idea changes:
-          build_policy     the agent (ChunkAgent = QC-FQL; QCAgent = QC)
+          build_policy     the agent (ChunkAgent = QC-FQL)
           build_selector   what picks the candidate chunk at act time
           critic_target    what the QC critic regresses onto
           model_update     how the latent model (if any) trains
@@ -92,8 +92,7 @@ class Arm:
         self.selector = self.build_selector()
 
     def build_policy(self):
-        """ QC-FQL (acfql.py, actor_type=distill-ddpg). The QC arm returns a
-            QCAgent (best-of-n) instead; same constructor keywords. """
+        """ QC-FQL (acfql.py, actor_type=distill-ddpg). """
         return ChunkAgent(
             repr_dim=self.obs_dim, action_dim=self.action_dim, chunk_len=self.chunk_len,
             device=self.device, lr=self.chunk.lr, hidden_dim=self.chunk.hidden_dim,
@@ -156,7 +155,7 @@ def agent_update(arm, replay, metrics_on=True):
 
     # acfql total_loss + _update: one batch, critic and actor losses from the
     # same pre-update parameters, one combined backward, then the polyak
-    # target update -- see ChunkAgent.update / QCAgent.update.
+    # target update -- see ChunkAgent.update.
     metrics = {}
     metrics.update(prefixed(arm.policy.update(
         b_obs, b_chunk, targets, b_valid, bc_feat=b_obs, bc_chunk=b_chunk,

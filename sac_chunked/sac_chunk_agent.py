@@ -341,8 +341,7 @@ class ChunkAgent:
     def bc_flow_loss(self, bc_feat, bc_chunk, bc_valid=None):
         """ acfql.actor_loss L63-79, the rectified-flow BC term (QC eq. 18):
             interpolate noise -> real chunk at a random time and predict the
-            straight-line velocity. Shared by ChunkAgent (QC-FQL) and QCAgent
-            (QC), which trains its flow policy with this term alone. """
+            straight-line velocity. """
         z0 = torch.randn_like(bc_chunk)
         t = torch.rand(bc_chunk.shape[0], 1, device=bc_chunk.device, dtype=bc_chunk.dtype)
         x_t = (1.0 - t) * z0 + t * bc_chunk

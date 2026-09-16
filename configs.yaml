@@ -51,8 +51,8 @@ defaults:
   chunk:
     chunk_len: 5
     # Candidate chunks per decision, drawn from the distilled one-step actor
-    # and picked by the critic (train_combined.py; train_qc_fql.py forces 1). QC's
-    # own best-of-N analysis bounds the KL from the sampling policy by
+    # and picked by the critic (train_combined.py). QC's own best-of-N
+    # analysis bounds the KL from the sampling policy by
     # log N - (N-1)/N; the paper used N=32 on cube-*. 1 = plain QC-FQL.
     select_n: 16
     # Where the select_n candidates come from (train_combined.py):
@@ -62,14 +62,6 @@ defaults:
     #          i.e. QC's own sampler, still picked by the critic.
     # Training is untouched either way; only what is drawn at a decision.
     candidate_source: actor
-    # train_qc.py only: N flow-policy samples per decision for QC's own
-    # best-of-N (act, eval and TD target). Their Table 4/5 value for
-    # cube-*. QC ignores select_n and alpha.
-    qc_num_samples: 32
-    # QC's TD bootstrap: bestofn = argmax over qc_num_samples BC samples at
-    # s' (paper, eq. 11); single = one BC sample (attribution: removes the
-    # max-over-N bias, acting unchanged).
-    qc_target: bestofn
     utd_ratio: 1
     batch_size: 256
     # main.py FLAGS.buffer_size. Capacity at runtime is

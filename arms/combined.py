@@ -3,7 +3,8 @@
     QC-FQL training (Li et al. 2025, Alg. 2: flow BC policy, distilled
     one-step actor, chunk critic). At act and eval time the online critic
     picks the best of chunk.select_n chunks. select_n=1 is plain QC-FQL
-    (train_qc_fql.py). No learned model anywhere. The base Arm class in
+    (run from the official ColinQiyangLi/qc repo for the baseline rows).
+    No learned model anywhere. The base Arm class in
     sac_chunked/experiment.py is this arm; this file adds only
     chunk.candidate_source (actor | bc: where the candidates are drawn from;
     the critic picks either way). """
