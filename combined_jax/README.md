@@ -46,7 +46,29 @@ MUJOCO_GL=egl python main.py --run_group=combined --agent.alpha=300 \
 # plain QC-FQL control (upstream-identical; paper alpha for cube-triple is 100)
 MUJOCO_GL=egl python main.py --run_group=qcfql --agent.alpha=100 \
   --env_name=cube-triple-play-singletask-task3-v0 --sparse=False --horizon_length=5
+
+# wm_explore arm: the combined arm + the bandit-gated novelty bonus
+MUJOCO_GL=egl python main.py --run_group=wm_explore --use_wm=True \
+  --agent.alpha=300 --agent.actor_num_candidates=16 \
+  --env_name=cube-triple-play-singletask-task3-v0 --sparse=False --horizon_length=5
 ```
+
+## wm_explore in JAX (`--use_wm=True`)
+
+`wm/tdmpc2.py` + `wm/selector.py` port this repo's PyTorch
+`tdmpc/model.py`, `tdmpc/agent.py` and `wm/chunk_selector.py` -- the
+TD-MPC2 latent model (encoder, dynamics ENSEMBLE, symlog two-hot reward
+and Q heads, max-entropy policy prior) and the act-time novelty bonus --
+restricted to exactly the paths the wm_explore arm runs (its v5
+configuration: step-mode Q, mean disagreement reduction, ref_mode
+rollout, bonus_scale spread, UCB bandit controller). Training, TD
+targets and eval stay the combined arm's; the bonus only reorders the
+act-time candidates during online collection, and an exploit episode
+(bandit arm 0) or eval scores identically to the combined arm.
+Knobs live under `--wm.*` (defaults = the repo's configs.yaml tdmpc +
+wm_explore blocks). Not ported, all unused by this arm or diagnostics
+only: q_mode='chunk', novelty='reward' weighting, tdmpc/diagnostics.py,
+the selector's extended stat accumulators.
 
 Protocol flags (`--offline_steps`, `--online_steps`, `--eval_episodes`, ...)
 are upstream's, with upstream defaults (1M offline, 1M online, 50 eval

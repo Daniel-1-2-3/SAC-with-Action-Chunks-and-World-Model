@@ -50,6 +50,12 @@ flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 
 config_flags.DEFINE_config_file('agent', 'agents/acfql.py', lock_config=False)
 
+# WM PATCH: the wm_explore arm -- the combined arm plus a bandit-gated
+# dynamics-disagreement bonus on act-time selection during online
+# collection only. Training, targets and eval are the combined arm's.
+flags.DEFINE_bool('use_wm', False, 'Train a TD-MPC2 latent model alongside and add the novelty bonus at act time (wm_explore arm). Requires agent.actor_num_candidates > 1.')
+config_flags.DEFINE_config_file('wm', 'wm/tdmpc2.py', lock_config=False)
+
 flags.DEFINE_float('dataset_proportion', 1.0, "Proportion of the dataset to use")
 flags.DEFINE_integer('dataset_replace_interval', 1000, 'Dataset replace interval, used for large datasets because of memory constraints')
 flags.DEFINE_string('ogbench_dataset_dir', None, 'OGBench dataset directory')
@@ -153,6 +159,20 @@ def main(_):
         config,
     )
 
+    # WM PATCH: latent model + novelty selector (wm_explore arm)
+    wm_model, selector, wm_info, wm_rng = None, None, {}, None
+    if FLAGS.use_wm:
+        assert config['actor_num_candidates'] > 1, \
+            'wm_explore selects among candidates: set --agent.actor_num_candidates'
+        from wm.tdmpc2 import WorldModel
+        from wm.selector import NoveltySelector
+        wm_model = WorldModel.create(
+            FLAGS.seed, example_batch['observations'].shape[-1],
+            example_batch['actions'].shape[-1], FLAGS.horizon_length,
+            discount, FLAGS.wm)
+        selector = NoveltySelector(FLAGS.wm)
+        wm_rng = jax.random.PRNGKey(FLAGS.seed + 1)
+
     # Setup logging.
     prefixes = ["eval", "env"]
     if FLAGS.offline_steps > 0:
@@ -187,7 +207,19 @@ def main(_):
 
         agent, offline_info = agent.update(batch)
 
+        # WM PATCH: model update every train_every steps, on real windows
+        # from the same data (offline: the online region is empty, so the
+        # balanced sampler falls back to uniform, as in the PyTorch loop)
+        if FLAGS.use_wm and i % FLAGS.wm.train_every == 0:
+            wbatch = train_dataset.sample_windows(
+                FLAGS.wm.batch_size, FLAGS.wm.horizon,
+                online_frac=FLAGS.wm.online_frac, offline_size=train_dataset.size)
+            wm_model, wm_info = wm_model.update(wbatch)
+
         if i % FLAGS.log_interval == 0:
+            if wm_info:
+                offline_info = dict(offline_info)
+                offline_info.update({f'wm/{k}': v for k, v in wm_info.items()})
             logger.log(offline_info, "offline_agent", step=log_step)
         
         # saving
@@ -214,9 +246,14 @@ def main(_):
     )
         
     ob, _ = env.reset()
-    
+
     action_queue = []
     action_dim = example_batch["actions"].shape[-1]
+
+    # WM PATCH: controller state for the first online episode
+    wm_ep_return = 0.0
+    if FLAGS.use_wm:
+        selector.begin_episode()
 
     # Online RL
     update_info = {}
@@ -230,7 +267,13 @@ def main(_):
         
         # during online rl, the action chunk is executed fully
         if len(action_queue) == 0:
-            action = agent.sample_actions(observations=ob, rng=key)
+            if FLAGS.use_wm:
+                # WM PATCH: the selector picks WHICH candidate chunk runs;
+                # the open-loop commitment length is unchanged
+                wm_rng, skey = jax.random.split(wm_rng)
+                action = selector.select(agent, wm_model, np.asarray(ob), skey)
+            else:
+                action = agent.sample_actions(observations=ob, rng=key)
 
             action_chunk = np.array(action).reshape(-1, action_dim)
             for action in action_chunk:
@@ -280,12 +323,35 @@ def main(_):
         )
         replay_buffer.add_transition(transition)
         
+        # WM PATCH: per-episode return for the controller, final step included
+        if FLAGS.use_wm:
+            wm_ep_return += float(int_reward)
+
         # done
         if done:
+            # WM PATCH: real online episode finished -> feed its return to
+            # the controller, then pick the next episode's arm
+            if FLAGS.use_wm:
+                selector.report_episode_return(wm_ep_return)
+                wm_ep_return = 0.0
             ob, _ = env.reset()
             action_queue = []  # reset the action queue
+            if FLAGS.use_wm:
+                selector.begin_episode()
         else:
             ob = next_ob
+
+        # WM PATCH: model update on balanced real windows (online_frac of
+        # the starts from the online region), same start_training gate as
+        # the agent's updates
+        wm_log = None
+        if FLAGS.use_wm and i >= FLAGS.start_training and i % FLAGS.wm.train_every == 0:
+            wbatch = replay_buffer.sample_windows(
+                FLAGS.wm.batch_size, FLAGS.wm.horizon,
+                online_frac=FLAGS.wm.online_frac, offline_size=train_dataset.size)
+            wm_model, wm_info = wm_model.update(wbatch)
+            wm_log = {f'wm/{k}': v for k, v in wm_info.items()}
+            wm_log.update(selector.last)
 
         if i >= FLAGS.start_training:
             batch = replay_buffer.sample_sequence(config['batch_size'] * FLAGS.utd_ratio, 
@@ -294,7 +360,12 @@ def main(_):
                 FLAGS.utd_ratio, config["batch_size"]) + x.shape[1:]), batch)
 
             agent, update_info["online_agent"] = agent.batch_update(batch)
-            
+
+        # WM PATCH: fold the model/selector metrics into the online log
+        if wm_log is not None:
+            update_info['online_agent'] = {
+                **update_info.get('online_agent', {}), **wm_log}
+
         if i % FLAGS.log_interval == 0:
             for key, info in update_info.items():
                 logger.log(info, key, step=log_step)

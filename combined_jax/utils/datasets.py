@@ -264,3 +264,41 @@ def add_history(dataset, history_length):
     return dataset
 
 
+
+
+# WM PATCH (not in upstream): consecutive single-step windows for the
+# latent world model, mirroring this repo's
+# ChunkTransitionReplay.sample_model_windows: obs/next_obs (B, H, obs),
+# action (B, H, A), reward/mask/valid (B, H, 1); valid is 1 until the
+# window crosses an episode end. online_frac of the window starts come
+# from the online region [offline_size, size - H], the rest uniform over
+# the whole buffer, with a uniform fallback while the online region has
+# no room (identical to the PyTorch _starts rule).
+def sample_windows(self, batch_size, horizon, online_frac=0.0, offline_size=0):
+    size = self.size
+    hi = size - horizon + 1
+    n_on = int(round(batch_size * float(online_frac)))
+    if n_on > 0 and offline_size < hi:
+        on = np.random.randint(offline_size, hi, size=n_on)
+        uni = np.random.randint(0, hi, size=batch_size - n_on)
+        starts = np.concatenate([on, uni])
+    else:
+        starts = np.random.randint(0, hi, size=batch_size)
+    w = starts[:, None] + np.arange(horizon)[None, :]
+    terminals = np.asarray(self['terminals'][w], dtype=np.float32)
+    valid = np.ones((batch_size, horizon), dtype=np.float32)
+    run = terminals[:, 0].copy()
+    for k in range(1, horizon):
+        valid[:, k] = 1.0 - run
+        run = np.maximum(run, terminals[:, k])
+    return dict(
+        obs=np.asarray(self['observations'][w], dtype=np.float32),
+        next_obs=np.asarray(self['next_observations'][w], dtype=np.float32),
+        action=np.asarray(self['actions'][w], dtype=np.float32),
+        reward=np.asarray(self['rewards'][w], dtype=np.float32)[..., None],
+        mask=np.asarray(self['masks'][w], dtype=np.float32)[..., None],
+        valid=valid[..., None],
+    )
+
+
+Dataset.sample_windows = sample_windows

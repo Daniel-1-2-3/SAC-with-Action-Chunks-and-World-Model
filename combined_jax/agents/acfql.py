@@ -256,6 +256,31 @@ class ACFQLAgent(flax.struct.PyTreeNode):
         return actions
 
     @jax.jit
+    def sample_candidates(
+        self,
+        observations,
+        rng=None,
+    ):
+        # COMBINED PATCH: the act-time candidate pool WITHOUT the argmax,
+        # for a selector that adds a bonus to the critic's scores (the
+        # wm_explore arm). Single observation (obs_dim,) only. Returns
+        # (candidates (n, D), per-head critic values (num_qs, n)) -- the
+        # same candidates and Q values the best-of-N branch of
+        # sample_actions computes.
+        n = self.config["actor_num_candidates"]
+        action_dim = self.config['action_dim'] * \
+                    (self.config['horizon_length'] if self.config["action_chunking"] else 1)
+        noises = jax.random.normal(rng, (n, action_dim))
+        observations = jnp.repeat(observations[None, :], n, axis=0)
+        if self.config["candidate_source"] == "bc":
+            actions = self.compute_flow_actions(observations, noises)
+        else:
+            actions = self.network.select('actor_onestep_flow')(observations, noises)
+        actions = jnp.clip(actions, -1, 1)
+        qs = self.network.select("critic")(observations, actions)   # (num_qs, n)
+        return actions, qs
+
+    @jax.jit
     def sample_onestep_actions(
         self,
         observations,
