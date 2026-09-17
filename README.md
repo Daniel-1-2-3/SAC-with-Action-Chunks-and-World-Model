@@ -11,6 +11,7 @@ with its own commands, not from this repo.
 |---|---|---|---|
 | `train_combined.py` | **combined** | QC-FQL training; at act and eval time the online critic picks the best of `chunk.select_n` chunks sampled from the distilled one-step actor (`candidate_source=actor`) or the flow BC policy (`=bc`). This is our method. | -- |
 | `train_wm_explore.py` | **wm_explore** | the combined arm plus a bandit-gated dynamics-disagreement bonus on act-time selection during online collection only (was `train_explore.py`). Training, targets and eval are the combined arm's; `wm_explore.beta=0` is exactly the combined arm. | -- |
+| `combined_jax/` | **combined (JAX)** | the combined arm implemented directly on the official `ColinQiyangLi/qc` JAX codebase: upstream QC-FQL training byte-for-byte, plus `--agent.actor_num_candidates=16` best-of-N by the critic at act/eval time. See `combined_jax/README.md`. | -- |
 
 `tdmpc/` is the latent world-model architecture (trained by `wm_explore`
 only, for its dynamics-ensemble disagreement) and `wm/` is the chunk
