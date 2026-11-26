@@ -219,6 +219,8 @@ def run(config, arm_cls):
               f'{replay.success_stats["offline_frac"]:.2f}) | capacity {capacity}')
 
     arm = arm_cls(config, obs_dim, action_dim, device, rng)
+    if hasattr(arm, 'attach_replay'):
+        arm.attach_replay(replay)
     print(f'PyTorch device: {device} | chunk_len={chunk_len} alpha={chunk.alpha}')
     print(f'ARM  {arm.describe()}')
     if general.model_ckpt and arm.model is not None:
@@ -324,6 +326,8 @@ def run(config, arm_cls):
         next_obs, reward, terminated, truncated, info = env.step(env_action)
         replay.add(state, action, reward, np.asarray(next_obs, dtype=np.float32),
                    terminated, truncated)
+        if hasattr(arm.selector, 'observe_step'):
+            arm.selector.observe_step(float(reward), bool(terminated or truncated))
 
         obs = next_obs
         ep_return += float(reward)
