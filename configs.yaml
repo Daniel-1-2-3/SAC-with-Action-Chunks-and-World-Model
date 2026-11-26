@@ -117,7 +117,7 @@ defaults:
     #          gamma^chunk_len * chunk_mask * min two random TARGET heads at
     #          (z', prior chunk unrolled in latent space). The policy prior
     #          trains against the chunk Q of its own unrolled chunk.
-    #          arms/wm_explore.py keeps this off; see tdmpc/agent.py
+    #          arms/tree_explore.py keeps this off; see tdmpc/agent.py
     #          _chunk_value_loss.
     q_mode: step
     # How the chunk-Q reduces its OWN bootstrap heads:
@@ -151,21 +151,6 @@ defaults:
     # that fall is what turns "visited" into "not novel". 0.0 = same
     # uniform sampling as the policy (the earlier behaviour).
     online_frac: 0.5
-    # The novelty reference (diagnosis/wm_data_disagreement), model arms:
-    #   step     one-step ensemble disagreement at the first real transition
-    #            of each training window (earlier behaviour). A candidate is
-    #            measured along an imagined path, whose disagreement
-    #            compounds with depth, so the ratio was >1 almost everywhere
-    #            and nu saturated.
-    #   rollout  the same path measure a candidate gets (novelty_at,
-    #            rollout_chunks), over the window's real actions. Like for
-    #            like: a candidate the data would have taken scores ~1.
-    ref_mode: rollout
-    # novelty=reward only: shrink the |d reward / d z| weights
-    # toward uniform, w <- (1 - s) * w + s. 0 = raw weights (earlier
-    # behaviour), 1 = plain mean. 0.5 keeps the reward head's emphasis
-    # without letting a few dims' ensemble noise decide novelty.
-    reward_weight_shrink: 0.5
     # --- symlog two-hot for BOTH reward and value, matching the Dreamer
     # config this replaced. Both come out in raw units, comparable to the
     # QC critic's own Q (tdmpc/diagnostics.py).
@@ -208,35 +193,36 @@ defaults:
   # its own block.
   # ---------------------------------------------------------------------
 
-  # train_wm_explore.py: the combined arm + a bandit-gated dynamics-disagreement
-  # bonus at act-time selection, online collection only. score_i =
-  # Q_i + beta_active * sigma_Q * nu_i; nu from the model's dynamics-
-  # ensemble disagreement vs the real-data reference; beta_active in
-  # {0, beta} per episode by sliding-window UCB over real episode returns
-  # (wm/chunk_selector.py). Eval never sees the bonus; beta 0 = combined arm.
-  wm_explore:
-    beta: 1.0
-    # spread  v4: bonus = beta * gate * sigma_Q * nu   (gate = bandit arm)
-    # unc     v3: bonus = beta * s_i * nu (per-candidate critic doubt)
-    bonus_scale: spread
-    # model   nu from dynamics-ensemble disagreement (the measured signal)
-    # none    nu = 1: critic-doubt-only attribution arm
-    novelty: model
-    novelty_at: path
-    nu_cap: 1.0
-    rollout_chunks: 1
-    # dynamics heads for the ensemble (constructor override; the shared
-    # tdmpc.num_dyn stays 1 for every other arm). >= 2 required for
-    # novelty=model.
-    num_dyn: 4
-    # bandit  per-episode beta in {0, beta}, sliding-window UCB on real
-    #         returns -- the v5 fix for Phase-4's endpoint tax
-    # gate    v4 learning-progress gate (kept for reproducibility)
-    controller: bandit
+  # train_tree_explore.py and train_tree_switch.py: the combined method plus a
+  # world-model tree at act-time selection during online collection only.
+  # Training, targets and eval are the combined method's.
+  tree:
+    beta: 1.0              # bonus weight; 0 = every decision is the combined method's
+    num_dyn: 4             # dynamics heads for disagreement (>= 2 when beta > 0)
+    depth: 4               # imagined chunks deep; 1 = no tree, only each candidate's own end point (the depth control)
+    beam: 4                # nodes kept per level
+    branch: 4              # proposer chunks per kept node
+    root_bc: 8             # extra flow behaviour-cloning candidates at the root, explore decisions only
+    trust_cap: 2.0         # node trusted while its disagreement <= trust_cap x the real-data reference at its depth
+    reach_cap: 2.0         # bonus <= amount x spread of critic values x reach_cap
+    min_amount: 0.05       # below this explore amount the tree is not grown
+    ref_every: 100         # model updates between trust-reference measurements
+    ref_rate: 0.1          # running-average rate of the trust reference
+    memory_offline: 25000
+    memory_online: 25000
+    memory_refresh_every: 10000
+    memory_k: 5
+    proposer_hidden: 512
+    proposer_lr: 3e-4
+    bandit: True
     bandit_window: 40
     bandit_c: 1.0
-    progress_gate: True
-    progress_window: 20
-    progress_tau: 0.2
-    use_rel_unc: False
+
+  # train_tree_switch.py only: explore amount per decision from the critic.
+  switch:
+    signal: both           # both | progress | promise | constant
+    lookback_chunks: 4
+    rank_window: 5000
+    min_history: 500
+    constant_stuck: 0.5    # signal=constant only (the timing control)
 

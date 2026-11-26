@@ -96,7 +96,13 @@ def model_report(model, policy, replay, chunk_len, depth, gamma, device, rng,
     unc_err_corr = None
     if getattr(model.net, 'num_dyn', 1) > 1:
         try:
-            dis = model.path_disagreement(model.encode(obs[:, 0]), act)
+            z_dis = model.encode(obs[:, 0])
+            pieces = []
+            for start in range(0, act.shape[1], model.chunk_len):
+                z_dis, piece = model.imagine_chunk(
+                    z_dis, act[:, start:start + model.chunk_len])
+                pieces.append(piece)
+            dis = torch.stack(pieces, 0).mean(0)
             dis = dis.reshape(-1).cpu().numpy()
             dr = drift.reshape(-1).cpu().numpy()
             if dis.std() > 1e-9 and dr.std() > 1e-9:
