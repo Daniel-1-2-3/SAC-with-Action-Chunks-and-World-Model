@@ -239,6 +239,24 @@ class ChunkSelector:
         self._stats = {}
         return out
 
+    def score_candidates(self, feat, n=None, source=None):
+        """ feat (1, obs_dim) tensor on the device. Returns
+            (cands (n, chunk_dim), qs (ensemble, n, 1), critic_score (n,)).
+            Same draw and same scoring select() always used. """
+        n = self.n if n is None else int(n)
+        source = self.candidate_source if source is None else source
+        feat_n = feat.repeat(n, 1)
+        if source == 'bc':
+            noises = self.policy.noise(n)
+            cands = self.policy.compute_flow_actions(feat_n, noises)  # (n, chunk_len * action_dim)
+        else:
+            cands = self.policy.sample_chunk(feat_n)  # (n, chunk_len * action_dim)
+
+        # QC's own best-of-N: the online critic scores every candidate.
+        qs = self.policy.critic(feat_n, cands)          # (ensemble, n, 1)
+        critic_score = self.policy._agg(qs).squeeze(-1)  # (n,)
+        return cands, qs, critic_score
+
     @torch.no_grad()
     def select(self, state_1d, eval_mode=False):
         """ state_1d: (obs_dim,) raw observation.
@@ -250,16 +268,7 @@ class ChunkSelector:
 
         feat = torch.as_tensor(np.asarray(state_1d, dtype=np.float32),
                                device=self.device).reshape(1, -1)
-        feat_n = feat.repeat(self.n, 1)
-        if self.candidate_source == 'bc':
-            noises = self.policy.noise(self.n)
-            cands = self.policy.compute_flow_actions(feat_n, noises)  # (n, chunk_len * action_dim)
-        else:
-            cands = self.policy.sample_chunk(feat_n)  # (n, chunk_len * action_dim)
-
-        # QC's own best-of-N: the online critic scores every candidate.
-        qs = self.policy.critic(feat_n, cands)          # (ensemble, n, 1)
-        critic_score = self.policy._agg(qs).squeeze(-1)  # (n,)
+        cands, qs, critic_score = self.score_candidates(feat)
 
         if getattr(self, '_ep_first_pending', False) and not eval_mode:
             # Episode-start value estimates, paired later with the realized
@@ -280,6 +289,7 @@ class ChunkSelector:
             self._ep_first_vals = (float(critic_score.max()), wm_v)
 
         if self.bonus_beta > 0.0 and not eval_mode and self.model is not None:
+            feat_n = feat.repeat(self.n, 1)
             return self._select_uncertainty_scaled(feat_n, cands, qs, critic_score)
         idx_t = torch.argmax(critic_score)
         # One GPU->CPU transfer for everything this decision needs.
