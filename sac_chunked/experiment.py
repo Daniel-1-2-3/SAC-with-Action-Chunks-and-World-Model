@@ -10,6 +10,7 @@
     That is what keeps the comparison controlled -- the only code that
     differs between two arms is inside their Arm classes. """
 
+import json
 import pathlib
 import time
 
@@ -196,7 +197,22 @@ def run(config, arm_cls):
         import wandb
         wandb.init(project=general.wandb_project, mode=general.wandb_mode,
                    name=(general.run_name or None), config=config.flat)
-    log = (lambda d, step: wandb.log(d, step=step)) if use_wandb else (lambda d, step: None)
+        log = lambda d, step: wandb.log(d, step=step)
+    else:
+        # wandb disabled: the logged dictionaries still land somewhere
+        # readable, one JSON line each, so a run can be checked offline.
+        # Pure output -- no randomness, no computation, no effect on results.
+        metrics_path = out_dir / 'metrics.jsonl'
+
+        def log(d, step):
+            row = {'step': int(step)}
+            for k, v in d.items():
+                try:
+                    row[k] = float(v)
+                except (TypeError, ValueError):
+                    continue
+            with open(metrics_path, 'a') as f:
+                f.write(json.dumps(row) + '\n')
 
     env, train_dataset = build_env(general, config.seed)
     env.action_space.seed(config.seed)

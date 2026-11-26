@@ -71,7 +71,8 @@ class TreeExploreArm(CombinedArm):
         t = self.config.tree
         self.proposer = ChunkProposer(
             self.config.tdmpc.latent_dim, self.chunk_len * self.action_dim,
-            self.device, hidden=t.proposer_hidden, lr=t.proposer_lr)
+            self.device, hidden=t.proposer_hidden, lr=t.proposer_lr,
+            compile_nets=self.config.tdmpc.compile_nets)
         self.memory = VisitMemory(
             self.obs_dim, self.device, offline_size=t.memory_offline,
             online_size=t.memory_online, k=t.memory_k)

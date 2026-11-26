@@ -37,11 +37,24 @@ class ChunkProposer:
     """ Owns the network and its optimizer. train_step runs once per model
         update on the same windows the model trains on. """
 
-    def __init__(self, latent_dim, chunk_dim, device, hidden=512, lr=3e-4):
+    def __init__(self, latent_dim, chunk_dim, device, hidden=512, lr=3e-4,
+                 compile_nets=False):
         self.chunk_dim = int(chunk_dim)
         self.device = device
         self.net = ProposerNet(latent_dim, self.chunk_dim, int(hidden)).to(device)
         self.opt = torch.optim.Adam(self.net.parameters(), lr=float(lr))
+        # Checkpoints read and write the raw module, so a file saved by a
+        # compiled run loads into an uncompiled one and back (the compiled
+        # wrapper shares the raw module's parameters).
+        self._raw_net = self.net
+        # Same lever as the other nets: the forward is a handful of tiny
+        # kernels, so fuse them. Pure speed change.
+        if compile_nets:
+            try:
+                self.net = torch.compile(self.net, mode='default', fullgraph=False)
+                print('[compile] torch.compile(default) enabled on the chunk proposer')
+            except Exception as e:
+                print(f'[compile] FAILED on the chunk proposer, running uncompiled: {e}')
 
     def train_step(self, policy, model, states):
         """ states (B, obs_dim): the first observation of each model window.
@@ -69,7 +82,7 @@ class ChunkProposer:
         return self.net(latents, noise)
 
     def state_dict(self):
-        return self.net.state_dict()
+        return self._raw_net.state_dict()
 
     def load_state_dict(self, state):
-        self.net.load_state_dict(state)
+        self._raw_net.load_state_dict(state)
