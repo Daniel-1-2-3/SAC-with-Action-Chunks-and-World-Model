@@ -167,6 +167,7 @@ class TreeSelector(ChunkSelector):
         if eval_mode or amount < float(self.tree.min_amount):
             if eval_mode:
                 self._acc('eval_tree_grown', 0.0)
+                self.carried = None
             else:
                 self._acc('tree_grown_frac', 0.0)
                 self.carried = None
