@@ -376,7 +376,7 @@ def test_bandit_untried_first_then_ucb():
 # ------------------------------------------------------------------- A9
 
 def test_a9_old_checkpoint_loads():
-    path = pathlib.Path('/tmp/old_wm_explore_model.pt')
+    path = pathlib.Path('/tmp/old_explorer_model.pt')
     if not path.exists():
         pytest.skip('old-shaped checkpoint not present on this machine')
     import ruamel.yaml as yaml
